@@ -1,0 +1,9 @@
+[package]
+name = "nerv-syntax"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nerv-lexer = { path = "../nerv-lexer" }

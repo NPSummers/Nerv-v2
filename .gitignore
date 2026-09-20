@@ -1,0 +1,9 @@
+/target/
+/clang/
+*.pdb
+*.exe
+*.dll
+*.lib
+*.obj
+*.log
+/old/

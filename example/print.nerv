@@ -1,0 +1,19 @@
+struct Pair
+    left: i64
+    right: i64
+
+fn sum(pair: Pair) -> i64 => pair.left + pair.right
+
+fn choose(enabled: bool, value: i64, fallback: i64) -> i64
+    if enabled
+        value
+    else
+        fallback
+
+fn main() -> i64
+    let pair = Pair { left: 19, right: 23 }
+    println("Nerv is running through LLVM ORC JIT")
+    println(sum(pair))
+    println(nerv.math.sqrt(81.0))
+    println(nerv.string.concat("Ne", "rv"))
+    return choose(true, 42, 0)

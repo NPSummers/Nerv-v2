@@ -1,0 +1,7 @@
+module app.main
+
+import lib.math
+
+fn main() -> void
+    println("imported function result")
+    println(add(2, 3))

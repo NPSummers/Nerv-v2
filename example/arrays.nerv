@@ -1,0 +1,5 @@
+fn main() -> void
+    let values: []i64 = [1, 2, 3]
+    values[1] = 40
+    println("array total")
+    println(values[0] + values[1] + values[2])

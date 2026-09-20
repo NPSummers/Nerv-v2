@@ -1,0 +1,45 @@
+module main
+
+struct Point
+    x: i32
+    y: i32
+
+enum Flag
+    Off
+    On
+
+fn add(a: i32, b: i32) -> i32
+    a + b
+
+fn classify(n: i32) -> string
+    if n > 5
+        "big"
+    else
+        "small"
+
+fn main() -> void
+    println("Hello, Nerv")
+    let answer = add(40, 2)
+    print("answer = ")
+    println(answer)
+
+    let mut n: i32 = 3
+    while n > 0
+        print("n = ")
+        println(n)
+        n = n - 1
+
+    let mut total: i32 = 0
+    for i in 1..=4
+        total = total + i
+    print("total = ")
+    println(total)
+
+    let state: Flag = On()
+    if state == On()
+        println("state = on")
+    else
+        println("state = off")
+
+    let label = classify(total)
+    println(label)

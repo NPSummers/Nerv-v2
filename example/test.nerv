@@ -1,0 +1,10 @@
+test "prints a value"
+    println(42)
+
+bench "runs a loop"
+    let mut total = 0
+    for value in 0..100
+        total = total + value
+
+fn main() -> void
+    println("Nerv")
