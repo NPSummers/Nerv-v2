@@ -1,0 +1,13 @@
+trait Drawable
+    fn draw(self) -> i64
+
+enum Light
+    On
+
+impl Light for Drawable
+    fn draw(self) -> i64 => 42
+
+fn main() -> i64
+    let light = On()
+    let drawable: Drawable = light
+    drawable:draw()

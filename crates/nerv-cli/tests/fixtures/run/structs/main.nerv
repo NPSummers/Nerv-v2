@@ -1,0 +1,10 @@
+struct Pair
+    left: i64
+    right: i64
+
+fn sum(pair: Pair) -> i64 => pair.left + pair.right
+
+fn main() -> i64
+    let mut pair = Pair { left: 19, right: 0 }
+    pair.right = 23
+    sum(pair)

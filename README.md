@@ -39,6 +39,8 @@ The macOS timing script requires Python 3. Use `--help` to see its options. Both
 
 ## Contributing
 
+Run all compiler tests with `bash ./test.sh` on macOS or `.\test.ps1` on Windows. See [compiler regression tests](./docs/testing.md) for prerequisites, fixture conventions, and CI platform coverage.
+
 Contributions are welcome, but please make sure you clarify with me before submitting a pull request. You can contact me via my discord `non.menthol.newports`.
 
 ## License
