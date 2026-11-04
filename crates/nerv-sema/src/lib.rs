@@ -275,6 +275,9 @@ fn check_function(
                 ..
             } => {
                 let actual = expr_type(path, value, &values, functions, structs, variants)?;
+                if actual == Type::Void {
+                    return Err(error_at(path, *line, *column, "cannot bind a void value"));
+                }
                 if let Some(expected) = ty
                     && *expected != actual
                     && !implements(&actual, expected, implementations)
@@ -368,6 +371,14 @@ fn check_function(
                 Type::Void
             }
             Statement::Return(value) => {
+                if function.result == Type::Void {
+                    return Err(error_at(
+                        path,
+                        function.line,
+                        function.column,
+                        "void functions do not return a value",
+                    ));
+                }
                 let actual = expr_type(path, value, &values, functions, structs, variants)?;
                 if actual != function.result {
                     return Err(error_at(
@@ -610,7 +621,31 @@ fn expr_type(
                 BinaryOp::And | BinaryOp::Or if left == Type::Bool && right == Type::Bool => {
                     Ok(Type::Bool)
                 }
-                BinaryOp::Eq | BinaryOp::NotEq if left == right => Ok(Type::Bool),
+                BinaryOp::Eq | BinaryOp::NotEq if left == right => {
+                    let supported = match &left {
+                        Type::Int | Type::Float | Type::Bool | Type::String | Type::Array(_) => {
+                            true
+                        }
+                        Type::Named(name) => {
+                            let members = variants
+                                .values()
+                                .filter(|info| info.enumeration == *name)
+                                .collect::<Vec<_>>();
+                            !members.is_empty() && members.iter().all(|info| info.payload.is_none())
+                        }
+                        _ => false,
+                    };
+                    if supported {
+                        Ok(Type::Bool)
+                    } else {
+                        Err(error_at(
+                            path,
+                            0,
+                            0,
+                            "equality is not supported for this type",
+                        ))
+                    }
+                }
                 BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
                     if numeric(&left) && left == right =>
                 {
@@ -625,13 +660,22 @@ fn expr_type(
             }
         }
         Expr::Call { callee, args } => {
-            let Some(name) = callee_name(callee) else {
-                return Err(error_at(path, 0, 0, "unsupported call target"));
-            };
+            let name = callee_name(callee);
             let args = args
                 .iter()
                 .map(|arg| expr_type(path, arg, values, functions, structs, variants))
                 .collect::<Result<Vec<_>, _>>()?;
+            let Some(name) = name else {
+                let Type::Function { params, result } =
+                    expr_type(path, callee, values, functions, structs, variants)?
+                else {
+                    return Err(error_at(path, 0, 0, "unsupported call target"));
+                };
+                if args != params {
+                    return Err(error_at(path, 0, 0, "function argument type mismatch"));
+                }
+                return Ok(*result);
+            };
             if let Some(result) = runtime_type(&name, &args) {
                 return result.ok_or_else(|| error_at(path, 0, 0, "invalid runtime call"));
             }
@@ -777,7 +821,12 @@ fn callee_name(expr: &Expr) -> Option<String> {
 
 fn runtime_type(name: &str, args: &[Type]) -> Option<Option<Type>> {
     Some(match (name, args) {
-        ("print" | "println", [_]) => Some(Type::Void),
+        ("print" | "println", [Type::Int | Type::Float | Type::Bool | Type::String]) => {
+            Some(Type::Void)
+        }
+        ("assert", [Type::Bool]) => Some(Type::Void),
+        ("i64", [Type::Int | Type::Float]) => Some(Type::Int),
+        ("f64", [Type::Int | Type::Float]) => Some(Type::Float),
         ("nerv.math.sqrt", [Type::Float]) => Some(Type::Float),
         ("nerv.math.pow", [Type::Float, Type::Float]) => Some(Type::Float),
         ("nerv.math.abs", [Type::Int]) => Some(Type::Int),
@@ -887,6 +936,9 @@ fn runtime_type(name: &str, args: &[Type]) -> Option<Option<Type>> {
         (
             "print"
             | "println"
+            | "assert"
+            | "i64"
+            | "f64"
             | "nerv.math.sqrt"
             | "nerv.math.pow"
             | "nerv.math.abs"
@@ -953,6 +1005,9 @@ fn block_type(
                 ..
             } => {
                 let actual = expr_type(path, value, values, functions, structs, variants)?;
+                if actual == Type::Void {
+                    return Err(error_at(path, 0, 0, "cannot bind a void value"));
+                }
                 if let Some(expected) = ty
                     && *expected != actual
                 {
@@ -1038,9 +1093,15 @@ fn block_type(
                 block_type(path, body, &mut loop_values, functions, structs, variants)?;
                 Type::Void
             }
-            Statement::Return(value) | Statement::Expr(value) => {
-                expr_type(path, value, values, functions, structs, variants)?
+            Statement::Return(_) => {
+                return Err(error_at(
+                    path,
+                    0,
+                    0,
+                    "return is only supported directly in a function body",
+                ));
             }
+            Statement::Expr(value) => expr_type(path, value, values, functions, structs, variants)?,
         };
     }
     Ok(last)
@@ -1086,17 +1147,21 @@ fn frontend_error(path: &Path, error: syntax::FrontendError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn test_directory() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "nerv-sema-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn checks_imported_functions() {
-        let root = std::env::temp_dir().join(format!(
-            "nerv-sema-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = test_directory();
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("math.nerv"),
@@ -1114,13 +1179,7 @@ mod tests {
 
     #[test]
     fn rejects_assigning_immutable_bindings() {
-        let root = std::env::temp_dir().join(format!(
-            "nerv-sema-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = test_directory();
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("main.nerv"),
@@ -1139,13 +1198,7 @@ mod tests {
 
     #[test]
     fn checks_exhaustive_enum_matches() {
-        let root = std::env::temp_dir().join(format!(
-            "nerv-sema-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = test_directory();
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("main.nerv"),
@@ -1164,13 +1217,7 @@ mod tests {
 
     #[test]
     fn checks_trait_method_dispatch() {
-        let root = std::env::temp_dir().join(format!(
-            "nerv-sema-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = test_directory();
         fs::create_dir_all(&root).unwrap();
         fs::write(
             root.join("main.nerv"),

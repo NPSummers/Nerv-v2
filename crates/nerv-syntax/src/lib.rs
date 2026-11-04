@@ -614,70 +614,41 @@ impl<'source> Parser<'source> {
                 body: self.block()?,
             });
         }
-        if self.at(TokenKind::Ident)
-            && self
-                .tokens
-                .get(self.index + 1)
-                .is_some_and(|token| token.kind == TokenKind::Dot)
-            && self
-                .tokens
-                .get(self.index + 2)
-                .is_some_and(|token| token.kind == TokenKind::Ident)
-            && self
-                .tokens
-                .get(self.index + 3)
-                .is_some_and(|token| token.kind == TokenKind::Eq)
-        {
-            let base = Expr::Name(self.ident()?);
-            self.expect(TokenKind::Dot)?;
-            let name = self.ident()?;
-            self.expect(TokenKind::Eq)?;
-            return Ok(Statement::AssignField {
-                base,
+        let target = self.expr(0)?;
+        if !self.consume(TokenKind::Eq) {
+            return Ok(Statement::Expr(target));
+        }
+        let value = self.expr(0)?;
+        match target {
+            Expr::Name(name) => Ok(Statement::Assign { name, value }),
+            Expr::Field { base, name } => Ok(Statement::AssignField {
+                base: *base,
                 name,
-                value: self.expr(0)?,
-            });
+                value,
+            }),
+            Expr::Index { base, index } => Ok(Statement::AssignIndex {
+                base: *base,
+                index: *index,
+                value,
+            }),
+            _ => Err(self.error("invalid assignment target")),
         }
-        if self.at(TokenKind::Ident)
-            && self
-                .tokens
-                .get(self.index + 1)
-                .is_some_and(|token| token.kind == TokenKind::Eq)
-        {
-            let name = self.ident()?;
-            self.expect(TokenKind::Eq)?;
-            return Ok(Statement::Assign {
-                name,
-                value: self.expr(0)?,
-            });
-        }
-        if self.at(TokenKind::Ident)
-            && self
-                .tokens
-                .get(self.index + 1)
-                .is_some_and(|token| token.kind == TokenKind::LBracket)
-        {
-            let base = Expr::Name(self.ident()?);
-            self.expect(TokenKind::LBracket)?;
-            let index = self.expr(0)?;
-            self.expect(TokenKind::RBracket)?;
-            self.expect(TokenKind::Eq)?;
-            return Ok(Statement::AssignIndex {
-                base,
-                index,
-                value: self.expr(0)?,
-            });
-        }
-        Ok(Statement::Expr(self.expr(0)?))
     }
 
     fn expr(&mut self, min_precedence: u8) -> Result<Expr, ParseError> {
         let mut left = match self.kind() {
             TokenKind::Minus => {
                 self.bump();
-                Expr::Unary {
-                    op: UnaryOp::Neg,
-                    value: Box::new(self.expr(8)?),
+                if self.at(TokenKind::Int)
+                    && self.peek().text(self.source).replace('_', "") == "9223372036854775808"
+                {
+                    self.bump();
+                    Expr::Int(i64::MIN)
+                } else {
+                    Expr::Unary {
+                        op: UnaryOp::Neg,
+                        value: Box::new(self.expr(8)?),
+                    }
                 }
             }
             TokenKind::Not => {
@@ -698,12 +669,32 @@ impl<'source> Parser<'source> {
             TokenKind::Float => {
                 let token = self.bump();
                 let text = self.text(token).replace('_', "");
-                Expr::Float(text.parse().map_err(|_| self.error("invalid float"))?)
+                let value: f64 = text.parse().map_err(|_| self.error("invalid float"))?;
+                if !value.is_finite() {
+                    return Err(self.error("float literal is outside the f64 range"));
+                }
+                Expr::Float(value)
             }
             TokenKind::String => {
                 let token = self.bump();
                 let text = self.text(token);
-                Expr::String(text[1..text.len() - 1].to_owned())
+                let mut decoded = String::new();
+                let mut chars = text[1..text.len() - 1].chars();
+                while let Some(ch) = chars.next() {
+                    decoded.push(match ch {
+                        '\\' => match chars.next() {
+                            Some('n') => '\n',
+                            Some('r') => '\r',
+                            Some('t') => '\t',
+                            Some('"') => '"',
+                            Some('\\') => '\\',
+                            _ => return Err(self.error("unsupported string escape")),
+                        },
+                        '\0' => return Err(self.error("NUL bytes are not supported in string literals")),
+                        ch => ch,
+                    });
+                }
+                Expr::String(decoded)
             }
             TokenKind::LBracket => {
                 self.bump();
@@ -889,10 +880,7 @@ impl<'source> Parser<'source> {
         self.skip_newlines();
         while !self.at(TokenKind::Dedent) && !self.at(TokenKind::Eof) {
             let statement = self.statement()?;
-            let has_nested_block = matches!(
-                statement,
-                Statement::While { .. } | Statement::For { .. } | Statement::Expr(Expr::If { .. })
-            );
+            let has_nested_block = self.tokens[self.index - 1].kind == TokenKind::Dedent;
             body.push(statement);
             if !has_nested_block {
                 self.end_line()?;

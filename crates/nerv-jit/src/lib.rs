@@ -60,6 +60,7 @@ pub fn run_main(modules: &[Module]) -> Result<i64, Error> {
     let _lock = JIT_LOCK
         .lock()
         .map_err(|_| Error::new("JIT lock poisoned"))?;
+    let _execution = nerv_runtime::Execution::new();
     let main = all_functions(modules)
         .find(|function| function.name == "main")
         .ok_or_else(|| Error::new("missing `main` function"))?;
@@ -85,6 +86,7 @@ fn run_prefixed(modules: &[Module], prefix: &str) -> Result<usize, Error> {
     let _lock = JIT_LOCK
         .lock()
         .map_err(|_| Error::new("JIT lock poisoned"))?;
+    let _execution = nerv_runtime::Execution::new();
     let names = all_functions(modules)
         .filter(|function| function.name.starts_with(prefix))
         .map(|function| function.name.clone())
@@ -731,7 +733,6 @@ impl Compiler {
                         },
                     ],
                 )?;
-                let array = self.call_external("nerv_array_i64_data", self.array_ty(), &[array])?;
                 for (index, element) in elements.iter().enumerate() {
                     let element = self.expr(element, values)?;
                     self.require_type(element, self.int_ty())?;
@@ -751,9 +752,7 @@ impl Compiler {
                 let length = self.expr(length, values)?;
                 self.require_type(value, self.int_ty())?;
                 self.require_type(length, self.int_ty())?;
-                let array =
-                    self.call_external("nerv_array_i64_new", self.array_ty(), &[length, value])?;
-                self.call_external("nerv_array_i64_data", self.array_ty(), &[array])
+                self.call_external("nerv_array_i64_new", self.array_ty(), &[length, value])
             }
             Expr::Match { value, arms } => self.match_expr(value, arms, values),
             Expr::Method { base, name, args } => self.method_call(base, name, args, values),
@@ -1082,7 +1081,7 @@ impl Compiler {
         let ty = result_ty.ok_or_else(|| Error::new("match needs at least one arm"))?;
         if ty == self.void_ty() {
             return Ok(Value {
-                value: unsafe { LLVMGetUndef(ty) },
+                value: ptr::null_mut(),
                 ty,
             });
         }
@@ -1165,7 +1164,10 @@ impl Compiler {
                 }
             }
         }
-        last.ok_or_else(|| Error::new("if branch must end with a value"))
+        Ok(last.unwrap_or(Value {
+            value: ptr::null_mut(),
+            ty: self.void_ty(),
+        }))
     }
 
     fn assign(
@@ -1244,16 +1246,9 @@ impl Compiler {
 
     fn array_element(&mut self, array: Value, index: Value) -> Result<LLVMValueRef, Error> {
         self.require_type(index, self.int_ty())?;
-        Ok(unsafe {
-            LLVMBuildInBoundsGEP2(
-                self.builder,
-                self.int_ty(),
-                array.value,
-                &mut [index.value] as *mut LLVMValueRef,
-                1,
-                c"array.element".as_ptr(),
-            )
-        })
+        Ok(self
+            .call_external("nerv_array_i64_at", self.array_ty(), &[array, index])?
+            .value)
     }
 
     fn array_store(&mut self, array: Value, index: Value, value: Value) -> Result<(), Error> {
@@ -1346,6 +1341,24 @@ impl Compiler {
         self.loop_body(body, &mut body_values)?;
         let index =
             unsafe { LLVMBuildLoad2(self.builder, self.int_ty(), slot, c"for.next".as_ptr()) };
+        if inclusive {
+            let increment_block = unsafe {
+                LLVMAppendBasicBlockInContext(self.context, function, c"for.increment".as_ptr())
+            };
+            let finished = unsafe {
+                LLVMBuildICmp(
+                    self.builder,
+                    LLVMIntPredicate::LLVMIntEQ,
+                    index,
+                    end.value,
+                    c"for.finished".as_ptr(),
+                )
+            };
+            unsafe {
+                LLVMBuildCondBr(self.builder, finished, exit_block, increment_block);
+                LLVMPositionBuilderAtEnd(self.builder, increment_block);
+            }
+        }
         let next = unsafe {
             LLVMBuildAdd(
                 self.builder,
@@ -1421,9 +1434,57 @@ impl Compiler {
         right: &Expr,
         values: &HashMap<String, Value>,
     ) -> Result<Value, Error> {
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            let right = Statement::Expr(right.clone());
+            let constant = Statement::Expr(Expr::Bool(op == BinaryOp::Or));
+            return if op == BinaryOp::And {
+                self.if_expr(left, &[right], &[constant], values)
+            } else {
+                self.if_expr(left, &[constant], &[right], values)
+            };
+        }
         let left = self.expr(left, values)?;
-        let right = self.expr(right, values)?;
+        let mut right = self.expr(right, values)?;
         self.require_type(right, left.ty)?;
+        if matches!(op, BinaryOp::Div | BinaryOp::Rem) && left.ty == self.int_ty() {
+            unsafe {
+                let nonzero = LLVMBuildICmp(
+                    self.builder,
+                    LLVMIntPredicate::LLVMIntNE,
+                    right.value,
+                    LLVMConstInt(self.int_ty(), 0, 0),
+                    c"div.nonzero".as_ptr(),
+                );
+                self.guard(nonzero, 1)?;
+                let minimum = LLVMBuildICmp(
+                    self.builder,
+                    LLVMIntPredicate::LLVMIntEQ,
+                    left.value,
+                    LLVMConstInt(self.int_ty(), i64::MIN as u64, 1),
+                    c"div.minimum".as_ptr(),
+                );
+                let negative_one = LLVMBuildICmp(
+                    self.builder,
+                    LLVMIntPredicate::LLVMIntEQ,
+                    right.value,
+                    LLVMConstInt(self.int_ty(), u64::MAX, 1),
+                    c"div.negative_one".as_ptr(),
+                );
+                let overflow = LLVMBuildAnd(
+                    self.builder,
+                    minimum,
+                    negative_one,
+                    c"div.overflow".as_ptr(),
+                );
+                right.value = LLVMBuildSelect(
+                    self.builder,
+                    overflow,
+                    LLVMConstInt(self.int_ty(), 1, 0),
+                    right.value,
+                    c"div.safe".as_ptr(),
+                );
+            }
+        }
         let name = c"binary".as_ptr();
         let value = unsafe {
             match (op, left.ty == self.float_ty()) {
@@ -1498,7 +1559,7 @@ impl Compiler {
                 ),
                 (BinaryOp::NotEq, true) => LLVMBuildFCmp(
                     self.builder,
-                    LLVMRealPredicate::LLVMRealONE,
+                    LLVMRealPredicate::LLVMRealUNE,
                     left.value,
                     right.value,
                     name,
@@ -1596,6 +1657,45 @@ impl Compiler {
         let Some(name) = callee_name(callee) else {
             return Err(Error::new("only direct function calls can be lowered"));
         };
+        if name == "assert" {
+            if args.len() != 1 {
+                return Err(Error::new("assert expects one bool argument"));
+            }
+            let condition = self.expr(&args[0], values)?;
+            self.require_type(condition, self.bool_ty())?;
+            self.guard(condition.value, 2)?;
+            return Ok(Value {
+                value: ptr::null_mut(),
+                ty: self.void_ty(),
+            });
+        }
+        if matches!(name.as_str(), "i64" | "f64") {
+            if args.len() != 1 {
+                return Err(Error::new("numeric conversion expects one argument"));
+            }
+            let value = self.expr(&args[0], values)?;
+            return match name.as_str() {
+                "i64" if value.ty == self.int_ty() => Ok(value),
+                "f64" if value.ty == self.float_ty() => Ok(value),
+                "i64" if value.ty == self.float_ty() => {
+                    self.call_external("nerv_f64_to_i64", self.int_ty(), &[value])
+                }
+                "f64" if value.ty == self.int_ty() => Ok(Value {
+                    value: unsafe {
+                        LLVMBuildSIToFP(
+                            self.builder,
+                            value.value,
+                            self.float_ty(),
+                            c"to.float".as_ptr(),
+                        )
+                    },
+                    ty: self.float_ty(),
+                }),
+                _ => Err(Error::new(
+                    "numeric conversion requires an integer or float",
+                )),
+            };
+        }
         if matches!(name.as_str(), "print" | "println") {
             if args.len() != 1 {
                 return Err(Error::new("print expects one argument"));
@@ -1779,8 +1879,7 @@ impl Compiler {
             ("nerv.arrays.new", [length, initial])
                 if length.ty == self.int_ty() && initial.ty == self.int_ty() =>
             {
-                let array = self.call_external("nerv_array_i64_new", self.array_ty(), args)?;
-                self.call_external("nerv_array_i64_data", self.array_ty(), &[array])?
+                self.call_external("nerv_array_i64_new", self.array_ty(), args)?
             }
             ("nerv.random", [maximum]) if maximum.ty == self.int_ty() => {
                 self.call_external("nerv_random_i64", self.int_ty(), args)?
@@ -2029,6 +2128,32 @@ impl Compiler {
             value,
             ty: enumeration.ty,
         }))
+    }
+
+    fn guard(&mut self, condition: LLVMValueRef, code: i64) -> Result<(), Error> {
+        let function = unsafe { LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder)) };
+        let success =
+            unsafe { LLVMAppendBasicBlockInContext(self.context, function, c"check.ok".as_ptr()) };
+        let failure = unsafe {
+            LLVMAppendBasicBlockInContext(self.context, function, c"check.failed".as_ptr())
+        };
+        unsafe {
+            LLVMBuildCondBr(self.builder, condition, success, failure);
+            LLVMPositionBuilderAtEnd(self.builder, failure);
+        }
+        self.call_external(
+            "nerv_fail",
+            self.void_ty(),
+            &[Value {
+                value: unsafe { LLVMConstInt(self.int_ty(), code as u64, 0) },
+                ty: self.int_ty(),
+            }],
+        )?;
+        unsafe {
+            LLVMBuildUnreachable(self.builder);
+            LLVMPositionBuilderAtEnd(self.builder, success);
+        }
+        Ok(())
     }
 
     fn call_external(

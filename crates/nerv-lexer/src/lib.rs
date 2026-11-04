@@ -237,7 +237,7 @@ impl<'source> Lexer<'source> {
         }
     }
 
-    fn layout(&mut self, span: Range<usize>) {
+    fn layout(&mut self, span: Range<usize>) -> Result<(), LexError> {
         let current = *self
             .indents
             .last()
@@ -253,7 +253,12 @@ impl<'source> Lexer<'source> {
                 self.pending
                     .push_back(self.token(TokenKind::Dedent, marker.clone()));
             }
+            if self.indentation != *self.indents.last().unwrap() {
+                let (line, column) = self.location(span.start);
+                return Err(LexError { span, line, column });
+            }
         }
+        Ok(())
     }
 
     fn finish(&mut self) -> Option<Result<Token, LexError>> {
@@ -361,7 +366,9 @@ impl Iterator for Lexer<'_> {
             };
 
             if self.line_start && self.delimiters == 0 {
-                self.layout(span.clone());
+                if let Err(error) = self.layout(span.clone()) {
+                    return Some(Err(error));
+                }
             }
             self.line_start = false;
             self.line_has_token = true;

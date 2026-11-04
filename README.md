@@ -13,6 +13,8 @@
 
 A basic showcase is in the [**Showcase**](./example/hello.nerv) file.
 
+The [language specification](./docs/language-spec.md) defines the supported alpha rules and includes executable examples and platform-specific instructions for running its conformance suite.
+
 Install Rust 1.94 or newer and your platform's native build tools (Xcode Command Line Tools on macOS, Visual Studio C++ Build Tools on Windows).
 
 The official macOS LLVM archive also needs zstd (`brew install zstd`). On first use, the setup script prepares a shared LLVM library using the archive's bundled tools.

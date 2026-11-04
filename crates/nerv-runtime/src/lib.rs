@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     io::{self, Write},
     slice,
@@ -24,8 +25,112 @@ struct NervDeque(VecDeque<i64>);
 
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
 
+struct Allocation {
+    pointer: *mut (),
+    drop: unsafe fn(*mut ()),
+}
+
+thread_local! {
+    static ALLOCATIONS: RefCell<Option<Vec<Allocation>>> = const { RefCell::new(None) };
+}
+
+pub struct Execution {
+    previous: Option<Vec<Allocation>>,
+}
+
+impl Execution {
+    pub fn new() -> Self {
+        Self {
+            previous: ALLOCATIONS.with(|allocations| allocations.replace(Some(Vec::new()))),
+        }
+    }
+}
+
+impl Default for Execution {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Execution {
+    fn drop(&mut self) {
+        let allocations = ALLOCATIONS.with(|allocations| allocations.replace(self.previous.take()));
+        for allocation in allocations.into_iter().flatten().rev() {
+            unsafe { (allocation.drop)(allocation.pointer) };
+        }
+    }
+}
+
+unsafe fn drop_allocation<T>(pointer: *mut ()) {
+    unsafe { drop(Box::from_raw(pointer.cast::<T>())) };
+}
+
+fn allocate<T: 'static>(value: T) -> *mut T {
+    let pointer = Box::into_raw(Box::new(value));
+    ALLOCATIONS.with(|allocations| {
+        if let Some(allocations) = allocations.borrow_mut().as_mut() {
+            allocations.push(Allocation {
+                pointer: pointer.cast(),
+                drop: drop_allocation::<T>,
+            });
+        }
+    });
+    pointer
+}
+
+unsafe fn release<T>(pointer: *mut T) {
+    if pointer.is_null() {
+        return;
+    }
+    ALLOCATIONS.with(|allocations| {
+        if let Some(allocations) = allocations.borrow_mut().as_mut()
+            && let Some(index) = allocations
+                .iter()
+                .position(|entry| entry.pointer == pointer.cast())
+        {
+            allocations.swap_remove(index);
+        }
+    });
+    unsafe { drop(Box::from_raw(pointer)) };
+}
+
+fn runtime_error(message: &str) -> ! {
+    eprintln!("runtime error: {message}");
+    std::process::exit(1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_fail(code: i64) {
+    runtime_error(match code {
+        1 => "integer division by zero",
+        _ => "assertion failed",
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_f64_to_i64(value: f64) -> i64 {
+    if !value.is_finite()
+        || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
+    {
+        runtime_error("float is outside the i64 range");
+    }
+    value.trunc() as i64
+}
+
 pub fn symbols() -> Vec<RuntimeSymbol> {
     vec![
+        RuntimeSymbol {
+            name: "nerv_fail",
+            address: nerv_fail as *const (),
+        },
+        RuntimeSymbol {
+            name: "nerv_f64_to_i64",
+            address: nerv_f64_to_i64 as *const (),
+        },
+        RuntimeSymbol {
+            name: "nerv_array_i64_at",
+            address: nerv_array_i64_at as *const (),
+        },
         RuntimeSymbol {
             name: "nerv_print_i64",
             address: nerv_print_i64 as *const (),
@@ -383,9 +488,7 @@ pub unsafe extern "C" fn nerv_string_new(bytes: *const u8, length: i64) -> *mut 
     } else {
         unsafe { slice::from_raw_parts(bytes, length) }
     };
-    Box::into_raw(Box::new(NervString(
-        String::from_utf8_lossy(bytes).into_owned(),
-    )))
+    string(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[unsafe(no_mangle)]
@@ -406,20 +509,23 @@ pub unsafe extern "C" fn nerv_string_concat(
     let right = unsafe { right.as_ref() }
         .map(|value| value.0.as_str())
         .unwrap_or("");
-    Box::into_raw(Box::new(NervString(format!("{left}{right}"))))
+    string(format!("{left}{right}"))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_string_free(value: *mut NervString) {
-    if !value.is_null() {
-        unsafe { drop(Box::from_raw(value)) };
-    }
+    unsafe { release(value) };
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_array_i64_new(length: i64, initial: i64) -> *mut NervArray {
-    let length = usize::try_from(length).unwrap_or(0);
-    Box::into_raw(Box::new(NervArray(vec![initial; length])))
+    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("negative array length"));
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .unwrap_or_else(|_| runtime_error("array allocation failed"));
+    values.resize(length, initial);
+    allocate(NervArray(values))
 }
 
 #[unsafe(no_mangle)]
@@ -438,59 +544,62 @@ pub unsafe extern "C" fn nerv_array_i64_data(array: *mut NervArray) -> *mut i64 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_get(array: *const NervArray, index: i64) -> i64 {
-    let index = usize::try_from(index).ok();
-    unsafe { array.as_ref() }
-        .and_then(|array| index.and_then(|index| array.0.get(index)))
-        .copied()
-        .unwrap_or(0)
+    unsafe { *nerv_array_i64_at(array.cast_mut(), index) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_set(array: *mut NervArray, index: i64, value: i64) {
-    let index = usize::try_from(index).ok();
-    if let (Some(array), Some(index)) = (unsafe { array.as_mut() }, index)
-        && let Some(slot) = array.0.get_mut(index)
-    {
-        *slot = value;
-    }
+    unsafe { *nerv_array_i64_at(array, index) = value };
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nerv_array_i64_at(array: *mut NervArray, index: i64) -> *mut i64 {
+    let array = unsafe { array.as_mut() }.unwrap_or_else(|| runtime_error("invalid array"));
+    let index =
+        usize::try_from(index).unwrap_or_else(|_| runtime_error("array index out of bounds"));
+    array
+        .0
+        .get_mut(index)
+        .map(|slot| slot as *mut i64)
+        .unwrap_or_else(|| runtime_error("array index out of bounds"))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_free(array: *mut NervArray) {
-    if !array.is_null() {
-        unsafe { drop(Box::from_raw(array)) };
-    }
+    unsafe { release(array) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_map(
-    array: *const i64,
+    array: *const NervArray,
     length: i64,
     callback: extern "C" fn(i64) -> i64,
-) -> *mut i64 {
-    let length = usize::try_from(length).unwrap_or(0);
-    if array.is_null() || length == 0 {
-        return std::ptr::null_mut();
-    }
-    let values = unsafe { slice::from_raw_parts(array, length) }
+) -> *mut NervArray {
+    let array = unsafe { array.as_ref() }.unwrap_or_else(|| runtime_error("invalid array"));
+    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
+    let values = array
+        .0
+        .get(..length)
+        .unwrap_or_else(|| runtime_error("array length out of bounds"))
         .iter()
         .map(|value| callback(*value))
         .collect::<Vec<_>>();
-    values.leak().as_mut_ptr()
+    allocate(NervArray(values))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_reduce(
-    array: *const i64,
+    array: *const NervArray,
     length: i64,
     initial: i64,
     callback: extern "C" fn(i64, i64) -> i64,
 ) -> i64 {
-    let length = usize::try_from(length).unwrap_or(0);
-    if array.is_null() || length == 0 {
-        return initial;
-    }
-    unsafe { slice::from_raw_parts(array, length) }
+    let array = unsafe { array.as_ref() }.unwrap_or_else(|| runtime_error("invalid array"));
+    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
+    array
+        .0
+        .get(..length)
+        .unwrap_or_else(|| runtime_error("array length out of bounds"))
         .iter()
         .fold(initial, |value, next| callback(value, *next))
 }
@@ -544,7 +653,7 @@ unsafe fn handle_ref<T>(handle: i64) -> Option<&'static T> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_vec_new() -> i64 {
-    Box::into_raw(Box::new(NervVec(Vec::new()))) as i64
+    allocate(NervVec(Vec::new())) as i64
 }
 
 #[unsafe(no_mangle)]
@@ -623,7 +732,7 @@ pub unsafe extern "C" fn nerv_vec_clear(handle: i64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_vec_free(handle: i64) {
     if handle != 0 {
-        unsafe { drop(Box::from_raw(handle as usize as *mut NervVec)) };
+        unsafe { release(handle as usize as *mut NervVec) };
     }
 }
 
@@ -651,7 +760,7 @@ pub unsafe extern "C" fn nerv_vec_as_ptr(handle: i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_map_new() -> i64 {
-    Box::into_raw(Box::new(NervMap(HashMap::new()))) as i64
+    allocate(NervMap(HashMap::new())) as i64
 }
 
 #[unsafe(no_mangle)]
@@ -708,13 +817,13 @@ pub unsafe extern "C" fn nerv_map_len(handle: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_map_free(handle: i64) {
     if handle != 0 {
-        unsafe { drop(Box::from_raw(handle as usize as *mut NervMap)) };
+        unsafe { release(handle as usize as *mut NervMap) };
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_set_new() -> i64 {
-    Box::into_raw(Box::new(NervSet(HashSet::new()))) as i64
+    allocate(NervSet(HashSet::new())) as i64
 }
 
 #[unsafe(no_mangle)]
@@ -750,13 +859,13 @@ pub unsafe extern "C" fn nerv_set_len(handle: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_set_free(handle: i64) {
     if handle != 0 {
-        unsafe { drop(Box::from_raw(handle as usize as *mut NervSet)) };
+        unsafe { release(handle as usize as *mut NervSet) };
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_deque_new() -> i64 {
-    Box::into_raw(Box::new(NervDeque(VecDeque::new()))) as i64
+    allocate(NervDeque(VecDeque::new())) as i64
 }
 
 #[unsafe(no_mangle)]
@@ -797,12 +906,12 @@ pub unsafe extern "C" fn nerv_deque_len(handle: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_deque_free(handle: i64) {
     if handle != 0 {
-        unsafe { drop(Box::from_raw(handle as usize as *mut NervDeque)) };
+        unsafe { release(handle as usize as *mut NervDeque) };
     }
 }
 
 fn string(value: String) -> *mut NervString {
-    Box::into_raw(Box::new(NervString(value)))
+    allocate(NervString(value))
 }
 
 #[unsafe(no_mangle)]
@@ -988,6 +1097,66 @@ pub unsafe extern "C" fn nerv_str_split_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    struct CountDrop(Rc<Cell<usize>>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn execution_owns_allocations_until_it_finishes() {
+        let dropped = Rc::new(Cell::new(0));
+        {
+            let _execution = Execution::new();
+            let pointer = allocate(CountDrop(dropped.clone()));
+            let alias = pointer;
+            assert_eq!(pointer, alias);
+            assert_eq!(dropped.get(), 0);
+            let text = string("é🙂".to_owned());
+            let array = nerv_array_i64_new(2, 42);
+            unsafe {
+                assert_eq!(nerv_string_len(text), 6);
+                assert_eq!(nerv_array_i64_get(array, 1), 42);
+            }
+            ALLOCATIONS
+                .with(|allocations| assert_eq!(allocations.borrow().as_ref().unwrap().len(), 3));
+        }
+        assert_eq!(dropped.get(), 1);
+        ALLOCATIONS.with(|allocations| assert!(allocations.borrow().is_none()));
+    }
+
+    #[test]
+    fn explicit_release_is_not_dropped_again_at_execution_end() {
+        let dropped = Rc::new(Cell::new(0));
+        {
+            let _execution = Execution::new();
+            let value = allocate(CountDrop(dropped.clone()));
+            unsafe { release(value) };
+            assert_eq!(dropped.get(), 1);
+        }
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn nested_execution_restores_its_parent_region() {
+        let dropped = Rc::new(Cell::new(0));
+        {
+            let _outer = Execution::new();
+            allocate(CountDrop(dropped.clone()));
+            {
+                let _inner = Execution::new();
+                allocate(CountDrop(dropped.clone()));
+            }
+            assert_eq!(dropped.get(), 1);
+            ALLOCATIONS
+                .with(|allocations| assert_eq!(allocations.borrow().as_ref().unwrap().len(), 1));
+        }
+        assert_eq!(dropped.get(), 2);
+    }
 
     #[test]
     fn stores_array_values() {
