@@ -6,6 +6,7 @@ members = [
     "crates/nerv-runtime",
     "crates/nerv-sema",
     "crates/nerv-syntax",
+    "tools/test-runner",
 ]
 exclude = ["old/rust-test", "time-release"]
 resolver = "3"

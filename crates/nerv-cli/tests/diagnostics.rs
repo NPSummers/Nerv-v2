@@ -47,3 +47,8 @@ snapshots! {
     eof => "--parse",
     backend => "--run",
 }
+
+#[test]
+fn payload_limit_is_checked_before_codegen() {
+    snapshot("backend", "--check");
+}

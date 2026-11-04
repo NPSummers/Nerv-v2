@@ -9,4 +9,7 @@ build = "build.rs"
 [dependencies]
 llvm-sys = { workspace = true, features = ["no-llvm-linking"] }
 nerv-runtime = { path = "../nerv-runtime" }
+nerv-sema = { path = "../nerv-sema" }
+
+[dev-dependencies]
 nerv-syntax = { path = "../nerv-syntax" }

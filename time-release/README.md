@@ -7,11 +7,11 @@ This standalone crate matches `example/heavy.nerv`: 10,000 array elements, 100,0
 Run both release benchmarks from the repo root:
 
 ```sh
-./time-release.sh --runs 5
+./tools/time-release.sh --runs 5
 ```
 
 ```powershell
-.\time-release.ps1 -Runs 5
+.\tools\time-release.ps1 -Runs 5
 ```
 
 To run just the Rust baseline:

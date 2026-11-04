@@ -17,7 +17,7 @@ if [[ "$target" != *.nerv ]]; then
     exit 1
 fi
 
-source "$root/setup-llvm.sh"
+source "$root/tools/setup-llvm.sh"
 setup_llvm
 cd "$root"
 exec cargo run --quiet -p nerv -- "$target" --run

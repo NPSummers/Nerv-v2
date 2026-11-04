@@ -1,0 +1,15 @@
+enum First
+    A
+enum Second
+    B
+
+impl First
+    fn value(self) -> i64 => 10
+
+impl Second
+    fn value(self) -> i64 => 32
+
+fn main() -> i64
+    let first = A()
+    let second = B()
+    first:value() + second:value()

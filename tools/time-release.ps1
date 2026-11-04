@@ -9,7 +9,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$scriptRoot = Split-Path -Parent $PSCommandPath
+$scriptRoot = Split-Path -Parent $PSScriptRoot
 
 function Resolve-LocalPath([string]$Path) {
     if ([System.IO.Path]::IsPathRooted($Path)) {
@@ -64,7 +64,7 @@ try {
         throw "Program file not found: $ProgramPath"
     }
 
-    . (Join-Path $scriptRoot 'setup-llvm.ps1')
+    . (Join-Path $scriptRoot 'tools\setup-llvm.ps1')
 
     if (-not $SkipBuild) {
         Write-Host 'Building release (Nerv)...'

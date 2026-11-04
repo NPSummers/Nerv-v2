@@ -1,0 +1,11 @@
+struct Pair
+    first: i64
+    second: i64
+
+fn record(value: i64) -> i64
+    println(value)
+    value
+
+fn main() -> i64
+    let pair = Pair { second: record(2), first: record(40) }
+    i64(f64(pair.first + pair.second))

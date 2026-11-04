@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 program=example/heavy.nerv
 runs=5
 skip_build=0
@@ -50,7 +50,7 @@ if [[ "$skip_rust" == 0 && "$skip_build" == 0 && ! -f time-release/Cargo.toml ]]
     echo 'Rust baseline is missing: time-release/Cargo.toml.' >&2
     exit 1
 fi
-source "$root/setup-llvm.sh"
+source "$root/tools/setup-llvm.sh"
 setup_llvm
 
 if [[ "$skip_build" == 0 ]]; then

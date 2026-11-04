@@ -119,6 +119,7 @@ version = "0.1.0"
 dependencies = [
  "llvm-sys",
  "nerv-runtime",
+ "nerv-sema",
  "nerv-syntax",
 ]
 
@@ -146,6 +147,10 @@ version = "0.1.0"
 dependencies = [
  "nerv-lexer",
 ]
+
+[[package]]
+name = "nerv-test-runner"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"

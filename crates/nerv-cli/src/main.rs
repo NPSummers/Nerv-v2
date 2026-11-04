@@ -108,12 +108,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let modules = program
-            .modules
-            .iter()
-            .map(|module| module.module.clone())
-            .collect::<Vec<_>>();
-        match run_main(&modules) {
+        match run_main(&program.ir) {
             Ok(value) => println!("{value}"),
             Err(error) => {
                 report_backend_error(error, &program.sources);
@@ -131,12 +126,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let modules = program
-            .modules
-            .iter()
-            .map(|module| module.module.clone())
-            .collect::<Vec<_>>();
-        match run_tests(&modules) {
+        match run_tests(&program.ir) {
             Ok(count) => println!("{count} tests passed"),
             Err(error) => {
                 report_backend_error(error, &program.sources);
@@ -154,13 +144,8 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let modules = program
-            .modules
-            .iter()
-            .map(|module| module.module.clone())
-            .collect::<Vec<_>>();
         let started = Instant::now();
-        match run_benches(&modules) {
+        match run_benches(&program.ir) {
             Ok(count) => println!(
                 "{count} benchmarks ran in {:.3} ms",
                 started.elapsed().as_secs_f64() * 1000.0

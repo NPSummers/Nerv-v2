@@ -24,11 +24,11 @@ jobs:
         run: brew install zstd
       - name: Test macOS workspace
         if: runner.os == 'macOS'
-        run: bash ./test.sh
+        run: bash ./tools/test.sh
       - name: Test Windows workspace
         if: runner.os == 'Windows'
         shell: pwsh
-        run: .\test.ps1
+        run: .\tools\test.ps1
 
   linux-frontend:
     name: Linux frontend and runtime (no LLVM)
@@ -37,4 +37,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
       - name: Test LLVM-independent crates
-        run: cargo test --locked -p nerv-lexer -p nerv-syntax -p nerv-sema -p nerv-runtime
+        run: bash ./tools/test.sh -p nerv-lexer -p nerv-syntax -p nerv-sema -p nerv-runtime -p nerv-test-runner

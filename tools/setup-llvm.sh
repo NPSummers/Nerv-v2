@@ -36,7 +36,7 @@ prepare_llvm() {
 
 setup_llvm() {
     local root config prefix version archive checksum staging
-    root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
     if [[ $(uname -s) != Darwin ]]; then
         echo 'This script requires macOS.' >&2
         return 1

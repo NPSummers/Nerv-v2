@@ -10,8 +10,12 @@ use nerv_syntax::{
     Struct as StructDecl, Type, UnaryOp,
 };
 
+pub mod ir;
+mod resolve;
+
 #[derive(Debug)]
 pub struct Program {
+    pub ir: ir::CheckedProgram,
     pub modules: Vec<LoadedModule>,
     pub sources: SourceMap,
 }
@@ -146,8 +150,32 @@ pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Errors> {
         &mut sources,
     )
     .map_err(|error| Errors::from(error).with_sources(&sources))?;
-    check(&modules).map_err(|errors| errors.with_sources(&sources))?;
-    Ok(Program { modules, sources })
+    let ir = check_loaded(&modules).map_err(|errors| errors.with_sources(&sources))?;
+    Ok(Program {
+        ir,
+        modules,
+        sources,
+    })
+}
+
+fn check_loaded(modules: &[LoadedModule]) -> Result<ir::CheckedProgram, Errors> {
+    check(modules)?;
+    resolve::resolve(modules).map_err(Into::into)
+}
+
+/// Check already-loaded syntax modules for embedding and compiler unit tests.
+/// Callers assign source IDs with `parse_source` when using multiple buffers.
+pub fn check_modules(modules: &[Module]) -> Result<ir::CheckedProgram, Errors> {
+    let loaded = modules
+        .iter()
+        .cloned()
+        .map(|module| LoadedModule {
+            source: module.source,
+            path: PathBuf::from("<buffer>"),
+            module,
+        })
+        .collect::<Vec<_>>();
+    check_loaded(&loaded)
 }
 
 fn load(

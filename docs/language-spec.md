@@ -5,17 +5,16 @@ This document specifies the current supported core, not a promise that every res
 Run the suite with LLVM configured in the current shell. On macOS:
 
 ```sh
-bash -c 'source ./setup-llvm.sh && setup_llvm && cargo test -p nerv --test language_rules'
+bash ./tools/test.sh -p nerv --test language_rules
 ```
 
 On Windows:
 
 ```powershell
-. .\setup-llvm.ps1
-cargo test -p nerv --test language_rules
+.\tools\test.ps1 -p nerv --test language_rules
 ```
 
-Replace the Cargo command with `cargo test --workspace` to include all compiler and runtime tests. The module examples are covered by the suite's multi-file test. Runtime ownership and cleanup also have unit tests in `nerv-runtime`.
+Omit `-p nerv --test language_rules` to include all compiler and runtime tests and the overall test score. The module examples are covered by the suite's multi-file test. Runtime ownership and cleanup also have unit tests in `nerv-runtime`.
 
 ## 1. Source, layout, and declarations
 
