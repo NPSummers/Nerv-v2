@@ -21,6 +21,7 @@ if ([System.IO.Path]::GetExtension($target) -ne '.nerv') {
 
 Push-Location $root
 try {
+    . (Join-Path $root 'setup-llvm.ps1')
     & cargo run --quiet -p nerv -- $target --run
     exit $LASTEXITCODE
 } finally {

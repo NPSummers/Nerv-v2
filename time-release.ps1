@@ -5,7 +5,7 @@ param(
     [switch]$ShowProgramOutput,
     [switch]$SkipRustBaseline,
     [string]$NervExePath = ".\target\release\nerv.exe",
-    [string]$RustExePath = ".\old\rust-test\target\release\heavy.exe"
+    [string]$RustExePath = ".\time-release\target\release\heavy.exe"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +16,15 @@ function Resolve-LocalPath([string]$Path) {
         return $Path
     }
     return Join-Path $scriptRoot $Path
+}
+
+function Format-DisplayPath([string]$Path) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $prefix = $scriptRoot + [System.IO.Path]::DirectorySeparatorChar
+    if ($fullPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $fullPath.Substring($prefix.Length)
+    }
+    return [System.IO.Path]::GetFileName($fullPath)
 }
 
 function Measure-Runs([string]$Label, [scriptblock]$Command) {
@@ -55,18 +64,20 @@ try {
         throw "Program file not found: $ProgramPath"
     }
 
+    . (Join-Path $scriptRoot 'setup-llvm.ps1')
+
     if (-not $SkipBuild) {
         Write-Host 'Building release (Nerv)...'
-        & cargo build --release -p nerv | Out-Null
+        & cargo build --quiet --release -p nerv | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw 'Nerv release build failed.'
         }
 
         if (-not $SkipRustBaseline) {
             Write-Host 'Building release (Rust baseline)...'
-            Push-Location '.\old\rust-test'
+            Push-Location '.\time-release'
             try {
-                & cargo build --release | Out-Null
+                & cargo build --quiet --release | Out-Null
                 if ($LASTEXITCODE -ne 0) {
                     throw 'Rust baseline release build failed.'
                 }
@@ -85,7 +96,7 @@ try {
     } else {
         { & $nervExe $program --run | Out-Null }
     }
-    $nervAverage = Measure-Runs "Nerv ($NervExePath $ProgramPath)" $nervCommand
+    $nervAverage = Measure-Runs "Nerv ($(Format-DisplayPath $nervExe) $(Format-DisplayPath $program))" $nervCommand
 
     if ($SkipRustBaseline) {
         exit 0
@@ -99,7 +110,7 @@ try {
     } else {
         { & $rustExe | Out-Null }
     }
-    $rustAverage = Measure-Runs "Rust ($RustExePath)" $rustCommand
+    $rustAverage = Measure-Runs "Rust ($(Format-DisplayPath $rustExe))" $rustCommand
 
     Write-Host ""
     Write-Host "=== Comparison (avg over $Runs runs) ==="

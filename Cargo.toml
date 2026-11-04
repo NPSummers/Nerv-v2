@@ -7,7 +7,7 @@ members = [
     "crates/nerv-sema",
     "crates/nerv-syntax",
 ]
-exclude = ["old/rust-test"]
+exclude = ["old/rust-test", "time-release"]
 resolver = "3"
 
 [workspace.package]

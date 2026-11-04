@@ -1,3 +1,2 @@
 [env]
-LLVM_CONFIG_PATH = { value = "clang/bin/llvm-config.exe", relative = true }
-LLVM_SYS_231_PREFIX = { value = "clang", relative = true }
+LLVM_SYS_231_PREFIX = { value = "llvm", relative = true }

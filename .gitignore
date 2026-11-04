@@ -1,4 +1,5 @@
 /target/
+/time-release/target/
 /clang/
 *.pdb
 *.exe
@@ -7,3 +8,4 @@
 *.obj
 *.log
 /old/
+/llvm/

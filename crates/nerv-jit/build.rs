@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
@@ -6,14 +6,44 @@ fn main() {
         .nth(2)
         .unwrap()
         .to_path_buf();
-    let llvm = root.join("clang");
-    let dll = llvm.join("bin").join("LLVM-C.dll");
-
-    println!("cargo:rerun-if-changed={}", dll.display());
+    println!("cargo:rerun-if-env-changed=LLVM_SYS_231_PREFIX");
+    println!("cargo:rerun-if-env-changed=LLVM_CONFIG_PATH");
+    let llvm = env::var_os("LLVM_SYS_231_PREFIX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("llvm"));
     println!(
         "cargo:rustc-link-search=native={}",
         llvm.join("lib").display()
     );
+    if env::var("CARGO_CFG_TARGET_OS").unwrap() != "windows" {
+        if llvm.join("lib/libLLVM-23.dylib").is_file() {
+            println!("cargo:rustc-link-lib=dylib=LLVM-23");
+            return;
+        }
+        let config = env::var_os("LLVM_CONFIG_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| llvm.join("bin/llvm-config"));
+        let output = Command::new(config)
+            .args(["--link-shared", "--libnames"])
+            .output()
+            .expect("could not run llvm-config");
+        assert!(
+            output.status.success(),
+            "llvm-config failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for library in String::from_utf8(output.stdout).unwrap().split_whitespace() {
+            let name = library.strip_prefix("lib").unwrap_or(library);
+            let name = name
+                .strip_suffix(".dylib")
+                .or_else(|| name.strip_suffix(".so"))
+                .unwrap_or(name);
+            println!("cargo:rustc-link-lib=dylib={name}");
+        }
+        return;
+    }
+    let dll = llvm.join("bin/LLVM-C.dll");
+    println!("cargo:rerun-if-changed={}", dll.display());
     println!("cargo:rustc-link-lib=dylib=LLVM-C");
 
     let profile = PathBuf::from(env::var("OUT_DIR").unwrap())
