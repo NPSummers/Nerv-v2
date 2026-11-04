@@ -1,0 +1,7 @@
+fn first() -> i64
+    let broken = missing
+    broken + another_missing
+
+fn second() -> i64 => false
+
+fn main() -> i64 => 0

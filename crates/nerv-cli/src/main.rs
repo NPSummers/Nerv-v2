@@ -3,7 +3,19 @@ use std::{env, fs, process::ExitCode, time::Instant};
 use nerv_jit::{run_benches, run_main, run_tests};
 use nerv_lexer::Lexer;
 use nerv_sema::check_path;
-use nerv_syntax::parse;
+use nerv_syntax::{SourceFile, SourceId, SourceMap, Span, parse};
+
+fn report_backend_error(error: nerv_jit::Error, sources: &SourceMap) {
+    if let Some(span) = error.span {
+        eprintln!(
+            "{}",
+            sources.get(span.source).render(span, &error.message, &[])
+        );
+    } else {
+        // Runtime failures and LLVM infrastructure errors may have no source span.
+        eprintln!("{error}");
+    }
+}
 
 fn main() -> ExitCode {
     let mut args = env::args_os();
@@ -32,15 +44,20 @@ fn main() -> ExitCode {
         }
     };
 
+    let source_file = SourceFile {
+        id: SourceId(0),
+        path: path.clone().into(),
+        text: source.clone().into(),
+    };
     let tokens: Vec<_> = match Lexer::new(&source).collect() {
         Ok(tokens) => tokens,
         Err(error) => {
-            eprintln!(
-                "{}:{}:{}: {error}",
-                path.to_string_lossy(),
-                error.line,
-                error.column
-            );
+            let span = Span {
+                source: source_file.id,
+                start: error.span.start,
+                end: error.span.end,
+            };
+            eprintln!("{}", source_file.render(span, &error.to_string(), &[]));
             return ExitCode::FAILURE;
         }
     };
@@ -62,7 +79,10 @@ fn main() -> ExitCode {
         match parse(&source) {
             Ok(module) => println!("{module:#?}"),
             Err(error) => {
-                eprintln!("{}: {error}", path.to_string_lossy());
+                eprintln!(
+                    "{}",
+                    source_file.render(error.span(source_file.id), &error.to_string(), &[])
+                );
                 return ExitCode::FAILURE;
             }
         }
@@ -96,7 +116,7 @@ fn main() -> ExitCode {
         match run_main(&modules) {
             Ok(value) => println!("{value}"),
             Err(error) => {
-                eprintln!("{error}");
+                report_backend_error(error, &program.sources);
                 return ExitCode::FAILURE;
             }
         }
@@ -119,7 +139,7 @@ fn main() -> ExitCode {
         match run_tests(&modules) {
             Ok(count) => println!("{count} tests passed"),
             Err(error) => {
-                eprintln!("{error}");
+                report_backend_error(error, &program.sources);
                 return ExitCode::FAILURE;
             }
         }
@@ -146,7 +166,7 @@ fn main() -> ExitCode {
                 started.elapsed().as_secs_f64() * 1000.0
             ),
             Err(error) => {
-                eprintln!("{error}");
+                report_backend_error(error, &program.sources);
                 return ExitCode::FAILURE;
             }
         }

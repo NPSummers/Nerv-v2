@@ -1,0 +1,5 @@
+argument_type.nerv:2:28: error: argument type mismatch
+  |
+2 | fn main() -> i64 => add(1, "bad")
+  |                            ^^^^^
+  = note: parameter `right` expects Int, found String

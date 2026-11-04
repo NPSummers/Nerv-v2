@@ -5,17 +5,20 @@ use std::{
 };
 
 use nerv_syntax::{
-    self as syntax, BinaryOp, Expr, Function, Module, Statement, Struct as StructDecl, Type,
-    UnaryOp,
+    self as syntax, BinaryOp, Expr as SpannedExpr, ExprKind as Expr, Function, Module, SourceFile,
+    SourceId, SourceMap, Span, Statement as SpannedStatement, StatementKind as Statement,
+    Struct as StructDecl, Type, UnaryOp,
 };
 
 #[derive(Debug)]
 pub struct Program {
     pub modules: Vec<LoadedModule>,
+    pub sources: SourceMap,
 }
 
 #[derive(Debug)]
 pub struct LoadedModule {
+    pub source: SourceId,
     pub path: PathBuf,
     pub module: Module,
 }
@@ -35,6 +38,9 @@ struct VariantInfo {
 
 #[derive(Debug, Clone)]
 pub struct Error {
+    pub span: Option<Box<Span>>,
+    pub source: Option<Box<SourceFile>>,
+    pub notes: Vec<String>,
     pub path: PathBuf,
     pub line: usize,
     pub column: usize,
@@ -43,6 +49,9 @@ pub struct Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (Some(source), Some(span)) = (&self.source, self.span.as_deref()) {
+            return f.write_str(&source.render(*span, &self.message, &self.notes));
+        }
         write!(
             f,
             "{}:{}:{}: {}",
@@ -56,13 +65,89 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Error> {
+impl Error {
+    fn at(mut self, span: Span) -> Self {
+        if self.span.is_none() {
+            self.span = Some(Box::new(span));
+        }
+        self
+    }
+
+    fn note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+}
+
+#[derive(Debug)]
+pub struct Errors(pub Vec<Error>);
+
+impl From<Error> for Errors {
+    fn from(error: Error) -> Self {
+        Self(vec![error])
+    }
+}
+
+impl fmt::Display for Errors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, error) in self.0.iter().enumerate() {
+            if index > 0 {
+                writeln!(f, "\n")?;
+            }
+            write!(f, "{error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Errors {}
+
+impl Errors {
+    fn with_sources(mut self, sources: &SourceMap) -> Self {
+        for error in &mut self.0 {
+            let source = error
+                .span
+                .as_deref()
+                .map(|span| sources.get(span.source))
+                .or_else(|| sources.find(&error.path));
+            if let Some(source) = source {
+                let span = **error.span.get_or_insert_with(|| {
+                    let start = source.offset(error.line.max(1), error.column.max(1));
+                    let length = source.text[start..]
+                        .chars()
+                        .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                        .map(char::len_utf8)
+                        .sum::<usize>();
+                    Box::new(Span {
+                        source: source.id,
+                        start,
+                        end: start + length,
+                    })
+                });
+                (error.line, error.column) = source.location(span.start);
+                error.path = source.path.clone();
+                error.source = Some(Box::new(source.clone()));
+            }
+        }
+        self
+    }
+}
+
+pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Errors> {
     let mut modules = Vec::new();
     let mut visited = HashSet::new();
     let mut loading = HashSet::new();
-    load(path.as_ref(), &mut modules, &mut visited, &mut loading)?;
-    check(&modules)?;
-    Ok(Program { modules })
+    let mut sources = SourceMap::default();
+    load(
+        path.as_ref(),
+        &mut modules,
+        &mut visited,
+        &mut loading,
+        &mut sources,
+    )
+    .map_err(|error| Errors::from(error).with_sources(&sources))?;
+    check(&modules).map_err(|errors| errors.with_sources(&sources))?;
+    Ok(Program { modules, sources })
 }
 
 fn load(
@@ -70,6 +155,7 @@ fn load(
     modules: &mut Vec<LoadedModule>,
     visited: &mut HashSet<PathBuf>,
     loading: &mut HashSet<PathBuf>,
+    sources: &mut SourceMap,
 ) -> Result<(), Error> {
     let path = path
         .canonicalize()
@@ -82,7 +168,9 @@ fn load(
     }
     let source =
         fs::read_to_string(&path).map_err(|error| error_at(&path, 0, 0, error.to_string()))?;
-    let module = syntax::parse(&source).map_err(|error| frontend_error(&path, error))?;
+    let id = sources.add(path.clone(), source.clone());
+    let module =
+        syntax::parse_source(&source, id).map_err(|error| frontend_error(&path, id, error))?;
     for import in &module.imports {
         if import.path.first().is_some_and(|part| part == "nerv") {
             continue;
@@ -95,15 +183,32 @@ fn load(
             target.push(part);
         }
         target.set_extension("nerv");
-        load(&target, modules, visited, loading)?;
+        load(&target, modules, visited, loading, sources).map_err(|mut error| {
+            if error.span.is_none() && !sources.files.iter().any(|file| file.path == error.path) {
+                error.path = path.clone();
+                error = error
+                    .at(import.span)
+                    .note(format!("while importing {}", target.display()));
+            } else if error.message == "import cycle" {
+                error.path = path.clone();
+                error = error
+                    .at(import.span)
+                    .note("remove an import to break the cycle");
+            }
+            error
+        })?;
     }
     loading.remove(&path);
     visited.insert(path.clone());
-    modules.push(LoadedModule { path, module });
+    modules.push(LoadedModule {
+        source: id,
+        path,
+        module,
+    });
     Ok(())
 }
 
-fn check(modules: &[LoadedModule]) -> Result<(), Error> {
+fn check(modules: &[LoadedModule]) -> Result<(), Errors> {
     let mut functions = HashMap::new();
     let mut structs = HashMap::new();
     let mut variants = HashMap::new();
@@ -117,7 +222,9 @@ fn check(modules: &[LoadedModule]) -> Result<(), Error> {
                     structure.line,
                     structure.column,
                     "duplicate struct",
-                ));
+                )
+                .at(structure.span)
+                .into());
             }
         }
         for enumeration in &loaded.module.enums {
@@ -143,7 +250,9 @@ fn check(modules: &[LoadedModule]) -> Result<(), Error> {
                         variant.line,
                         variant.column,
                         "duplicate enum variant",
-                    ));
+                    )
+                    .at(variant.span)
+                    .into());
                 }
             }
         }
@@ -154,7 +263,9 @@ fn check(modules: &[LoadedModule]) -> Result<(), Error> {
                     trait_decl.line,
                     trait_decl.column,
                     "duplicate trait",
-                ));
+                )
+                .at(trait_decl.span)
+                .into());
             }
         }
         for structure in &loaded.module.structs {
@@ -171,7 +282,9 @@ fn check(modules: &[LoadedModule]) -> Result<(), Error> {
                         implementation.line,
                         implementation.column,
                         "duplicate trait implementation",
-                    ));
+                    )
+                    .at(implementation.span)
+                    .into());
                 }
             }
         }
@@ -182,7 +295,9 @@ fn check(modules: &[LoadedModule]) -> Result<(), Error> {
                     function.line,
                     function.column,
                     "duplicate function",
-                ));
+                )
+                .at(function.span)
+                .into());
             }
         }
     }
@@ -195,24 +310,43 @@ fn check(modules: &[LoadedModule]) -> Result<(), Error> {
                         implementation.line,
                         implementation.column,
                         "unknown trait",
-                    ));
+                    )
+                    .at(implementation.span)
+                    .into());
                 }
             }
         }
     }
+    let mut errors = Vec::new();
     for loaded in modules {
         for function in all_functions(&loaded.module) {
-            check_function(
+            if let Err(error) = check_function(
                 &loaded.path,
                 function,
                 &functions,
                 &structs,
                 &variants,
                 &implementations,
-            )?;
+            ) {
+                errors.push(error.at(function.span));
+                // A function is a recovery boundary: don't invent types for failed
+                // bindings, or report dependent errors from the rest of its body.
+                if errors.len() == 20 {
+                    errors
+                        .last_mut()
+                        .unwrap()
+                        .notes
+                        .push("stopped after 20 errors; fix these before checking again".into());
+                    return Err(Errors(errors));
+                }
+            }
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Errors(errors))
+    }
 }
 
 fn all_functions(module: &Module) -> impl Iterator<Item = &Function> {
@@ -258,143 +392,161 @@ fn check_function(
                 parameter.line,
                 parameter.column,
                 "duplicate parameter",
-            ));
+            )
+            .at(parameter.span));
         }
     }
     let mut last = Type::Void;
     let mut returns = false;
     for statement in &function.body {
-        last = match statement {
-            Statement::Let {
-                name,
-                mutable,
-                ty,
-                value,
-                line,
-                column,
-                ..
-            } => {
-                let actual = expr_type(path, value, &values, functions, structs, variants)?;
-                if actual == Type::Void {
-                    return Err(error_at(path, *line, *column, "cannot bind a void value"));
+        last = (|| {
+            Ok(match &statement.kind {
+                Statement::Let {
+                    name,
+                    mutable,
+                    ty,
+                    value,
+                    line,
+                    column,
+                    ..
+                } => {
+                    let actual = expr_type(path, value, &values, functions, structs, variants)?;
+                    if actual == Type::Void {
+                        return Err(error_at(path, *line, *column, "cannot bind a void value"));
+                    }
+                    if let Some(expected) = ty
+                        && *expected != actual
+                        && !implements(&actual, expected, implementations)
+                    {
+                        return Err(error_at(
+                            path,
+                            *line,
+                            *column,
+                            format!("expected {expected:?}, found {actual:?}"),
+                        )
+                        .at(value.span)
+                        .note("the initializer must match the binding's type annotation"));
+                    }
+                    values.insert(
+                        name.clone(),
+                        Binding {
+                            ty: binding_type(ty, actual),
+                            mutable: *mutable,
+                        },
+                    );
+                    Type::Void
                 }
-                if let Some(expected) = ty
-                    && *expected != actual
-                    && !implements(&actual, expected, implementations)
-                {
-                    return Err(error_at(
+                Statement::Assign { name, value } => {
+                    let expected = values
+                        .get(name)
+                        .ok_or_else(|| error_at(path, 0, 0, format!("unknown name `{name}`")))?;
+                    if !expected.mutable {
+                        return Err(error_at(path, 0, 0, format!("cannot assign to `{name}`")));
+                    }
+                    let actual = expr_type(path, value, &values, functions, structs, variants)?;
+                    if actual != expected.ty {
+                        return Err(error_at(path, 0, 0, "assignment type mismatch")
+                            .at(value.span)
+                            .note(format!("expected {:?}, found {actual:?}", expected.ty)));
+                    }
+                    Type::Void
+                }
+                Statement::AssignIndex { base, index, value } => {
+                    require_mutable(path, base, &values)?;
+                    let Type::Array(element) =
+                        expr_type(path, base, &values, functions, structs, variants)?
+                    else {
+                        return Err(error_at(path, 0, 0, "index assignment requires an array"));
+                    };
+                    if expr_type(path, index, &values, functions, structs, variants)? != Type::Int
+                        || expr_type(path, value, &values, functions, structs, variants)?
+                            != *element
+                    {
+                        return Err(error_at(path, 0, 0, "invalid array assignment"));
+                    }
+                    Type::Void
+                }
+                Statement::AssignField { base, name, value } => {
+                    require_mutable(path, base, &values)?;
+                    check_field_assignment(
+                        path, base, name, value, &values, functions, structs, variants,
+                    )?;
+                    Type::Void
+                }
+                Statement::While { condition, body } => {
+                    if expr_type(path, condition, &values, functions, structs, variants)?
+                        != Type::Bool
+                    {
+                        return Err(
+                            error_at(path, 0, 0, "while condition must be bool").at(condition.span)
+                        );
+                    }
+                    block_type(
                         path,
-                        *line,
-                        *column,
-                        format!("expected {expected:?}, found {actual:?}"),
-                    ));
+                        body,
+                        &mut values.clone(),
+                        functions,
+                        structs,
+                        variants,
+                    )?;
+                    Type::Void
                 }
-                values.insert(
-                    name.clone(),
-                    Binding {
-                        ty: binding_type(ty, actual),
-                        mutable: *mutable,
-                    },
-                );
-                Type::Void
-            }
-            Statement::Assign { name, value } => {
-                let expected = values
-                    .get(name)
-                    .ok_or_else(|| error_at(path, 0, 0, format!("unknown name `{name}`")))?;
-                if !expected.mutable {
-                    return Err(error_at(path, 0, 0, format!("cannot assign to `{name}`")));
-                }
-                let actual = expr_type(path, value, &values, functions, structs, variants)?;
-                if actual != expected.ty {
-                    return Err(error_at(path, 0, 0, "assignment type mismatch"));
-                }
-                Type::Void
-            }
-            Statement::AssignIndex { base, index, value } => {
-                require_mutable(path, base, &values)?;
-                let Type::Array(element) =
-                    expr_type(path, base, &values, functions, structs, variants)?
-                else {
-                    return Err(error_at(path, 0, 0, "index assignment requires an array"));
-                };
-                if expr_type(path, index, &values, functions, structs, variants)? != Type::Int
-                    || expr_type(path, value, &values, functions, structs, variants)? != *element
-                {
-                    return Err(error_at(path, 0, 0, "invalid array assignment"));
-                }
-                Type::Void
-            }
-            Statement::AssignField { base, name, value } => {
-                require_mutable(path, base, &values)?;
-                check_field_assignment(
-                    path, base, name, value, &values, functions, structs, variants,
-                )?;
-                Type::Void
-            }
-            Statement::While { condition, body } => {
-                if expr_type(path, condition, &values, functions, structs, variants)? != Type::Bool
-                {
-                    return Err(error_at(path, 0, 0, "while condition must be bool"));
-                }
-                block_type(
-                    path,
+                Statement::For {
+                    name,
+                    start,
+                    end,
                     body,
-                    &mut values.clone(),
-                    functions,
-                    structs,
-                    variants,
-                )?;
-                Type::Void
-            }
-            Statement::For {
-                name,
-                start,
-                end,
-                body,
-                ..
-            } => {
-                if expr_type(path, start, &values, functions, structs, variants)? != Type::Int
-                    || expr_type(path, end, &values, functions, structs, variants)? != Type::Int
-                {
-                    return Err(error_at(path, 0, 0, "range bounds must be integers"));
+                    ..
+                } => {
+                    if expr_type(path, start, &values, functions, structs, variants)? != Type::Int
+                        || expr_type(path, end, &values, functions, structs, variants)? != Type::Int
+                    {
+                        return Err(error_at(path, 0, 0, "range bounds must be integers"));
+                    }
+                    let mut loop_values = values.clone();
+                    loop_values.insert(
+                        name.clone(),
+                        Binding {
+                            ty: Type::Int,
+                            mutable: false,
+                        },
+                    );
+                    block_type(path, body, &mut loop_values, functions, structs, variants)?;
+                    Type::Void
                 }
-                let mut loop_values = values.clone();
-                loop_values.insert(
-                    name.clone(),
-                    Binding {
-                        ty: Type::Int,
-                        mutable: false,
-                    },
-                );
-                block_type(path, body, &mut loop_values, functions, structs, variants)?;
-                Type::Void
-            }
-            Statement::Return(value) => {
-                if function.result == Type::Void {
-                    return Err(error_at(
-                        path,
-                        function.line,
-                        function.column,
-                        "void functions do not return a value",
-                    ));
+                Statement::Return(value) => {
+                    if function.result == Type::Void {
+                        return Err(error_at(
+                            path,
+                            function.line,
+                            function.column,
+                            "void functions do not return a value",
+                        )
+                        .at(value.span));
+                    }
+                    let actual = expr_type(path, value, &values, functions, structs, variants)?;
+                    if actual != function.result {
+                        return Err(error_at(
+                            path,
+                            function.line,
+                            function.column,
+                            format!("expected {:?}, found {actual:?}", function.result),
+                        )
+                        .at(value.span)
+                        .note(format!(
+                            "function `{}` declares result {:?}",
+                            function.name, function.result
+                        )));
+                    }
+                    returns = true;
+                    Type::Void
                 }
-                let actual = expr_type(path, value, &values, functions, structs, variants)?;
-                if actual != function.result {
-                    return Err(error_at(
-                        path,
-                        function.line,
-                        function.column,
-                        format!("expected {:?}, found {actual:?}", function.result),
-                    ));
+                Statement::Expr(value) => {
+                    expr_type(path, value, &values, functions, structs, variants)?
                 }
-                returns = true;
-                Type::Void
-            }
-            Statement::Expr(value) => {
-                expr_type(path, value, &values, functions, structs, variants)?
-            }
-        };
+            })
+        })()
+        .map_err(|error: Error| error.at(statement.span))?;
     }
     if function.result != Type::Void && !returns && last != function.result {
         return Err(error_at(
@@ -402,20 +554,43 @@ fn check_function(
             function.line,
             function.column,
             format!("expected {:?}, found {last:?}", function.result),
-        ));
+        )
+        .at(function
+            .body
+            .last()
+            .map_or(function.span, |statement| match &statement.kind {
+                Statement::Expr(value) => value.span,
+                _ => statement.span,
+            }))
+        .note(format!(
+            "function `{}` declares result {:?}",
+            function.name, function.result
+        )));
     }
     Ok(())
 }
 
 fn expr_type(
     path: &Path,
-    expr: &Expr,
+    expr: &SpannedExpr,
     values: &HashMap<String, Binding>,
     functions: &HashMap<&str, &Function>,
     structs: &HashMap<&str, &StructDecl>,
     variants: &HashMap<&str, VariantInfo>,
 ) -> Result<Type, Error> {
-    match expr {
+    expr_type_inner(path, expr, values, functions, structs, variants)
+        .map_err(|error| error.at(expr.span))
+}
+
+fn expr_type_inner(
+    path: &Path,
+    expr: &SpannedExpr,
+    values: &HashMap<String, Binding>,
+    functions: &HashMap<&str, &Function>,
+    structs: &HashMap<&str, &StructDecl>,
+    variants: &HashMap<&str, VariantInfo>,
+) -> Result<Type, Error> {
+    match &expr.kind {
         Expr::Int(_) => Ok(Type::Int),
         Expr::Float(_) => Ok(Type::Float),
         Expr::String(_) => Ok(Type::String),
@@ -423,7 +598,9 @@ fn expr_type(
         Expr::Array(elements) => {
             for value in elements {
                 if expr_type(path, value, values, functions, structs, variants)? != Type::Int {
-                    return Err(error_at(path, 0, 0, "arrays currently require i64 values"));
+                    return Err(
+                        error_at(path, 0, 0, "arrays currently require i64 values").at(value.span)
+                    );
                 }
             }
             Ok(Type::Array(Box::new(Type::Int)))
@@ -454,7 +631,10 @@ fn expr_type(
                     result: Box::new(function.result.clone()),
                 })
             })
-            .ok_or_else(|| error_at(path, 0, 0, format!("unknown name `{name}`"))),
+            .ok_or_else(|| {
+                error_at(path, 0, 0, format!("unknown name `{name}`"))
+                    .note("names must be declared in this scope before use; check the spelling")
+            }),
         Expr::Lambda {
             params,
             result,
@@ -474,7 +654,9 @@ fn expr_type(
                 .collect();
             let actual = expr_type(path, body, &lambda_values, functions, structs, variants)?;
             if actual != *result {
-                return Err(error_at(path, 0, 0, "lambda result type mismatch"));
+                return Err(error_at(path, 0, 0, "lambda result type mismatch")
+                    .at(body.span)
+                    .note(format!("expected {result:?}, found {actual:?}")));
             }
             Ok(Type::Function {
                 params: params.iter().map(|param| param.ty.clone()).collect(),
@@ -497,19 +679,29 @@ fn expr_type(
                 .get(method.as_str())
                 .ok_or_else(|| error_at(path, 0, 0, format!("unknown method `{name}`")))?;
             if function.params.len() != args.len() + 1 {
-                return Err(error_at(path, 0, 0, "wrong argument count"));
+                return Err(error_at(path, 0, 0, "wrong argument count").note(format!(
+                    "method `{name}` expects {} arguments, found {}",
+                    function.params.len().saturating_sub(1),
+                    args.len()
+                )));
             }
             if function.params[0].ty != Type::Named(type_name.clone()) {
                 return Err(error_at(path, 0, 0, "invalid method receiver"));
             }
             for (arg, parameter) in args.iter().zip(function.params.iter().skip(1)) {
-                if expr_type(path, arg, values, functions, structs, variants)? != parameter.ty {
+                let actual = expr_type(path, arg, values, functions, structs, variants)?;
+                if actual != parameter.ty {
                     return Err(error_at(
                         path,
                         parameter.line,
                         parameter.column,
                         "argument type mismatch",
-                    ));
+                    )
+                    .at(arg.span)
+                    .note(format!(
+                        "parameter `{}` expects {:?}, found {actual:?}",
+                        parameter.name, parameter.ty
+                    )));
                 }
             }
             Ok(function.result.clone())
@@ -583,7 +775,7 @@ fn expr_type(
             else_body,
         } => {
             if expr_type(path, condition, values, functions, structs, variants)? != Type::Bool {
-                return Err(error_at(path, 0, 0, "if condition must be bool"));
+                return Err(error_at(path, 0, 0, "if condition must be bool").at(condition.span));
             }
             let then_type = block_type(
                 path,
@@ -615,6 +807,7 @@ fn expr_type(
             }
         }
         Expr::Binary { left, op, right } => {
+            let right_span = right.span;
             let left = expr_type(path, left, values, functions, structs, variants)?;
             let right = expr_type(path, right, values, functions, structs, variants)?;
             match op {
@@ -656,11 +849,16 @@ fn expr_type(
                 {
                     Ok(left)
                 }
-                _ => Err(error_at(path, 0, 0, "invalid binary operation")),
+                _ => Err(error_at(path, 0, 0, "invalid binary operation")
+                    .at(right_span)
+                    .note(format!(
+                        "operator {op:?} cannot combine {left:?} and {right:?}"
+                    ))),
             }
         }
         Expr::Call { callee, args } => {
             let name = callee_name(callee);
+            let argument_exprs = args;
             let args = args
                 .iter()
                 .map(|arg| expr_type(path, arg, values, functions, structs, variants))
@@ -672,12 +870,14 @@ fn expr_type(
                     return Err(error_at(path, 0, 0, "unsupported call target"));
                 };
                 if args != params {
-                    return Err(error_at(path, 0, 0, "function argument type mismatch"));
+                    return Err(error_at(path, 0, 0, "function argument type mismatch")
+                        .note(format!("expected {params:?}, found {args:?}")));
                 }
                 return Ok(*result);
             };
             if let Some(result) = runtime_type(&name, &args) {
-                return result.ok_or_else(|| error_at(path, 0, 0, "invalid runtime call"));
+                return result.ok_or_else(|| error_at(path, 0, 0, "invalid runtime call")
+                    .note(format!("`{name}` does not accept argument types {args:?}; check the builtin signature")));
             }
             let variant = name.rsplit('.').next().unwrap();
             if let Some(info) = variants.get(variant) {
@@ -697,29 +897,42 @@ fn expr_type(
             }) = values.get(name.as_str())
             {
                 if args != *params {
-                    return Err(error_at(path, 0, 0, "function argument type mismatch"));
+                    return Err(error_at(path, 0, 0, "function argument type mismatch")
+                        .note(format!("expected {params:?}, found {args:?}")));
                 }
                 return Ok((**result).clone());
             }
-            let function = functions
-                .get(name.as_str())
-                .ok_or_else(|| error_at(path, 0, 0, format!("unknown function `{name}`")))?;
+            let function = functions.get(name.as_str()).ok_or_else(|| {
+                error_at(path, 0, 0, format!("unknown function `{name}`"))
+                    .at(callee.span)
+                    .note("check the spelling and import the module that defines this function")
+            })?;
             if args.len() != function.params.len() {
-                return Err(error_at(
-                    path,
-                    function.line,
-                    function.column,
-                    "wrong argument count",
-                ));
+                return Err(
+                    error_at(path, function.line, function.column, "wrong argument count")
+                        .at(expr.span)
+                        .note(format!(
+                            "function `{name}` expects {} arguments, found {}",
+                            function.params.len(),
+                            args.len()
+                        )),
+                );
             }
-            for (arg, parameter) in args.iter().zip(&function.params) {
+            for ((arg, parameter), source_arg) in
+                args.iter().zip(&function.params).zip(argument_exprs)
+            {
                 if *arg != parameter.ty {
                     return Err(error_at(
                         path,
                         parameter.line,
                         parameter.column,
                         "argument type mismatch",
-                    ));
+                    )
+                    .at(source_arg.span)
+                    .note(format!(
+                        "parameter `{}` expects {:?}, found {arg:?}",
+                        parameter.name, parameter.ty
+                    )));
                 }
             }
             Ok(function.result.clone())
@@ -737,8 +950,14 @@ fn expr_type(
                     .iter()
                     .find(|field| field.name == *name)
                     .ok_or_else(|| error_at(path, 0, 0, format!("unknown field `{name}`")))?;
-                if expr_type(path, value, values, functions, structs, variants)? != field.ty {
-                    return Err(error_at(path, 0, 0, "struct field type mismatch"));
+                let actual = expr_type(path, value, values, functions, structs, variants)?;
+                if actual != field.ty {
+                    return Err(error_at(path, 0, 0, "struct field type mismatch")
+                        .at(value.span)
+                        .note(format!(
+                            "field `{name}` expects {:?}, found {actual:?}",
+                            field.ty
+                        )));
                 }
             }
             Ok(Type::Named(name.clone()))
@@ -761,7 +980,7 @@ fn expr_type(
                 return Err(error_at(path, 0, 0, "indexing requires an array"));
             };
             if expr_type(path, index, values, functions, structs, variants)? != Type::Int {
-                return Err(error_at(path, 0, 0, "array index must be an integer"));
+                return Err(error_at(path, 0, 0, "array index must be an integer").at(index.span));
             }
             Ok(*element)
         }
@@ -770,9 +989,9 @@ fn expr_type(
 
 fn check_field_assignment(
     path: &Path,
-    base: &Expr,
+    base: &SpannedExpr,
     name: &str,
-    value: &Expr,
+    value: &SpannedExpr,
     values: &HashMap<String, Binding>,
     functions: &HashMap<&str, &Function>,
     structs: &HashMap<&str, &StructDecl>,
@@ -788,17 +1007,22 @@ fn check_field_assignment(
         .ok_or_else(|| error_at(path, 0, 0, format!("unknown field `{name}`")))?;
     let actual = expr_type(path, value, values, functions, structs, variants)?;
     if actual != field.ty {
-        return Err(error_at(path, 0, 0, "field assignment type mismatch"));
+        return Err(error_at(path, 0, 0, "field assignment type mismatch")
+            .at(value.span)
+            .note(format!(
+                "field `{name}` expects {:?}, found {actual:?}",
+                field.ty
+            )));
     }
     Ok(())
 }
 
 fn require_mutable(
     path: &Path,
-    base: &Expr,
+    base: &SpannedExpr,
     values: &HashMap<String, Binding>,
 ) -> Result<(), Error> {
-    let Expr::Name(name) = base else {
+    let Expr::Name(name) = &base.kind else {
         return Err(error_at(path, 0, 0, "assignment target must be a binding"));
     };
     let binding = values
@@ -807,12 +1031,14 @@ fn require_mutable(
     if binding.mutable {
         Ok(())
     } else {
-        Err(error_at(path, 0, 0, format!("cannot assign to `{name}`")))
+        Err(error_at(path, 0, 0, format!("cannot assign to `{name}`"))
+            .at(base.span)
+            .note("declare the binding with `let mut` to allow assignment"))
     }
 }
 
-fn callee_name(expr: &Expr) -> Option<String> {
-    match expr {
+fn callee_name(expr: &SpannedExpr) -> Option<String> {
+    match &expr.kind {
         Expr::Name(name) => Some(name.clone()),
         Expr::Field { base, name } => Some(format!("{}.{}", callee_name(base)?, name)),
         _ => None,
@@ -988,7 +1214,7 @@ fn runtime_type(name: &str, args: &[Type]) -> Option<Option<Type>> {
 
 fn block_type(
     path: &Path,
-    body: &[Statement],
+    body: &[SpannedStatement],
     values: &mut HashMap<String, Binding>,
     functions: &HashMap<&str, &Function>,
     structs: &HashMap<&str, &StructDecl>,
@@ -996,113 +1222,126 @@ fn block_type(
 ) -> Result<Type, Error> {
     let mut last = Type::Void;
     for statement in body {
-        last = match statement {
-            Statement::Let {
-                name,
-                mutable,
-                ty,
-                value,
-                ..
-            } => {
-                let actual = expr_type(path, value, values, functions, structs, variants)?;
-                if actual == Type::Void {
-                    return Err(error_at(path, 0, 0, "cannot bind a void value"));
+        last = (|| {
+            Ok(match &statement.kind {
+                Statement::Let {
+                    name,
+                    mutable,
+                    ty,
+                    value,
+                    ..
+                } => {
+                    let actual = expr_type(path, value, values, functions, structs, variants)?;
+                    if actual == Type::Void {
+                        return Err(error_at(path, 0, 0, "cannot bind a void value"));
+                    }
+                    if let Some(expected) = ty
+                        && *expected != actual
+                    {
+                        return Err(error_at(path, 0, 0, "let binding type mismatch")
+                            .at(value.span)
+                            .note(format!("expected {expected:?}, found {actual:?}")));
+                    }
+                    values.insert(
+                        name.clone(),
+                        Binding {
+                            ty: binding_type(ty, actual),
+                            mutable: *mutable,
+                        },
+                    );
+                    Type::Void
                 }
-                if let Some(expected) = ty
-                    && *expected != actual
-                {
-                    return Err(error_at(path, 0, 0, "let binding type mismatch"));
+                Statement::Assign { name, value } => {
+                    let expected = values
+                        .get(name)
+                        .ok_or_else(|| error_at(path, 0, 0, format!("unknown name `{name}`")))?;
+                    if !expected.mutable {
+                        return Err(error_at(path, 0, 0, format!("cannot assign to `{name}`")));
+                    }
+                    let actual = expr_type(path, value, values, functions, structs, variants)?;
+                    if actual != expected.ty {
+                        return Err(error_at(path, 0, 0, "assignment type mismatch")
+                            .at(value.span)
+                            .note(format!("expected {:?}, found {actual:?}", expected.ty)));
+                    }
+                    Type::Void
                 }
-                values.insert(
-                    name.clone(),
-                    Binding {
-                        ty: binding_type(ty, actual),
-                        mutable: *mutable,
-                    },
-                );
-                Type::Void
-            }
-            Statement::Assign { name, value } => {
-                let expected = values
-                    .get(name)
-                    .ok_or_else(|| error_at(path, 0, 0, format!("unknown name `{name}`")))?;
-                if !expected.mutable {
-                    return Err(error_at(path, 0, 0, format!("cannot assign to `{name}`")));
+                Statement::AssignIndex { base, index, value } => {
+                    require_mutable(path, base, values)?;
+                    let Type::Array(element) =
+                        expr_type(path, base, values, functions, structs, variants)?
+                    else {
+                        return Err(error_at(path, 0, 0, "index assignment requires an array"));
+                    };
+                    if expr_type(path, index, values, functions, structs, variants)? != Type::Int
+                        || expr_type(path, value, values, functions, structs, variants)? != *element
+                    {
+                        return Err(error_at(path, 0, 0, "invalid array assignment"));
+                    }
+                    Type::Void
                 }
-                let actual = expr_type(path, value, values, functions, structs, variants)?;
-                if actual != expected.ty {
-                    return Err(error_at(path, 0, 0, "assignment type mismatch"));
+                Statement::AssignField { base, name, value } => {
+                    require_mutable(path, base, values)?;
+                    check_field_assignment(
+                        path, base, name, value, values, functions, structs, variants,
+                    )?;
+                    Type::Void
                 }
-                Type::Void
-            }
-            Statement::AssignIndex { base, index, value } => {
-                require_mutable(path, base, values)?;
-                let Type::Array(element) =
-                    expr_type(path, base, values, functions, structs, variants)?
-                else {
-                    return Err(error_at(path, 0, 0, "index assignment requires an array"));
-                };
-                if expr_type(path, index, values, functions, structs, variants)? != Type::Int
-                    || expr_type(path, value, values, functions, structs, variants)? != *element
-                {
-                    return Err(error_at(path, 0, 0, "invalid array assignment"));
+                Statement::While { condition, body } => {
+                    if expr_type(path, condition, values, functions, structs, variants)?
+                        != Type::Bool
+                    {
+                        return Err(
+                            error_at(path, 0, 0, "while condition must be bool").at(condition.span)
+                        );
+                    }
+                    block_type(
+                        path,
+                        body,
+                        &mut values.clone(),
+                        functions,
+                        structs,
+                        variants,
+                    )?;
+                    Type::Void
                 }
-                Type::Void
-            }
-            Statement::AssignField { base, name, value } => {
-                require_mutable(path, base, values)?;
-                check_field_assignment(
-                    path, base, name, value, values, functions, structs, variants,
-                )?;
-                Type::Void
-            }
-            Statement::While { condition, body } => {
-                if expr_type(path, condition, values, functions, structs, variants)? != Type::Bool {
-                    return Err(error_at(path, 0, 0, "while condition must be bool"));
-                }
-                block_type(
-                    path,
+                Statement::For {
+                    name,
+                    start,
+                    end,
                     body,
-                    &mut values.clone(),
-                    functions,
-                    structs,
-                    variants,
-                )?;
-                Type::Void
-            }
-            Statement::For {
-                name,
-                start,
-                end,
-                body,
-                ..
-            } => {
-                if expr_type(path, start, values, functions, structs, variants)? != Type::Int
-                    || expr_type(path, end, values, functions, structs, variants)? != Type::Int
-                {
-                    return Err(error_at(path, 0, 0, "range bounds must be integers"));
+                    ..
+                } => {
+                    if expr_type(path, start, values, functions, structs, variants)? != Type::Int
+                        || expr_type(path, end, values, functions, structs, variants)? != Type::Int
+                    {
+                        return Err(error_at(path, 0, 0, "range bounds must be integers"));
+                    }
+                    let mut loop_values = values.clone();
+                    loop_values.insert(
+                        name.clone(),
+                        Binding {
+                            ty: Type::Int,
+                            mutable: false,
+                        },
+                    );
+                    block_type(path, body, &mut loop_values, functions, structs, variants)?;
+                    Type::Void
                 }
-                let mut loop_values = values.clone();
-                loop_values.insert(
-                    name.clone(),
-                    Binding {
-                        ty: Type::Int,
-                        mutable: false,
-                    },
-                );
-                block_type(path, body, &mut loop_values, functions, structs, variants)?;
-                Type::Void
-            }
-            Statement::Return(_) => {
-                return Err(error_at(
-                    path,
-                    0,
-                    0,
-                    "return is only supported directly in a function body",
-                ));
-            }
-            Statement::Expr(value) => expr_type(path, value, values, functions, structs, variants)?,
-        };
+                Statement::Return(_) => {
+                    return Err(error_at(
+                        path,
+                        0,
+                        0,
+                        "return is only supported directly in a function body",
+                    ));
+                }
+                Statement::Expr(value) => {
+                    expr_type(path, value, values, functions, structs, variants)?
+                }
+            })
+        })()
+        .map_err(|error: Error| error.at(statement.span))?;
     }
     Ok(last)
 }
@@ -1127,19 +1366,26 @@ fn binding_type(annotation: &Option<Type>, actual: Type) -> Type {
 }
 fn error_at(path: &Path, line: usize, column: usize, message: impl Into<String>) -> Error {
     Error {
+        span: None,
+        source: None,
+        notes: Vec::new(),
         path: path.to_path_buf(),
         line,
         column,
         message: message.into(),
     }
 }
-fn frontend_error(path: &Path, error: syntax::FrontendError) -> Error {
+fn frontend_error(path: &Path, source: SourceId, error: syntax::FrontendError) -> Error {
     match error {
         syntax::FrontendError::Lex(error) => {
-            error_at(path, error.line, error.column, error.to_string())
+            error_at(path, error.line, error.column, error.to_string()).at(Span {
+                source,
+                start: error.span.start,
+                end: error.span.end,
+            })
         }
         syntax::FrontendError::Parse(error) => {
-            error_at(path, error.line, error.column, error.message)
+            error_at(path, error.line, error.column, error.message).at(error.span)
         }
     }
 }
@@ -1157,6 +1403,53 @@ mod tests {
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn loaded_sources_and_cloned_modules_retain_ids() {
+        let root = test_directory();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("helper.nerv"), "fn answer() -> i64 => 42\n").unwrap();
+        fs::write(
+            root.join("main.nerv"),
+            "import helper\nimport helper\nfn main() -> i64 => answer()\n",
+        )
+        .unwrap();
+        let program = check_path(root.join("main.nerv")).unwrap();
+        assert_eq!(program.sources.files.len(), 2);
+        assert_eq!(program.modules.len(), 2);
+        for loaded in &program.modules {
+            assert_eq!(loaded.source, loaded.module.source);
+            assert_eq!(loaded.path, program.sources.get(loaded.source).path);
+            let cloned = loaded.module.clone();
+            assert_eq!(cloned.functions[0].span.source, loaded.source);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn errors_are_bounded_and_keep_the_original_source() {
+        let root = test_directory();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("main.nerv");
+        let source = (0..25)
+            .map(|index| format!("fn bad_{index}() -> i64 => false\n"))
+            .collect::<String>();
+        fs::write(&path, source).unwrap();
+        let errors = check_path(&path).unwrap_err();
+        assert_eq!(errors.0.len(), 20);
+        assert!(
+            errors
+                .0
+                .iter()
+                .all(|error| error.span.is_some() && error.line > 0 && error.column > 0)
+        );
+        fs::write(&path, "changed after checking").unwrap();
+        let rendered = errors.to_string();
+        assert!(rendered.contains("fn bad_0() -> i64 => false"));
+        assert!(!rendered.contains("changed after checking"));
+        assert!(rendered.contains("stopped after 20 errors"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

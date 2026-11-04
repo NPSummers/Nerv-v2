@@ -1,0 +1,4 @@
+backend.nerv:2:5: error: enum payloads currently require at most one i64 value
+  |
+2 |     Text(string)
+  |     ^^^^^^^^^^^^

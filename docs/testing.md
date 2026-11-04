@@ -19,6 +19,9 @@ These commands require Rust 1.94 or newer and native build tools. They reuse the
 - Unit tests in the lexer, syntax, semantic checker, JIT, and runtime crates.
 - Executable specification examples and module/language-rule checks in `crates/nerv-cli/tests/language_rules.rs`.
 - CLI fixtures in `crates/nerv-cli/tests/fixtures`, run by `crates/nerv-cli/tests/regressions.rs`: parsing, checking, execution, and compile-time/runtime failures. They cover structs, enums, traits, methods, arrays, lambdas, multi-file imports, output, and exit status.
+- Exact diagnostic snapshots in `crates/nerv-cli/tests/diagnostics`, run by `diagnostics.rs`: lexical/parser errors, type mismatches, unresolved names, invalid calls, imported-file errors, independent errors, EOF, and backend errors. Only the absolute fixture-root path and platform line endings are normalized.
+
+For a diagnostic change, add a `.nerv` reproducer and its reviewed `.stderr` output under `tests/diagnostics`, then register its CLI mode in `diagnostics.rs`. Run `bash ./test.sh -p nerv --test diagnostics` (or `.\test.ps1 -p nerv --test diagnostics`). Do not update snapshots merely to silence a failure: check the selected file, line, column, underline, and explanatory notes.
 
 ## Adding a regression
 

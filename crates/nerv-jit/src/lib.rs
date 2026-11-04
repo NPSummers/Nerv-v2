@@ -34,23 +34,37 @@ use llvm_sys::{
     },
 };
 use nerv_syntax::{
-    BinaryOp, Expr, Function, Module, Statement, Struct as StructDecl, Type, UnaryOp,
+    BinaryOp, Expr as SpannedExpr, ExprKind as Expr, Function, Module, Span,
+    Statement as SpannedStatement, StatementKind as Statement, Struct as StructDecl, Type, UnaryOp,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error(String);
+pub struct Error {
+    pub message: String,
+    pub span: Option<Span>,
+}
 
 static JIT_LOCK: Mutex<()> = Mutex::new(());
 
 impl Error {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    fn at(mut self, span: Span) -> Self {
+        if self.span.is_none() {
+            self.span = Some(span);
+        }
+        self
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -65,9 +79,7 @@ pub fn run_main(modules: &[Module]) -> Result<i64, Error> {
         .find(|function| function.name == "main")
         .ok_or_else(|| Error::new("missing `main` function"))?;
     if !main.params.is_empty() || !matches!(main.result, Type::Int | Type::Void) {
-        return Err(Error::new(
-            "`main` must have type fn() -> i64 or fn() -> void",
-        ));
+        return Err(Error::new("`main` must have type fn() -> i64 or fn() -> void").at(main.span));
     }
     let mut jit = Jit::new()?;
     jit.add_module(lower(modules)?)?;
@@ -431,9 +443,11 @@ impl Compiler {
             let mut params = function
                 .params
                 .iter()
-                .map(|param| self.ty(&param.ty))
+                .map(|param| self.ty(&param.ty).map_err(|error| error.at(param.span)))
                 .collect::<Result<Vec<_>, _>>()?;
-            let result = self.ty(&function.result)?;
+            let result = self
+                .ty(&function.result)
+                .map_err(|error| error.at(function.span))?;
             let function_ty =
                 unsafe { LLVMFunctionType(result, params.as_mut_ptr(), params.len() as u32, 0) };
             let name = cstring(&function.name)?;
@@ -456,7 +470,8 @@ impl Compiler {
             }
         }
         for function in all_functions(source) {
-            self.function(function)?;
+            self.function(function)
+                .map_err(|error| error.at(function.span))?;
         }
         unsafe {
             let mut message = ptr::null_mut();
@@ -498,7 +513,8 @@ impl Compiler {
             }
         }
         for structure in source.iter().flat_map(|module| &module.structs) {
-            self.define_struct(structure)?;
+            self.define_struct(structure)
+                .map_err(|error| error.at(structure.span))?;
         }
         Ok(())
     }
@@ -507,7 +523,7 @@ impl Compiler {
         let mut fields = Vec::with_capacity(structure.fields.len());
         let mut field_types = Vec::with_capacity(structure.fields.len());
         for (index, field) in structure.fields.iter().enumerate() {
-            let ty = self.ty(&field.ty)?;
+            let ty = self.ty(&field.ty).map_err(|error| error.at(field.span))?;
             fields.push((field.name.clone(), (index as u32, ty)));
             field_types.push(ty);
         }
@@ -537,7 +553,8 @@ impl Compiler {
                 {
                     return Err(Error::new(
                         "enum payloads currently require at most one i64 value",
-                    ));
+                    )
+                    .at(variant.span));
                 }
                 if variants
                     .insert(
@@ -608,7 +625,7 @@ impl Compiler {
 
         let mut last = None;
         for statement in &source.body {
-            match statement {
+            match &statement.kind {
                 Statement::Let {
                     name, ty, value, ..
                 } => {
@@ -683,8 +700,21 @@ impl Compiler {
         Ok(())
     }
 
-    fn expr(&mut self, expr: &Expr, values: &HashMap<String, Value>) -> Result<Value, Error> {
-        match expr {
+    fn expr(
+        &mut self,
+        expr: &SpannedExpr,
+        values: &HashMap<String, Value>,
+    ) -> Result<Value, Error> {
+        self.expr_inner(expr, values)
+            .map_err(|error| error.at(expr.span))
+    }
+
+    fn expr_inner(
+        &mut self,
+        expr: &SpannedExpr,
+        values: &HashMap<String, Value>,
+    ) -> Result<Value, Error> {
+        match &expr.kind {
             Expr::Int(value) => Ok(Value {
                 value: unsafe { LLVMConstInt(self.int_ty(), *value as u64, 1) },
                 ty: self.int_ty(),
@@ -764,10 +794,14 @@ impl Compiler {
                 let name = format!("__lambda_{}", self.lambda_index);
                 self.lambda_index += 1;
                 let function = Function {
+                    span: expr.span,
                     name: name.clone(),
                     params: params.clone(),
                     result: result.clone(),
-                    body: vec![Statement::Expr((**body).clone())],
+                    body: vec![SpannedStatement {
+                        span: body.span,
+                        kind: Statement::Expr((**body).clone()),
+                    }],
                     line: 0,
                     column: 0,
                 };
@@ -902,9 +936,9 @@ impl Compiler {
 
     fn if_expr(
         &mut self,
-        condition: &Expr,
-        then_body: &[Statement],
-        else_body: &[Statement],
+        condition: &SpannedExpr,
+        then_body: &[SpannedStatement],
+        else_body: &[SpannedStatement],
         values: &HashMap<String, Value>,
     ) -> Result<Value, Error> {
         let condition = self.expr(condition, values)?;
@@ -952,9 +986,9 @@ impl Compiler {
 
     fn method_call(
         &mut self,
-        base: &Expr,
+        base: &SpannedExpr,
         name: &str,
-        args: &[Expr],
+        args: &[SpannedExpr],
         values: &HashMap<String, Value>,
     ) -> Result<Value, Error> {
         let base = self.expr(base, values)?;
@@ -1001,7 +1035,7 @@ impl Compiler {
 
     fn match_expr(
         &mut self,
-        value: &Expr,
+        value: &SpannedExpr,
         arms: &[nerv_syntax::MatchArm],
         values: &HashMap<String, Value>,
     ) -> Result<Value, Error> {
@@ -1101,13 +1135,13 @@ impl Compiler {
 
     fn block(
         &mut self,
-        body: &[Statement],
+        body: &[SpannedStatement],
         values: &HashMap<String, Value>,
     ) -> Result<Value, Error> {
         let mut values = values.clone();
         let mut last = None;
         for statement in body {
-            match statement {
+            match &statement.kind {
                 Statement::Let {
                     name, ty, value, ..
                 } => {
@@ -1173,7 +1207,7 @@ impl Compiler {
     fn assign(
         &mut self,
         name: &str,
-        expr: &Expr,
+        expr: &SpannedExpr,
         values: &HashMap<String, Value>,
     ) -> Result<(), Error> {
         let slot = values
@@ -1188,9 +1222,9 @@ impl Compiler {
 
     fn assign_index(
         &mut self,
-        base: &Expr,
-        index: &Expr,
-        value: &Expr,
+        base: &SpannedExpr,
+        index: &SpannedExpr,
+        value: &SpannedExpr,
         values: &HashMap<String, Value>,
     ) -> Result<(), Error> {
         let base = self.expr(base, values)?;
@@ -1204,12 +1238,12 @@ impl Compiler {
 
     fn assign_field(
         &mut self,
-        base: &Expr,
+        base: &SpannedExpr,
         name: &str,
-        value: &Expr,
+        value: &SpannedExpr,
         values: &HashMap<String, Value>,
     ) -> Result<(), Error> {
-        let Expr::Name(base_name) = base else {
+        let Expr::Name(base_name) = &base.kind else {
             return Err(Error::new("field assignment requires a named value"));
         };
         let slot = values
@@ -1260,8 +1294,8 @@ impl Compiler {
 
     fn while_loop(
         &mut self,
-        condition: &Expr,
-        body: &[Statement],
+        condition: &SpannedExpr,
+        body: &[SpannedStatement],
         values: &HashMap<String, Value>,
     ) -> Result<(), Error> {
         let function = unsafe { LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder)) };
@@ -1289,10 +1323,10 @@ impl Compiler {
     fn for_loop(
         &mut self,
         name: &str,
-        start: &Expr,
-        end: &Expr,
+        start: &SpannedExpr,
+        end: &SpannedExpr,
         inclusive: bool,
-        body: &[Statement],
+        body: &[SpannedStatement],
         values: &HashMap<String, Value>,
     ) -> Result<(), Error> {
         let start = self.expr(start, values)?;
@@ -1375,11 +1409,11 @@ impl Compiler {
 
     fn loop_body(
         &mut self,
-        body: &[Statement],
+        body: &[SpannedStatement],
         values: &mut HashMap<String, Value>,
     ) -> Result<(), Error> {
         for statement in body {
-            match statement {
+            match &statement.kind {
                 Statement::Let {
                     name, ty, value, ..
                 } => {
@@ -1430,13 +1464,22 @@ impl Compiler {
     fn binary(
         &mut self,
         op: BinaryOp,
-        left: &Expr,
-        right: &Expr,
+        left: &SpannedExpr,
+        right: &SpannedExpr,
         values: &HashMap<String, Value>,
     ) -> Result<Value, Error> {
         if matches!(op, BinaryOp::And | BinaryOp::Or) {
-            let right = Statement::Expr(right.clone());
-            let constant = Statement::Expr(Expr::Bool(op == BinaryOp::Or));
+            let right = SpannedStatement {
+                span: right.span,
+                kind: Statement::Expr(right.clone()),
+            };
+            let constant = SpannedStatement {
+                span: left.span,
+                kind: Statement::Expr(SpannedExpr {
+                    span: left.span,
+                    kind: Expr::Bool(op == BinaryOp::Or),
+                }),
+            };
             return if op == BinaryOp::And {
                 self.if_expr(left, &[right], &[constant], values)
             } else {
@@ -1609,11 +1652,11 @@ impl Compiler {
 
     fn call(
         &mut self,
-        callee: &Expr,
-        args: &[Expr],
+        callee: &SpannedExpr,
+        args: &[SpannedExpr],
         values: &HashMap<String, Value>,
     ) -> Result<Value, Error> {
-        if let Expr::Lambda { params, result, .. } = callee {
+        if let Expr::Lambda { params, result, .. } = &callee.kind {
             if args.len() != params.len() {
                 return Err(Error::new("wrong argument count"));
             }
@@ -1725,7 +1768,7 @@ impl Compiler {
         if let Some(result) = self.runtime_call(&name, &lowered)? {
             return Ok(result);
         }
-        if let Expr::Name(name) = callee
+        if let Expr::Name(name) = &callee.kind
             && let Some(callee) = values.get(name)
             && let Some(function_ty) = self.function_slots.get(&(callee.value as usize)).copied()
         {
@@ -2267,8 +2310,8 @@ fn cstring(value: &str) -> Result<CString, Error> {
     CString::new(value).map_err(|_| Error::new("NUL byte in LLVM identifier"))
 }
 
-fn callee_name(expr: &Expr) -> Option<String> {
-    match expr {
+fn callee_name(expr: &SpannedExpr) -> Option<String> {
+    match &expr.kind {
         Expr::Name(name) => Some(name.clone()),
         Expr::Field { base, name } => Some(format!("{}.{}", callee_name(base)?, name)),
         _ => None,

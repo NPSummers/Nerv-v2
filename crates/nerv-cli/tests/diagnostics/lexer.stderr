@@ -1,0 +1,4 @@
+lexer.nerv:2:5: error: invalid token
+  |
+2 |     @
+  |     ^
