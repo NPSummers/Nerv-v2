@@ -5,6 +5,8 @@ use nerv_lexer::Lexer;
 use nerv_sema::check_path;
 use nerv_syntax::{SourceFile, SourceId, SourceMap, Span, parse};
 
+mod build;
+
 fn report_backend_error(error: nerv_jit::Error, sources: &SourceMap) {
     if let Some(span) = error.span {
         eprintln!(
@@ -22,15 +24,18 @@ fn main() -> ExitCode {
     let program = args.next().unwrap_or_default();
     let Some(path) = args.next() else {
         eprintln!(
-            "usage: {} <file.nerv> [--lex|--parse|--check|--run|--test|--bench]",
+            "usage: {} <file.nerv> [--lex|--parse|--check|--run|--test|--bench]\n       nerv build <file.nerv> [-o output] [--debug|--release] [--emit-object]",
             program.to_string_lossy()
         );
         return ExitCode::FAILURE;
     };
+    if path == "build" {
+        return build::command(args);
+    }
     let mode = args.next().map(|arg| arg.to_string_lossy().into_owned());
     if args.next().is_some() {
         eprintln!(
-            "usage: {} <file.nerv> [--lex|--parse|--check|--run|--test|--bench]",
+            "usage: {} <file.nerv> [--lex|--parse|--check|--run|--test|--bench]\n       nerv build <file.nerv> [-o output] [--debug|--release] [--emit-object]",
             program.to_string_lossy()
         );
         return ExitCode::FAILURE;

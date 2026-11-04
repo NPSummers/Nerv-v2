@@ -1,7 +1,11 @@
 use std::{
+    alloc::{Layout, alloc},
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     io::{self, Write},
+    marker::PhantomData,
+    ptr::NonNull,
+    rc::Rc,
     slice,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -11,8 +15,10 @@ pub struct RuntimeSymbol {
     pub address: *const (),
 }
 
+/// Opaque UTF-8 string handle. Its Rust layout is never accessed by generated code.
 pub struct NervString(String);
 
+/// Opaque fixed-length i64 array handle; elements are accessed only through the ABI.
 pub struct NervArray(Vec<i64>);
 
 struct NervVec(Vec<i64>);
@@ -31,17 +37,28 @@ struct Allocation {
 }
 
 thread_local! {
-    static ALLOCATIONS: RefCell<Option<Vec<Allocation>>> = const { RefCell::new(None) };
+    static ALLOCATIONS: RefCell<Vec<Vec<Allocation>>> = const { RefCell::new(Vec::new()) };
 }
 
 pub struct Execution {
-    previous: Option<Vec<Allocation>>,
+    depth: usize,
+    // Regions and their raw pointers belong to the creating thread.
+    _thread: PhantomData<Rc<()>>,
 }
 
 impl Execution {
     pub fn new() -> Self {
+        let depth = ALLOCATIONS.with(|regions| {
+            let mut regions = regions.borrow_mut();
+            regions
+                .try_reserve(1)
+                .unwrap_or_else(|_| runtime_error("allocation failed"));
+            regions.push(Vec::new());
+            regions.len()
+        });
         Self {
-            previous: ALLOCATIONS.with(|allocations| allocations.replace(Some(Vec::new()))),
+            depth,
+            _thread: PhantomData,
         }
     }
 }
@@ -52,10 +69,23 @@ impl Default for Execution {
     }
 }
 
+/// Diagnostic count of live allocations owned by regions on this thread.
+pub fn active_region_allocations() -> usize {
+    ALLOCATIONS.with(|regions| regions.borrow().iter().map(Vec::len).sum())
+}
+
 impl Drop for Execution {
     fn drop(&mut self) {
-        let allocations = ALLOCATIONS.with(|allocations| allocations.replace(self.previous.take()));
-        for allocation in allocations.into_iter().flatten().rev() {
+        let allocations = ALLOCATIONS.with(|regions| {
+            let mut regions = regions.borrow_mut();
+            assert_eq!(
+                regions.len(),
+                self.depth,
+                "execution regions must be dropped in stack order"
+            );
+            regions.pop().unwrap()
+        });
+        for allocation in allocations.into_iter().rev() {
             unsafe { (allocation.drop)(allocation.pointer) };
         }
     }
@@ -66,9 +96,22 @@ unsafe fn drop_allocation<T>(pointer: *mut ()) {
 }
 
 fn allocate<T: 'static>(value: T) -> *mut T {
-    let pointer = Box::into_raw(Box::new(value));
+    // Box::new aborts on OOM; allocate explicitly so the ABI reports exit status 1.
+    let layout = Layout::new::<T>();
+    let pointer = if layout.size() == 0 {
+        NonNull::<T>::dangling().as_ptr()
+    } else {
+        unsafe { alloc(layout).cast::<T>() }
+    };
+    if pointer.is_null() {
+        runtime_error("allocation failed");
+    }
+    unsafe { pointer.write(value) };
     ALLOCATIONS.with(|allocations| {
-        if let Some(allocations) = allocations.borrow_mut().as_mut() {
+        if let Some(allocations) = allocations.borrow_mut().last_mut() {
+            allocations
+                .try_reserve(1)
+                .unwrap_or_else(|_| runtime_error("allocation failed"));
             allocations.push(Allocation {
                 pointer: pointer.cast(),
                 drop: drop_allocation::<T>,
@@ -83,19 +126,22 @@ unsafe fn release<T>(pointer: *mut T) {
         return;
     }
     ALLOCATIONS.with(|allocations| {
-        if let Some(allocations) = allocations.borrow_mut().as_mut()
-            && let Some(index) = allocations
+        // An explicit native free may target an allocation in a parent region.
+        for allocations in allocations.borrow_mut().iter_mut().rev() {
+            if let Some(index) = allocations
                 .iter()
                 .position(|entry| entry.pointer == pointer.cast())
-        {
-            allocations.swap_remove(index);
+            {
+                allocations.swap_remove(index);
+                break;
+            }
         }
     });
     unsafe { drop(Box::from_raw(pointer)) };
 }
 
 fn runtime_error(message: &str) -> ! {
-    eprintln!("runtime error: {message}");
+    let _ = writeln!(io::stderr().lock(), "runtime error: {message}");
     std::process::exit(1)
 }
 
@@ -117,8 +163,37 @@ pub extern "C" fn nerv_f64_to_i64(value: f64) -> i64 {
     value.trunc() as i64
 }
 
+/// Version of the C ABI used by generated host objects and the JIT.
+pub const ABI_VERSION: u32 = 1;
+
+/// Standalone entry adapters deliberately preserve the JIT's printed result and
+/// process status: a returned integer is output, not an operating-system exit code.
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_start_i64(entry: extern "C" fn() -> i64) -> i32 {
+    let _execution = Execution::new();
+    let result = entry();
+    nerv_println_i64(result);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_start_void(entry: extern "C" fn()) -> i32 {
+    let _execution = Execution::new();
+    entry();
+    nerv_println_i64(0);
+    0
+}
+
 pub fn symbols() -> Vec<RuntimeSymbol> {
     vec![
+        RuntimeSymbol {
+            name: "nerv_start_i64",
+            address: nerv_start_i64 as *const (),
+        },
+        RuntimeSymbol {
+            name: "nerv_start_void",
+            address: nerv_start_void as *const (),
+        },
         RuntimeSymbol {
             name: "nerv_fail",
             address: nerv_fail as *const (),
@@ -432,63 +507,63 @@ pub fn symbols() -> Vec<RuntimeSymbol> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_print_i64(value: i64) {
-    print!("{value}");
-    let _ = io::stdout().flush();
+    output(format_args!("{value}"));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_println_i64(value: i64) {
-    println!("{value}");
+    output(format_args!("{value}\n"));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_print_f64(value: f64) {
-    print!("{value}");
-    let _ = io::stdout().flush();
+    output(format_args!("{value}"));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_println_f64(value: f64) {
-    println!("{value}");
+    output(format_args!("{value}\n"));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_print_bool(value: bool) {
-    print!("{value}");
-    let _ = io::stdout().flush();
+    output(format_args!("{value}"));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nerv_println_bool(value: bool) {
-    println!("{value}");
+    output(format_args!("{value}\n"));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_print_string(value: *const NervString) {
     if let Some(value) = unsafe { value.as_ref() } {
-        print!("{}", value.0);
-        let _ = io::stdout().flush();
+        output(format_args!("{}", value.0));
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_println_string(value: *const NervString) {
     if let Some(value) = unsafe { value.as_ref() } {
-        println!("{}", value.0);
+        output(format_args!("{}\n", value.0));
     } else {
-        println!();
+        output(format_args!("\n"));
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_string_new(bytes: *const u8, length: i64) -> *mut NervString {
-    let length = usize::try_from(length).unwrap_or(0);
-    let bytes = if bytes.is_null() {
+    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid string length"));
+    let bytes = if length == 0 {
         &[]
     } else {
+        if bytes.is_null() {
+            runtime_error("invalid string bytes");
+        }
         unsafe { slice::from_raw_parts(bytes, length) }
     };
-    string(String::from_utf8_lossy(bytes).into_owned())
+    let text = std::str::from_utf8(bytes).unwrap_or_else(|_| runtime_error("invalid UTF-8 string"));
+    string(copy_string(text))
 }
 
 #[unsafe(no_mangle)]
@@ -509,7 +584,9 @@ pub unsafe extern "C" fn nerv_string_concat(
     let right = unsafe { right.as_ref() }
         .map(|value| value.0.as_str())
         .unwrap_or("");
-    string(format!("{left}{right}"))
+    let mut result = copy_string(left);
+    append(&mut result, right);
+    string(result)
 }
 
 #[unsafe(no_mangle)]
@@ -544,7 +621,14 @@ pub unsafe extern "C" fn nerv_array_i64_data(array: *mut NervArray) -> *mut i64 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_get(array: *const NervArray, index: i64) -> i64 {
-    unsafe { *nerv_array_i64_at(array.cast_mut(), index) }
+    let array = unsafe { array.as_ref() }.unwrap_or_else(|| runtime_error("invalid array"));
+    let index =
+        usize::try_from(index).unwrap_or_else(|_| runtime_error("array index out of bounds"));
+    array
+        .0
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| runtime_error("array index out of bounds"))
 }
 
 #[unsafe(no_mangle)]
@@ -575,15 +659,24 @@ pub unsafe extern "C" fn nerv_array_i64_map(
     length: i64,
     callback: extern "C" fn(i64) -> i64,
 ) -> *mut NervArray {
-    let array = unsafe { array.as_ref() }.unwrap_or_else(|| runtime_error("invalid array"));
-    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
-    let values = array
+    let available = unsafe { array.as_ref() }
+        .unwrap_or_else(|| runtime_error("invalid array"))
         .0
-        .get(..length)
-        .unwrap_or_else(|| runtime_error("array length out of bounds"))
-        .iter()
-        .map(|value| callback(*value))
-        .collect::<Vec<_>>();
+        .len();
+    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
+    if length > available {
+        runtime_error("array length out of bounds");
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .unwrap_or_else(|_| runtime_error("array allocation failed"));
+    for index in 0..length {
+        // End the Rust borrow before invoking native code: a callback may mutate
+        // a shared array handle, but may not free it during this operation.
+        let value = unsafe { (&(*array).0)[index] };
+        values.push(callback(value));
+    }
     allocate(NervArray(values))
 }
 
@@ -594,14 +687,20 @@ pub unsafe extern "C" fn nerv_array_i64_reduce(
     initial: i64,
     callback: extern "C" fn(i64, i64) -> i64,
 ) -> i64 {
-    let array = unsafe { array.as_ref() }.unwrap_or_else(|| runtime_error("invalid array"));
-    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
-    array
+    let available = unsafe { array.as_ref() }
+        .unwrap_or_else(|| runtime_error("invalid array"))
         .0
-        .get(..length)
-        .unwrap_or_else(|| runtime_error("array length out of bounds"))
-        .iter()
-        .fold(initial, |value, next| callback(value, *next))
+        .len();
+    let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
+    if length > available {
+        runtime_error("array length out of bounds");
+    }
+    let mut result = initial;
+    for index in 0..length {
+        let next = unsafe { (&(*array).0)[index] };
+        result = callback(result, next);
+    }
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -659,6 +758,10 @@ pub extern "C" fn nerv_vec_new() -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_vec_push(handle: i64, value: i64) {
     if let Some(values) = unsafe { handle_mut::<NervVec>(handle) } {
+        values
+            .0
+            .try_reserve(1)
+            .unwrap_or_else(|_| runtime_error("allocation failed"));
         values.0.push(value);
     }
 }
@@ -709,6 +812,10 @@ pub unsafe extern "C" fn nerv_vec_insert(handle: i64, index: i64, value: i64) {
     if let (Some(values), Some(index)) = (unsafe { handle_mut::<NervVec>(handle) }, index)
         && index <= values.0.len()
     {
+        values
+            .0
+            .try_reserve(1)
+            .unwrap_or_else(|_| runtime_error("allocation failed"));
         values.0.insert(index, value);
     }
 }
@@ -771,7 +878,10 @@ pub unsafe extern "C" fn nerv_map_insert(handle: i64, key: *const NervString, va
     let Some(map) = (unsafe { handle_mut::<NervMap>(handle) }) else {
         return -1;
     };
-    map.0.insert(key.0.clone(), value);
+    map.0
+        .try_reserve(1)
+        .unwrap_or_else(|_| runtime_error("allocation failed"));
+    map.0.insert(copy_string(&key.0), value);
     0
 }
 
@@ -831,6 +941,9 @@ pub unsafe extern "C" fn nerv_set_insert(handle: i64, value: i64) -> i64 {
     let Some(set) = (unsafe { handle_mut::<NervSet>(handle) }) else {
         return -1;
     };
+    set.0
+        .try_reserve(1)
+        .unwrap_or_else(|_| runtime_error("allocation failed"));
     set.0.insert(value);
     0
 }
@@ -871,6 +984,10 @@ pub extern "C" fn nerv_deque_new() -> i64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_deque_push_back(handle: i64, value: i64) {
     if let Some(deque) = unsafe { handle_mut::<NervDeque>(handle) } {
+        deque
+            .0
+            .try_reserve(1)
+            .unwrap_or_else(|_| runtime_error("allocation failed"));
         deque.0.push_back(value);
     }
 }
@@ -878,6 +995,10 @@ pub unsafe extern "C" fn nerv_deque_push_back(handle: i64, value: i64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_deque_push_front(handle: i64, value: i64) {
     if let Some(deque) = unsafe { handle_mut::<NervDeque>(handle) } {
+        deque
+            .0
+            .try_reserve(1)
+            .unwrap_or_else(|_| runtime_error("allocation failed"));
         deque.0.push_front(value);
     }
 }
@@ -912,6 +1033,62 @@ pub unsafe extern "C" fn nerv_deque_free(handle: i64) {
 
 fn string(value: String) -> *mut NervString {
     allocate(NervString(value))
+}
+
+fn output(args: std::fmt::Arguments<'_>) {
+    let mut stdout = io::stdout().lock();
+    if stdout
+        .write_fmt(args)
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        runtime_error("stdout write failed");
+    }
+}
+
+fn append(result: &mut String, text: &str) {
+    result
+        .try_reserve(text.len())
+        .unwrap_or_else(|_| runtime_error("string allocation failed"));
+    result.push_str(text);
+}
+
+fn copy_string(text: &str) -> String {
+    let mut result = String::new();
+    append(&mut result, text);
+    result
+}
+
+fn change_case(text: &str, upper: bool) -> String {
+    let mut result = String::new();
+    for ch in text.chars() {
+        // Unicode case mappings can expand one scalar into several scalars.
+        if upper {
+            for ch in ch.to_uppercase() {
+                append(&mut result, ch.encode_utf8(&mut [0; 4]));
+            }
+        } else {
+            for ch in ch.to_lowercase() {
+                append(&mut result, ch.encode_utf8(&mut [0; 4]));
+            }
+        }
+    }
+    result
+}
+
+fn replace_string(value: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return copy_string(value);
+    }
+    let mut result = String::new();
+    let mut start = 0;
+    for (index, matched) in value.match_indices(from) {
+        append(&mut result, &value[start..index]);
+        append(&mut result, to);
+        start = index + matched.len();
+    }
+    append(&mut result, &value[start..]);
+    result
 }
 
 #[unsafe(no_mangle)]
@@ -958,7 +1135,7 @@ pub unsafe extern "C" fn nerv_str_ends_with(
 pub unsafe extern "C" fn nerv_str_to_upper(value: *const NervString) -> *mut NervString {
     string(
         unsafe { value.as_ref() }
-            .map(|value| value.0.to_uppercase())
+            .map(|value| change_case(&value.0, true))
             .unwrap_or_default(),
     )
 }
@@ -967,7 +1144,7 @@ pub unsafe extern "C" fn nerv_str_to_upper(value: *const NervString) -> *mut Ner
 pub unsafe extern "C" fn nerv_str_to_lower(value: *const NervString) -> *mut NervString {
     string(
         unsafe { value.as_ref() }
-            .map(|value| value.0.to_lowercase())
+            .map(|value| change_case(&value.0, false))
             .unwrap_or_default(),
     )
 }
@@ -976,7 +1153,7 @@ pub unsafe extern "C" fn nerv_str_to_lower(value: *const NervString) -> *mut Ner
 pub unsafe extern "C" fn nerv_str_trim(value: *const NervString) -> *mut NervString {
     string(
         unsafe { value.as_ref() }
-            .map(|value| value.0.trim().to_owned())
+            .map(|value| copy_string(value.0.trim()))
             .unwrap_or_default(),
     )
 }
@@ -996,10 +1173,7 @@ pub unsafe extern "C" fn nerv_str_replace(
     let to = unsafe { to.as_ref() }
         .map(|value| value.0.as_str())
         .unwrap_or("");
-    if from.is_empty() {
-        return string(value.to_owned());
-    }
-    string(value.replace(from, to))
+    string(replace_string(value, from, to))
 }
 
 #[unsafe(no_mangle)]
@@ -1007,7 +1181,21 @@ pub unsafe extern "C" fn nerv_str_repeat(value: *const NervString, count: i64) -
     let value = unsafe { value.as_ref() }
         .map(|value| value.0.as_str())
         .unwrap_or("");
-    string(value.repeat(usize::try_from(count).unwrap_or(0)))
+    let count = usize::try_from(count).unwrap_or(0);
+    let length = value
+        .len()
+        .checked_mul(count)
+        .unwrap_or_else(|| runtime_error("string allocation failed"));
+    let mut result = String::new();
+    result
+        .try_reserve_exact(length)
+        .unwrap_or_else(|_| runtime_error("string allocation failed"));
+    if !value.is_empty() {
+        for _ in 0..count {
+            result.push_str(value);
+        }
+    }
+    string(result)
 }
 
 #[unsafe(no_mangle)]
@@ -1024,7 +1212,7 @@ pub unsafe extern "C" fn nerv_str_slice(
     if start >= end || !value.is_char_boundary(start) || !value.is_char_boundary(end) {
         return string(String::new());
     }
-    string(value[start..end].to_owned())
+    string(copy_string(&value[start..end]))
 }
 
 #[unsafe(no_mangle)]
@@ -1066,10 +1254,7 @@ pub unsafe extern "C" fn nerv_str_split(
     let separator = unsafe { separator.as_ref() }
         .map(|value| value.0.as_str())
         .unwrap_or("");
-    if separator.is_empty() {
-        return string(value.to_owned());
-    }
-    string(value.split(separator).collect::<Vec<_>>().join("\n"))
+    string(replace_string(value, separator, "\n"))
 }
 
 #[unsafe(no_mangle)]
@@ -1084,13 +1269,18 @@ pub unsafe extern "C" fn nerv_str_split_once(
         .map(|value| value.0.as_str())
         .unwrap_or("");
     if separator.is_empty() {
-        return string(value.to_owned());
+        return string(copy_string(value));
     }
     string(
         value
             .split_once(separator)
-            .map(|(left, right)| format!("{left}\n{right}"))
-            .unwrap_or_else(|| value.to_owned()),
+            .map(|(left, right)| {
+                let mut result = copy_string(left);
+                append(&mut result, "\n");
+                append(&mut result, right);
+                result
+            })
+            .unwrap_or_else(|| copy_string(value)),
     )
 }
 
@@ -1123,10 +1313,10 @@ mod tests {
                 assert_eq!(nerv_array_i64_get(array, 1), 42);
             }
             ALLOCATIONS
-                .with(|allocations| assert_eq!(allocations.borrow().as_ref().unwrap().len(), 3));
+                .with(|allocations| assert_eq!(allocations.borrow().last().unwrap().len(), 3));
         }
         assert_eq!(dropped.get(), 1);
-        ALLOCATIONS.with(|allocations| assert!(allocations.borrow().is_none()));
+        ALLOCATIONS.with(|allocations| assert!(allocations.borrow().is_empty()));
     }
 
     #[test]
@@ -1153,7 +1343,7 @@ mod tests {
             }
             assert_eq!(dropped.get(), 1);
             ALLOCATIONS
-                .with(|allocations| assert_eq!(allocations.borrow().as_ref().unwrap().len(), 1));
+                .with(|allocations| assert_eq!(allocations.borrow().last().unwrap().len(), 1));
         }
         assert_eq!(dropped.get(), 2);
     }
@@ -1220,6 +1410,135 @@ mod tests {
             nerv_string_free(value);
             nerv_string_free(needle);
             nerv_string_free(upper);
+        }
+    }
+
+    #[test]
+    fn releasing_a_parent_allocation_from_a_nested_region_does_not_double_free() {
+        let dropped = Rc::new(Cell::new(0));
+        let outer = Execution::new();
+        let pointer = allocate(CountDrop(dropped.clone()));
+        {
+            let _inner = Execution::new();
+            unsafe { release(pointer) };
+            assert_eq!(active_region_allocations(), 0);
+        }
+        drop(outer);
+        assert_eq!(dropped.get(), 1);
+    }
+
+    #[test]
+    fn regions_release_shared_handles_and_all_string_operations() {
+        for _ in 0..20 {
+            let execution = Execution::new();
+            unsafe {
+                let text = nerv_string_new("é🙂".as_ptr(), 6);
+                let alias = text;
+                let upper = nerv_str_to_upper(text);
+                let lower = nerv_str_to_lower(upper);
+                let repeated = nerv_str_repeat(lower, 3);
+                let slice = nerv_str_slice(repeated, 0, 2);
+                let replaced = nerv_str_replace(repeated, text, slice);
+                let split = nerv_str_split(repeated, text);
+                let once = nerv_str_split_once(repeated, text);
+                let _trimmed = nerv_str_trim(text);
+                assert_eq!(nerv_string_len(alias), 6);
+                assert_eq!(nerv_string_len(replaced), 6);
+                assert_eq!(nerv_string_len(split), 3);
+                assert_eq!(nerv_string_len(once), 13);
+                assert_eq!(active_region_allocations(), 9);
+            }
+            drop(execution);
+            assert_eq!(active_region_allocations(), 0);
+        }
+    }
+
+    #[test]
+    fn callbacks_can_mutate_shared_array_storage_without_overlapping_rust_borrows() {
+        thread_local! { static INPUT: Cell<*mut NervArray> = const { Cell::new(std::ptr::null_mut()) }; }
+        extern "C" fn change(value: i64) -> i64 {
+            INPUT.with(|input| unsafe { nerv_array_i64_set(input.get(), 1, 40) });
+            value
+        }
+        extern "C" fn add(total: i64, value: i64) -> i64 {
+            INPUT.with(|input| unsafe { nerv_array_i64_set(input.get(), 1, 41) });
+            total + value
+        }
+        let _execution = Execution::new();
+        let input = nerv_array_i64_new(2, 1);
+        INPUT.with(|slot| slot.set(input));
+        unsafe {
+            let mapped = nerv_array_i64_map(input, 2, change);
+            assert_eq!(nerv_array_i64_get(mapped, 1), 40);
+            assert_eq!(nerv_array_i64_reduce(input, 2, 0, add), 42);
+        }
+        INPUT.with(|slot| slot.set(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn array_get_respects_shared_native_references() {
+        let _execution = Execution::new();
+        let array = nerv_array_i64_new(2, 3);
+        unsafe {
+            let shared = &*array;
+            assert_eq!(nerv_array_i64_get(shared, 0), 3);
+            assert_eq!(shared.0[1], 3);
+            assert_eq!(nerv_array_i64_get(shared, 1), 3);
+        }
+    }
+
+    #[test]
+    fn abi_symbols_are_unique() {
+        let mut names = HashSet::new();
+        for symbol in symbols() {
+            assert!(names.insert(symbol.name));
+            assert!(!symbol.address.is_null());
+        }
+        assert_eq!(ABI_VERSION, 1);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn runtime_failure_probe() {
+        let Ok(case) = std::env::var("NERV_RUNTIME_FAILURE_TEST") else {
+            return;
+        };
+        let _execution = Execution::new();
+        match case.as_str() {
+            "array" => {
+                nerv_array_i64_new(i64::MAX, 0);
+            }
+            "string" => unsafe {
+                let text = nerv_string_new(c"xx".as_ptr().cast(), 2);
+                nerv_str_repeat(text, i64::MAX);
+            },
+            "utf8" => unsafe {
+                nerv_string_new([255u8].as_ptr(), 1);
+            },
+            _ => panic!("unknown failure probe"),
+        }
+        panic!("runtime failure unexpectedly returned");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn allocation_and_utf8_failures_exit_cleanly_without_unwinding_across_the_abi() {
+        for (case, message) in [
+            ("array", "array allocation failed"),
+            ("string", "string allocation failed"),
+            ("utf8", "invalid UTF-8 string"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::runtime_failure_probe", "--nocapture"])
+                .env("NERV_RUNTIME_FAILURE_TEST", case)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{case}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(message),
+                "{case}: {output:?}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
         }
     }
 }

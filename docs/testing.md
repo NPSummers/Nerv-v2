@@ -24,6 +24,8 @@ For a healthy full run, the score is `100.0%`. Cargo runs remaining suites after
 
 - Unit tests in the lexer, syntax, semantic checker, JIT, and runtime crates.
 - Checked-IR invariant tests in `crates/nerv-sema/src/ir.rs` inspect resolved symbols, checked types, conversions, lambda lifting, and spans without requiring LLVM. JIT tests consume checked programs, not unchecked syntax.
+- `crates/nerv-cli/tests/standalone.rs` compares native debug/release builds with the JIT, including specification examples and runtime failures. Run it alone with `bash ./tools/test.sh -p nerv --test standalone`. It requires native linker/build tools.
+- `bash ./tools/check-memory.sh` runs safe-core runtime tests under nightly Miri with strict provenance and leak checking; see [runtime memory validation](runtime-abi.md). This is a separate check, not included in the normal test score. CI runs it on Linux.
 - Executable specification examples and module/language-rule checks in `crates/nerv-cli/tests/language_rules.rs`.
 - CLI fixtures in `crates/nerv-cli/tests/fixtures`, run by `crates/nerv-cli/tests/regressions.rs`: parsing, checking, execution, and compile-time/runtime failures. They cover structs, enums, traits, methods, arrays, lambdas, multi-file imports, output, and exit status.
 - Exact diagnostic snapshots in `crates/nerv-cli/tests/diagnostics`, run by `diagnostics.rs`: lexical/parser errors, type mismatches, unresolved names, invalid calls, imported-file errors, independent errors, EOF, and lowering restrictions. The historical `backend` payload-limit fixture now fails during checking, before code generation. Only the absolute fixture-root path and platform line endings are normalized.

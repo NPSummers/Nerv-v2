@@ -240,3 +240,25 @@ fn runs_resolved_test_and_benchmark_entry_groups() {
     assert_eq!(run_tests(&checked).unwrap(), 1);
     assert_eq!(run_benches(&checked).unwrap(), 1);
 }
+
+#[test]
+fn repeated_invocations_release_all_region_allocations() {
+    let source = include_str!("../../nerv-cli/tests/fixtures/run/region_lifetimes/main.nerv");
+    let checked = nerv_sema::check_modules(&[parse(source).unwrap()]).unwrap();
+    for _ in 0..20 {
+        assert_eq!(super::run_main(&checked).unwrap(), 42);
+        assert_eq!(nerv_runtime::active_region_allocations(), 0);
+    }
+}
+
+#[test]
+fn rejected_duplicate_modules_do_not_double_free_llvm_owned_memory() {
+    let _lock = JIT_LOCK.lock().unwrap();
+    let program = nerv_sema::check_modules(&[parse("fn main() -> i64 => 42\n").unwrap()]).unwrap();
+    let mut jit = Jit::new().unwrap();
+    jit.add_module(compiler::generate(&program, BuildMode::Release, false).unwrap())
+        .unwrap();
+    let duplicate = compiler::generate(&program, BuildMode::Release, false).unwrap();
+    assert!(jit.add_module(duplicate).is_err());
+    assert_eq!(jit.run(&symbol(program.main().unwrap()), true).unwrap(), 42);
+}

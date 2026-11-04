@@ -1,0 +1,3 @@
+fn main() -> i64
+    let values = nerv.arrays.new(9223372036854775807, 0)
+    0

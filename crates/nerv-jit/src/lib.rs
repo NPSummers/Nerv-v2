@@ -9,14 +9,15 @@ use llvm_sys::{
     error::{LLVMDisposeErrorMessage, LLVMErrorRef, LLVMGetErrorMessage},
     orc2::{
         LLVMJITEvaluatedSymbol, LLVMJITSymbolFlags, LLVMJITSymbolGenericFlags,
-        LLVMOrcAbsoluteSymbols, LLVMOrcCSymbolMapPair, LLVMOrcCreateNewThreadSafeModule,
-        LLVMOrcDisposeThreadSafeContext, LLVMOrcDisposeThreadSafeModule, LLVMOrcJITDylibDefine,
-        LLVMOrcThreadSafeContextRef, lljit::*,
+        LLVMOrcAbsoluteSymbols, LLVMOrcCSymbolMapPair,
+        LLVMOrcCreateNewThreadSafeContextFromLLVMContext, LLVMOrcCreateNewThreadSafeModule,
+        LLVMOrcDisposeThreadSafeContext, LLVMOrcJITDylibDefine, lljit::*,
     },
     prelude::{LLVMContextRef, LLVMModuleRef},
     target::{LLVM_InitializeNativeAsmPrinter, LLVM_InitializeNativeTarget},
 };
 use nerv_sema::ir::{CheckedProgram, Span, SymbolId, Type};
+use std::path::Path;
 
 mod compiler;
 mod optimize;
@@ -52,6 +53,60 @@ impl std::error::Error for Error {}
 
 static JIT_LOCK: Mutex<()> = Mutex::new(());
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMode {
+    Debug,
+    Release,
+}
+
+/// Emit a host-native, position-independent object without creating a JIT.
+/// The object includes a C main adapter and links against runtime ABI version 1.
+pub fn emit_object(program: &CheckedProgram, output: &Path, mode: BuildMode) -> Result<(), Error> {
+    use llvm_sys::target_machine::{LLVMCodeGenFileType, LLVMTargetMachineEmitToFile};
+    let _lock = JIT_LOCK
+        .lock()
+        .map_err(|_| Error::new("LLVM lock poisoned"))?;
+    initialize_native()?;
+    if program.main().is_none() {
+        return Err(Error::new("missing `main` function"));
+    }
+    let generated = compiler::generate(program, mode, true)?;
+    let machine = optimize::Machine::new(generated.module, mode, true)?;
+    let path = CString::new(output.as_os_str().as_encoded_bytes())
+        .map_err(|_| Error::new("NUL byte in object path"))?;
+    let mut message = ptr::null_mut();
+    let failed = unsafe {
+        LLVMTargetMachineEmitToFile(
+            machine.raw,
+            generated.module,
+            path.as_ptr().cast_mut(),
+            LLVMCodeGenFileType::LLVMObjectFile,
+            &mut message,
+        )
+    };
+    if failed != 0 {
+        let error = if message.is_null() {
+            "could not emit object file".into()
+        } else {
+            let error = unsafe { CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { llvm_sys::core::LLVMDisposeMessage(message) };
+            error
+        };
+        Err(Error::new(error))
+    } else {
+        Ok(())
+    }
+}
+
+fn initialize_native() -> Result<(), Error> {
+    if unsafe { LLVM_InitializeNativeTarget() != 0 || LLVM_InitializeNativeAsmPrinter() != 0 } {
+        return Err(Error::new("could not initialize the native LLVM target"));
+    }
+    Ok(())
+}
+
 pub fn run_main(program: &CheckedProgram) -> Result<i64, Error> {
     let _lock = JIT_LOCK
         .lock()
@@ -61,7 +116,7 @@ pub fn run_main(program: &CheckedProgram) -> Result<i64, Error> {
         .main()
         .ok_or_else(|| Error::new("missing `main` function"))?;
     let mut jit = Jit::new()?;
-    jit.add_module(compiler::lower(program)?)?;
+    jit.add_module(compiler::generate(program, BuildMode::Release, false)?)?;
     jit.run(&symbol(main), program.function(main).result == Type::Int)
 }
 
@@ -79,7 +134,7 @@ fn run_group(program: &CheckedProgram, functions: &[SymbolId]) -> Result<usize, 
         .map_err(|_| Error::new("JIT lock poisoned"))?;
     let _execution = nerv_runtime::Execution::new();
     let mut jit = Jit::new()?;
-    jit.add_module(compiler::lower(program)?)?;
+    jit.add_module(compiler::generate(program, BuildMode::Release, false)?)?;
     for id in functions {
         jit.run(&symbol(*id), false)?;
     }
@@ -116,15 +171,15 @@ impl Drop for Context {
     }
 }
 
-struct LoweredModule {
+struct GeneratedModule {
     module: LLVMModuleRef,
-    context: LLVMOrcThreadSafeContextRef,
+    context: LLVMContextRef,
 }
-impl Drop for LoweredModule {
+impl Drop for GeneratedModule {
     fn drop(&mut self) {
         unsafe {
             LLVMDisposeModule(self.module);
-            LLVMOrcDisposeThreadSafeContext(self.context);
+            LLVMContextDispose(self.context);
         }
     }
 }
@@ -135,9 +190,7 @@ struct Jit {
 impl Jit {
     fn new() -> Result<Self, Error> {
         unsafe {
-            if LLVM_InitializeNativeTarget() != 0 || LLVM_InitializeNativeAsmPrinter() != 0 {
-                return Err(Error::new("could not initialize the native LLVM target"));
-            }
+            initialize_native()?;
             let builder = LLVMOrcCreateLLJITBuilder();
             if builder.is_null() {
                 return Err(Error::new("could not create an LLJIT builder"));
@@ -190,13 +243,19 @@ impl Jit {
         }
     }
 
-    fn add_module(&mut self, module: LoweredModule) -> Result<(), Error> {
+    fn add_module(&mut self, module: GeneratedModule) -> Result<(), Error> {
         let module = mem::ManuallyDrop::new(module);
         unsafe {
-            let thread_safe = LLVMOrcCreateNewThreadSafeModule(module.module, module.context);
+            let context = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(module.context);
+            if context.is_null() {
+                LLVMDisposeModule(module.module);
+                LLVMContextDispose(module.context);
+                return Err(Error::new("could not create an LLVM thread-safe context"));
+            }
+            let thread_safe = LLVMOrcCreateNewThreadSafeModule(module.module, context);
             if thread_safe.is_null() {
                 LLVMDisposeModule(module.module);
-                LLVMOrcDisposeThreadSafeContext(module.context);
+                LLVMOrcDisposeThreadSafeContext(context);
                 return Err(Error::new("could not create an LLVM thread-safe module"));
             }
             let error = LLVMOrcLLJITAddLLVMIRModule(
@@ -204,11 +263,12 @@ impl Jit {
                 LLVMOrcLLJITGetMainJITDylib(self.raw),
                 thread_safe,
             );
-            LLVMOrcDisposeThreadSafeContext(module.context);
+            LLVMOrcDisposeThreadSafeContext(context);
             if error.is_null() {
                 Ok(())
             } else {
-                LLVMOrcDisposeThreadSafeModule(thread_safe);
+                // LLJITAddLLVMIRModule consumes the module even on error.
+                // Disposing it here would double-free LLVM-owned memory.
                 Err(llvm_error(error))
             }
         }

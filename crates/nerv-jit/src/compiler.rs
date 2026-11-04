@@ -5,7 +5,6 @@ use llvm_sys::{
     LLVMIntPredicate as IP, LLVMRealPredicate as FP,
     analysis::{LLVMVerifierFailureAction, LLVMVerifyModule},
     core::*,
-    orc2::LLVMOrcCreateNewThreadSafeContextFromLLVMContext,
     prelude::*,
 };
 use nerv_sema::ir::{self, BinaryOp as B, ExprKind as E, StatementKind as S, UnaryOp as U};
@@ -33,16 +32,15 @@ struct Compiler {
     externals: HashMap<String, Function>,
 }
 
-pub(super) fn lower(program: &CheckedProgram) -> Result<LoweredModule, Error> {
+pub(super) fn generate(
+    program: &CheckedProgram,
+    mode: BuildMode,
+    standalone: bool,
+) -> Result<GeneratedModule, Error> {
     unsafe {
         let context = LLVMContextCreate();
         if context.is_null() {
             return Err(Error::new("could not create an LLVM context"));
-        }
-        let shared = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(context);
-        if shared.is_null() {
-            LLVMContextDispose(context);
-            return Err(Error::new("could not create an LLVM thread-safe context"));
         }
         let module = LLVMModuleCreateWithNameInContext(c"nerv".as_ptr(), context);
         let builder = LLVMCreateBuilderInContext(context);
@@ -56,24 +54,21 @@ pub(super) fn lower(program: &CheckedProgram) -> Result<LoweredModule, Error> {
             externals: HashMap::new(),
         };
         let result = compiler
-            .compile(program)
-            .and_then(|()| super::optimize::optimize(module));
+            .compile(program, standalone)
+            .and_then(|()| super::optimize::optimize(module, mode, standalone));
         LLVMDisposeBuilder(builder);
         if let Err(error) = result {
             LLVMDisposeModule(module);
-            LLVMOrcDisposeThreadSafeContext(shared);
+            LLVMContextDispose(context);
             Err(error)
         } else {
-            Ok(LoweredModule {
-                module,
-                context: shared,
-            })
+            Ok(GeneratedModule { module, context })
         }
     }
 }
 
 impl Compiler {
-    fn compile(&mut self, program: &CheckedProgram) -> Result<(), Error> {
+    fn compile(&mut self, program: &CheckedProgram, standalone: bool) -> Result<(), Error> {
         for structure in program.structs() {
             let name = cstring(&format!("struct_{}", structure.id.0))?;
             self.types.insert(structure.id, unsafe {
@@ -135,6 +130,9 @@ impl Compiler {
             self.function(function)
                 .map_err(|error| error.at(function.span))?;
         }
+        if standalone {
+            self.entry_adapter(program)?;
+        }
         unsafe {
             let mut message = ptr::null_mut();
             if LLVMVerifyModule(
@@ -153,6 +151,34 @@ impl Compiler {
                 return Err(Error::new(text));
             }
         }
+        Ok(())
+    }
+
+    fn entry_adapter(&mut self, program: &CheckedProgram) -> Result<(), Error> {
+        let main = program
+            .main()
+            .ok_or_else(|| Error::new("missing `main` function"))?;
+        let entry = self.functions[&main];
+        let int32 = unsafe { LLVMInt32TypeInContext(self.context) };
+        let signature = unsafe { LLVMFunctionType(int32, ptr::null_mut(), 0, 0) };
+        let function = unsafe { LLVMAddFunction(self.module, c"main".as_ptr(), signature) };
+        let block =
+            unsafe { LLVMAppendBasicBlockInContext(self.context, function, c"entry".as_ptr()) };
+        unsafe { LLVMPositionBuilderAtEnd(self.builder, block) };
+        let runtime = if program.function(main).result == Type::Int {
+            "nerv_start_i64"
+        } else {
+            "nerv_start_void"
+        };
+        let result = self.external(
+            runtime,
+            int32,
+            &[Value {
+                value: entry.value,
+                ty: self.pointer_ty(),
+            }],
+        )?;
+        unsafe { LLVMBuildRet(self.builder, result.value) };
         Ok(())
     }
 
@@ -207,7 +233,22 @@ impl Compiler {
     ) -> Result<(), Error> {
         let name = cstring(&format!("local_{}", binding.id.0))?;
         let ty = self.ty(&binding.ty);
-        let pointer = unsafe { LLVMBuildAlloca(self.builder, ty, name.as_ptr()) };
+        // A lexical binding needs one stack slot per invocation, not one alloca
+        // per loop iteration (especially important for unoptimized builds).
+        let pointer = unsafe {
+            let allocator = LLVMCreateBuilderInContext(self.context);
+            let function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
+            let entry = LLVMGetEntryBasicBlock(function);
+            let first = LLVMGetFirstInstruction(entry);
+            if first.is_null() {
+                LLVMPositionBuilderAtEnd(allocator, entry);
+            } else {
+                LLVMPositionBuilderBefore(allocator, first);
+            }
+            let pointer = LLVMBuildAlloca(allocator, ty, name.as_ptr());
+            LLVMDisposeBuilder(allocator);
+            pointer
+        };
         unsafe { LLVMBuildStore(self.builder, value.value, pointer) };
         slots.insert(binding.id, Value { value: pointer, ty });
         Ok(())

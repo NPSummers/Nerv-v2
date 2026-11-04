@@ -6,52 +6,95 @@ use llvm_sys::{
     transforms::pass_builder::*,
 };
 
-pub(super) fn optimize(module: LLVMModuleRef) -> Result<(), Error> {
-    unsafe {
-        let triple = LLVMGetDefaultTargetTriple();
-        if triple.is_null() {
-            return Err(Error::new("could not get the native LLVM target triple"));
-        }
-        let mut target = ptr::null_mut();
-        let mut message = ptr::null_mut();
-        if LLVMGetTargetFromTriple(triple, &mut target, &mut message) != 0 {
-            let message = if message.is_null() {
-                "could not resolve the native LLVM target".to_owned()
-            } else {
-                let text = CStr::from_ptr(message).to_string_lossy().into_owned();
-                LLVMDisposeMessage(message);
-                text
+pub(super) struct Machine {
+    pub raw: LLVMTargetMachineRef,
+}
+impl Drop for Machine {
+    fn drop(&mut self) {
+        unsafe { LLVMDisposeTargetMachine(self.raw) };
+    }
+}
+
+impl Machine {
+    pub fn new(module: LLVMModuleRef, mode: BuildMode, portable: bool) -> Result<Self, Error> {
+        unsafe {
+            let triple = LLVMGetDefaultTargetTriple();
+            if triple.is_null() {
+                return Err(Error::new("could not get the native LLVM target triple"));
+            }
+            let mut target = ptr::null_mut();
+            let mut message = ptr::null_mut();
+            if LLVMGetTargetFromTriple(triple, &mut target, &mut message) != 0 {
+                let text = if message.is_null() {
+                    "could not resolve native LLVM target".into()
+                } else {
+                    let text = CStr::from_ptr(message).to_string_lossy().into_owned();
+                    LLVMDisposeMessage(message);
+                    text
+                };
+                LLVMDisposeMessage(triple);
+                return Err(Error::new(text));
+            }
+            let level = match mode {
+                BuildMode::Debug => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
+                BuildMode::Release => LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
             };
+            let raw = if portable {
+                LLVMCreateTargetMachine(
+                    target,
+                    triple,
+                    c"generic".as_ptr(),
+                    c"".as_ptr(),
+                    level,
+                    LLVMRelocMode::LLVMRelocPIC,
+                    LLVMCodeModel::LLVMCodeModelDefault,
+                )
+            } else {
+                let cpu = LLVMGetHostCPUName();
+                let features = LLVMGetHostCPUFeatures();
+                let raw = LLVMCreateTargetMachine(
+                    target,
+                    triple,
+                    cpu,
+                    features,
+                    level,
+                    LLVMRelocMode::LLVMRelocDefault,
+                    LLVMCodeModel::LLVMCodeModelJITDefault,
+                );
+                LLVMDisposeMessage(cpu);
+                LLVMDisposeMessage(features);
+                raw
+            };
+            LLVMSetTarget(module, triple);
             LLVMDisposeMessage(triple);
-            return Err(Error::new(message));
+            if raw.is_null() {
+                return Err(Error::new("could not create an LLVM target machine"));
+            }
+            let machine = Self { raw };
+            let layout = LLVMCreateTargetDataLayout(raw);
+            let text = LLVMCopyStringRepOfTargetData(layout);
+            LLVMSetDataLayout(module, text);
+            LLVMDisposeMessage(text);
+            LLVMDisposeTargetData(layout);
+            Ok(machine)
         }
-        let cpu = LLVMGetHostCPUName();
-        let features = LLVMGetHostCPUFeatures();
-        let machine = LLVMCreateTargetMachine(
-            target,
-            triple,
-            cpu,
-            features,
-            LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-            LLVMRelocMode::LLVMRelocDefault,
-            LLVMCodeModel::LLVMCodeModelJITDefault,
-        );
-        LLVMDisposeMessage(cpu);
-        LLVMDisposeMessage(features);
-        LLVMSetTarget(module, triple);
-        LLVMDisposeMessage(triple);
-        if machine.is_null() {
-            return Err(Error::new("could not create an LLVM target machine"));
-        }
-        let layout = LLVMCreateTargetDataLayout(machine);
-        let layout_text = LLVMCopyStringRepOfTargetData(layout);
-        LLVMSetDataLayout(module, layout_text);
-        LLVMDisposeMessage(layout_text);
-        LLVMDisposeTargetData(layout);
+    }
+}
+
+pub(super) fn optimize(
+    module: LLVMModuleRef,
+    mode: BuildMode,
+    portable: bool,
+) -> Result<(), Error> {
+    let machine = Machine::new(module, mode, portable)?;
+    unsafe {
         let options = LLVMCreatePassBuilderOptions();
-        let error = LLVMRunPasses(module, c"default<O3>".as_ptr(), machine, options);
+        let passes = match mode {
+            BuildMode::Debug => c"default<O0>",
+            BuildMode::Release => c"default<O3>",
+        };
+        let error = LLVMRunPasses(module, passes.as_ptr(), machine.raw, options);
         LLVMDisposePassBuilderOptions(options);
-        LLVMDisposeTargetMachine(machine);
         if error.is_null() {
             Ok(())
         } else {

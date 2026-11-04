@@ -29,6 +29,43 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: .\tools\test.ps1
+      - name: Build portable macOS smoke application
+        if: runner.os == 'macOS'
+        run: ./nerv.sh build crates/nerv-cli/tests/fixtures/run/region_lifetimes/main.nerv -o standalone-app --release
+      - name: Build portable Windows smoke application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\nerv.ps1 build crates\nerv-cli\tests\fixtures\run\region_lifetimes\main.nerv -o standalone-app.exe --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.os }}
+          path: standalone-app*
+          if-no-files-found: error
+
+  standalone-clean-runner:
+    name: Standalone without compiler setup (${{ matrix.os }})
+    needs: workspace
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14-arm64, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: standalone-${{ matrix.os }}
+      - name: Run macOS executable without checkout or LLVM setup
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x standalone-app
+          output=$(env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH -u LLVM_SYS_231_PREFIX -u LLVM_CONFIG_PATH ./standalone-app)
+          test "$output" = "42"
+      - name: Run Windows executable without checkout or LLVM setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = & .\standalone-app.exe
+          if ($LASTEXITCODE -ne 0 -or $output -ne '42') { throw 'Standalone smoke test failed' }
 
   linux-frontend:
     name: Linux frontend and runtime (no LLVM)
@@ -38,3 +75,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - name: Test LLVM-independent crates
         run: bash ./tools/test.sh -p nerv-lexer -p nerv-syntax -p nerv-sema -p nerv-runtime -p nerv-test-runner
+
+  memory:
+    name: Runtime memory safety (Miri)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - name: Check safe-core runtime ownership, aliasing, and leaks
+        run: bash ./tools/check-memory.sh

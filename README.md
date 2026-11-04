@@ -23,6 +23,8 @@ On macOS:
 
 ```sh
 ./nerv.sh example/hello.nerv
+./nerv.sh build example/hello.nerv -o hello --release
+./hello
 ./tools/time-release.sh --runs 5
 ```
 
@@ -30,10 +32,14 @@ On Windows:
 
 ```powershell
 .\nerv.ps1 example\hello.nerv
+.\nerv.ps1 build example\hello.nerv -o hello.exe --release
+.\hello.exe
 .\tools\time-release.ps1 -Runs 5
 ```
 
 Both scripts reuse a compatible LLVM 23.1 installation, or download LLVM 23.1.3 into the repo's ignored `llvm/` folder and verify its SHA-256 checksum. The download is large and only needed once. Apple Silicon Macs and x64/ARM64 Windows have automatic downloads; Intel Macs require an existing LLVM 23.1 installation. Set `LLVM_SYS_231_PREFIX` or `LLVM_CONFIG_PATH` to use a custom installation. An unusable existing `llvm/` folder must be moved aside before downloading.
+
+Standalone applications statically include the Nerv runtime and do not need Nerv or LLVM installed to run. See [standalone compilation](./docs/standalone.md) for build modes, linker requirements, and platform-validation limits.
 
 The macOS timing script requires Python 3. Use `--help` to see its options. Both timing scripts build and compare Nerv against the [Rust loop baseline](./time-release/) in `time-release/`. Use `--skip-rust-baseline` on macOS or `-SkipRustBaseline` on Windows to time only Nerv.
 

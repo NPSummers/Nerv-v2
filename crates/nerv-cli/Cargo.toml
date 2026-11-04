@@ -10,3 +10,6 @@ nerv-jit = { path = "../nerv-jit" }
 nerv-lexer = { path = "../nerv-lexer" }
 nerv-sema = { path = "../nerv-sema" }
 nerv-syntax = { path = "../nerv-syntax" }
+
+[target.'cfg(windows)'.dependencies]
+find-msvc-tools = "=0.1.13"

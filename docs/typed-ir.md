@@ -3,10 +3,12 @@
 The execution pipeline is:
 
 ```text
-source files → spanned syntax → semantic checking/resolution → checked IR → LLVM → JIT
+source files → spanned syntax → semantic checking/resolution → checked IR → LLVM → JIT or host object
 ```
 
 `nerv-sema::check_path` returns a `Program` containing source files, loaded syntax modules, and `Program.ir`. Embedded callers with already-loaded modules can use `check_modules`. The JIT's `run_main`, `run_tests`, and `run_benches` APIs accept only `&nerv_sema::ir::CheckedProgram`. Syntax is a **test-only** dependency of the JIT crate.
+
+`emit_object` consumes the same checked program without constructing a JIT. See [standalone compilation](standalone.md) for object emission, native linking, and runtime packaging.
 
 ## IR invariants
 

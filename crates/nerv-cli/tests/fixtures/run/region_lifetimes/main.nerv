@@ -1,0 +1,18 @@
+struct Leaf
+    values: []i64
+    label: string
+
+struct Nested
+    leaf: Leaf
+
+fn make() -> Nested
+    Nested { leaf: Leaf { values: [0, 2], label: nerv.string.concat("Ne", "rv") } }
+
+fn main() -> i64
+    let original = make()
+    let copied = original
+    let mut alias = copied.leaf.values
+    alias[0] = 40
+    assert(nerv.string.len(original.leaf.label) == 4)
+    assert(original.leaf.label == copied.leaf.label)
+    original.leaf.values[0] + original.leaf.values[1]
