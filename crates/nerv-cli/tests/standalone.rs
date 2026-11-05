@@ -113,6 +113,79 @@ fn parity(source: &Path) {
     }
 }
 
+#[test]
+fn native_cpu_and_invalid_cpu_options() {
+    let project = Project::new();
+    let source = project.0.join("main.nerv");
+    fs::write(&source, "fn main() -> i64 => 42\n").unwrap();
+    let output = project
+        .cli()
+        .arg("build")
+        .arg(&source)
+        .arg("-o")
+        .arg(project.executable())
+        .args(["--release", "--cpu=native"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let result = clean_command(&project.executable(), &project.0)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(text(&result.stdout), "42\n");
+    for options in [
+        vec!["--cpu", "bad"],
+        vec!["--cpu"],
+        vec!["--cpu=native", "--cpu=generic"],
+    ] {
+        let output = project
+            .cli()
+            .arg("build")
+            .arg(&source)
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
+fn inline_bounds_checks_reject_negative_huge_and_empty_indices() {
+    let project = Project::new();
+    let source = project.0.join("main.nerv");
+    for (array, index) in [
+        ("[1]", "-1"),
+        ("[1]", "9223372036854775807"),
+        ("nerv.arrays.new(0, 0)", "0"),
+    ] {
+        fs::write(
+            &source,
+            format!(
+                "fn main() -> i64\n    let values: []i64 = {array}\n    return values[{index}]\n"
+            ),
+        )
+        .unwrap();
+        parity(&source);
+    }
+}
+
+#[test]
+fn reassigned_handles_and_wrapping_indices_retain_bounds_checks() {
+    let project = Project::new();
+    let source = project.0.join("main.nerv");
+    for body in [
+        "    let mut values: []i64 = [1, 2]\n    for i in 0..2\n        println(values[1])\n        values = [1]\n",
+        "    let values: []i64 = [1, 2]\n    let index = 9223372036854775807 + 1\n    println(values[index])\n",
+        "    let values: []i64 = [1, 2]\n    for i in 0..=2\n        println(values[i])\n",
+    ] {
+        fs::write(&source, format!("fn main() -> void\n{body}")).unwrap();
+        let jit = project.cli().arg(&source).arg("--run").output().unwrap();
+        assert_eq!(jit.status.code(), Some(1));
+        assert!(text(&jit.stderr).contains("array index out of bounds"));
+        parity(&source);
+    }
+}
+
 macro_rules! fixtures {
     ($($name:ident => $fixture:literal),+ $(,)?) => { $(
         #[test]
@@ -126,6 +199,7 @@ fixtures! {
     enums => "run/enums",
     traits_methods => "run/traits_methods",
     arrays => "run/arrays",
+    loop_optimizations => "run/loop_optimizations",
     lambdas => "run/lambdas",
     imports => "run/imports",
     output_and_exit_status => "run/output",
@@ -189,6 +263,11 @@ fn builds_from_unicode_paths_and_emits_a_real_host_object() {
         .unwrap();
     assert!(output.status.success(), "{}", text(&output.stderr));
     let bytes = fs::read(object).unwrap();
+    assert!(
+        bytes
+            .windows(b"nerv_runtime_abi_v2".len())
+            .any(|window| window == b"nerv_runtime_abi_v2")
+    );
     assert!(bytes.len() > 64);
     if cfg!(target_os = "macos") {
         assert_eq!(&bytes[..4], &[0xcf, 0xfa, 0xed, 0xfe]);
@@ -337,5 +416,17 @@ fn output_before_a_fatal_runtime_error_is_preserved() {
         "fn main() -> i64\n    print(\"before\")\n    assert(false)\n    0\n",
     )
     .unwrap();
+    parity(&source);
+}
+
+#[test]
+fn reciprocal_setup_preserves_output_before_zero_division() {
+    let project = Project::new();
+    let source = project.0.join("main.nerv");
+    fs::write(&source, "fn main() -> i64\n    let zero = nerv.random(1)\n    for i in 0..64\n        print(\"before\")\n        println(i / zero)\n    return 0\n").unwrap();
+    let jit = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert_eq!(jit.status.code(), Some(1));
+    assert_eq!(text(&jit.stdout), "before");
+    assert!(text(&jit.stderr).contains("integer division by zero"));
     parity(&source);
 }

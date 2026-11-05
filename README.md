@@ -41,7 +41,7 @@ Both scripts reuse a compatible LLVM 23.1 installation, or download LLVM 23.1.3 
 
 Standalone applications statically include the Nerv runtime and do not need Nerv or LLVM installed to run. See [standalone compilation](./docs/standalone.md) for build modes, linker requirements, and platform-validation limits.
 
-The macOS timing script requires Python 3. Use `--help` to see its options. Both timing scripts build and compare Nerv against the [Rust loop baseline](./time-release/) in `time-release/`. Use `--skip-rust-baseline` on macOS or `-SkipRustBaseline` on Windows to time only Nerv.
+The macOS timing script requires Python 3. Use `--help` to see its options. Both timing scripts compile the Nerv benchmark into a standalone release binary, then compare it with the [Rust release baseline](./time-release/) over one billion logical nested-loop iterations per invocation. Compilation and JIT time are not measured. Results include warmups, alternating run order, medians, and optional JSON output. Use `--skip-rust-baseline` on macOS or `-SkipRustBaseline` on Windows to time only Nerv.
 
 ## Contributing
 

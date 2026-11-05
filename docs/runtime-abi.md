@@ -1,11 +1,11 @@
-# Execution-region memory and runtime ABI (version 1)
+# Execution-region memory and runtime ABI (version 2)
 
 Each JIT invocation or standalone entry owns a thread-local execution region. A test/benchmark batch shares one region. Allocations survive lexical blocks and function returns; region teardown releases every still-owned allocation exactly once. Regions nest in stack order, cannot migrate between threads, and native frees remove allocations from the owning region, including a parent region. Fatal errors print `runtime error: ...` and exit 1 without unwinding through generated code; the OS reclaims memory on fatal exit.
 
 ## Representation and lifetime
 
 - Integers are signed 64-bit values, floats are IEEE `double`, and booleans use the target's scalar bool representation.
-- Strings and arrays are opaque, pointer-sized handles. Strings own immutable UTF-8, arrays own fixed-length `i64` elements. Generated code never reads Rust `String`/`Vec` layouts; operations go through runtime functions. String producers allocate distinct handles, including empty strings.
+- Strings and arrays are pointer-sized handles. Strings own immutable UTF-8, arrays own fixed-length `i64` elements. Generated code never reads Rust `String`/`Vec` layouts. ABI v2 exposes an immutable C-layout array prefix (`int64_t *data; int64_t length;`) for inline checked accesses. Only elements are mutable; header loads, never element loads, are marked invariant. Backing storage cannot move or resize before destruction. String producers allocate distinct handles, including empty strings.
 - Structs are target-native LLVM aggregates in declaration field order. Nested structs copy by value; string/array fields copy handles and share the allocation. Payload enums have an i64 tag and one i64 payload slot; fieldless enums have only an i64 tag. Unused payloads are initialized to zero. These aggregate layouts are internal to generated code, not a portable C FFI layout.
 - There is no early reclamation or tracing collection. Long-running allocation-heavy code retains memory until the region ends. Generic/nested arrays, string enum payloads, and capturing closures remain unsupported, rather than being silently represented unsafely.
 
@@ -16,6 +16,8 @@ This covers runtime-controlled reservations, not every allocation inside LLVM, t
 The experimental `nerv.collections` integer handles and raw-pointer/free exports are **not** part of the safe language core. Foreign callers must provide live, correctly typed, aligned handles, valid buffer lengths, and C-compatible callbacks; they must not free an iterated array during callbacks. Array map/reduce copy each element before calling native code, so callbacks may mutate shared storage without keeping overlapping Rust borrows alive. Forged handles and use-after-free remain invalid native operations.
 
 ## Shared entry and operations
+
+Generated standalone entries reference `nerv_runtime_abi_v2`; an older runtime fails to link rather than misreading the array layout. Inline accesses reject null handles and use unsigned index/length comparisons, rejecting negative indices as well as oversized indices before computing element addresses. Native callers must not modify the header.
 
 [`crates/nerv-runtime/include/nerv.h`](../crates/nerv-runtime/include/nerv.h) specifies the core C ABI. `nerv_start_i64` / `nerv_start_void` enter a region, invoke a generated entry, print its result (zero for void), and clean up before returning process status 0. The same runtime implementation provides operations to the JIT's symbol registry and to a statically linked standalone program. Returning 7 prints `7`; it does not set process status 7.
 

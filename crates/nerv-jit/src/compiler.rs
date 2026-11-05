@@ -8,7 +8,7 @@ use llvm_sys::{
     prelude::*,
 };
 use nerv_sema::ir::{self, BinaryOp as B, ExprKind as E, StatementKind as S, UnaryOp as U};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy)]
 struct Value {
@@ -30,12 +30,37 @@ struct Compiler {
     payloads: HashMap<SymbolId, bool>,
     functions: HashMap<SymbolId, Function>,
     externals: HashMap<String, Function>,
+    ranges: HashMap<SymbolId, super::range::Range>,
+    array_lengths: HashMap<SymbolId, i64>,
+    immutable_depths: HashMap<SymbolId, usize>,
+    loop_depth: usize,
+    mode: BuildMode,
+    assigned: HashSet<SymbolId>,
+    reciprocal_loop: bool,
 }
 
 pub(super) fn generate(
     program: &CheckedProgram,
     mode: BuildMode,
     standalone: bool,
+) -> Result<GeneratedModule, Error> {
+    generate_for_cpu(
+        program,
+        mode,
+        standalone,
+        if standalone {
+            CpuTarget::Generic
+        } else {
+            CpuTarget::Native
+        },
+    )
+}
+
+pub(super) fn generate_for_cpu(
+    program: &CheckedProgram,
+    mode: BuildMode,
+    standalone: bool,
+    cpu: CpuTarget,
 ) -> Result<GeneratedModule, Error> {
     unsafe {
         let context = LLVMContextCreate();
@@ -52,10 +77,17 @@ pub(super) fn generate(
             payloads: HashMap::new(),
             functions: HashMap::new(),
             externals: HashMap::new(),
+            ranges: HashMap::new(),
+            array_lengths: HashMap::new(),
+            immutable_depths: HashMap::new(),
+            loop_depth: 0,
+            mode,
+            assigned: HashSet::new(),
+            reciprocal_loop: false,
         };
         let result = compiler
             .compile(program, standalone)
-            .and_then(|()| super::optimize::optimize(module, mode, standalone));
+            .and_then(|()| super::optimize::optimize(module, mode, cpu, standalone));
         LLVMDisposeBuilder(builder);
         if let Err(error) = result {
             LLVMDisposeModule(module);
@@ -165,6 +197,7 @@ impl Compiler {
         let block =
             unsafe { LLVMAppendBasicBlockInContext(self.context, function, c"entry".as_ptr()) };
         unsafe { LLVMPositionBuilderAtEnd(self.builder, block) };
+        self.external("nerv_runtime_abi_v2", self.void_ty(), &[])?;
         let runtime = if program.function(main).result == Type::Int {
             "nerv_start_i64"
         } else {
@@ -199,6 +232,10 @@ impl Compiler {
     }
 
     fn function(&mut self, source: &ir::Function) -> Result<(), Error> {
+        self.ranges.clear();
+        self.array_lengths.clear();
+        self.immutable_depths.clear();
+        self.assigned = super::range::assigned_locals(&source.body);
         let function = self.functions[&source.id];
         let entry = unsafe {
             LLVMAppendBasicBlockInContext(self.context, function.value, c"entry".as_ptr())
@@ -251,6 +288,9 @@ impl Compiler {
         };
         unsafe { LLVMBuildStore(self.builder, value.value, pointer) };
         slots.insert(binding.id, Value { value: pointer, ty });
+        if !self.assigned.contains(&binding.id) {
+            self.immutable_depths.insert(binding.id, self.loop_depth);
+        }
         Ok(())
     }
 
@@ -270,18 +310,30 @@ impl Compiler {
     fn statement(&mut self, statement: &ir::Statement, slots: &mut Slots) -> Result<Value, Error> {
         match &statement.kind {
             S::Let { binding, value } => {
+                let range = super::range::infer(value, &self.ranges);
+                let length = self.array_length(value);
                 let value = self.expr(value, slots)?;
                 self.bind(binding, value, slots)?;
+                if !self.assigned.contains(&binding.id) {
+                    if let Some(range) = range {
+                        self.ranges.insert(binding.id, range);
+                    }
+                    if let Some(length) = length {
+                        self.array_lengths.insert(binding.id, length);
+                    }
+                }
             }
             S::Assign { target, value } => {
                 let value = self.expr(value, slots)?;
                 unsafe { LLVMBuildStore(self.builder, value.value, slots[target].value) };
             }
             S::AssignIndex { base, index, value } => {
+                let proven = self.proven_index(base, index);
                 let base = self.expr(base, slots)?;
                 let index = self.expr(index, slots)?;
                 let value = self.expr(value, slots)?;
-                self.array_store(base, index, value)?;
+                let pointer = self.array_element_checked(base, index, proven)?;
+                unsafe { LLVMBuildStore(self.builder, value.value, pointer) };
             }
             S::AssignField {
                 target,
@@ -424,9 +476,10 @@ impl Compiler {
                 }
             }
             E::Index { base, index } => {
+                let proven = self.proven_index(base, index);
                 let base = self.expr(base, slots)?;
                 let index = self.expr(index, slots)?;
-                let pointer = self.array_element(base, index)?;
+                let pointer = self.array_element_checked(base, index, proven)?;
                 unsafe { LLVMBuildLoad2(self.builder, ty, pointer, c"array.load".as_ptr()) }
             }
             E::If {
@@ -643,7 +696,11 @@ impl Compiler {
             LLVMBuildCondBr(self.builder, condition.value, body_block, exit);
             LLVMPositionBuilderAtEnd(self.builder, body_block);
         }
+        self.loop_depth += 1;
+        let previous_reciprocal_loop = std::mem::replace(&mut self.reciprocal_loop, false);
         self.block(body, slots)?;
+        self.reciprocal_loop = previous_reciprocal_loop;
+        self.loop_depth -= 1;
         unsafe {
             LLVMBuildBr(self.builder, test);
             LLVMPositionBuilderAtEnd(self.builder, exit);
@@ -660,6 +717,19 @@ impl Compiler {
         body: &[ir::Statement],
         slots: &mut Slots,
     ) -> Result<(), Error> {
+        // Reciprocal setup pays off only with reuse. For now require a proven
+        // minimum of 16 iterations; short/unknown-trip loops keep hardware div.
+        let amortized = super::range::infer(start, &self.ranges)
+            .zip(super::range::infer(end, &self.ranges))
+            .is_some_and(|((_, start_max), (end_min, _))| {
+                i128::from(end_min) - i128::from(start_max) + i128::from(inclusive) >= 16
+            });
+        let range = super::range::infer(start, &self.ranges)
+            .zip(super::range::infer(end, &self.ranges))
+            .and_then(|((lo, _), (_, hi))| {
+                let hi = if inclusive { hi } else { hi.checked_sub(1)? };
+                (lo <= hi).then_some((lo, hi))
+            });
         let start = self.expr(start, slots)?;
         let end = self.expr(end, slots)?;
         self.bind(binding, start, slots)?;
@@ -691,7 +761,18 @@ impl Compiler {
             LLVMBuildCondBr(self.builder, condition, body_block, exit);
             LLVMPositionBuilderAtEnd(self.builder, body_block);
         }
+        self.loop_depth += 1;
+        let previous_reciprocal_loop = std::mem::replace(&mut self.reciprocal_loop, amortized);
+        if !binding.mutable {
+            self.immutable_depths.insert(binding.id, self.loop_depth);
+            if let Some(range) = range {
+                self.ranges.insert(binding.id, range);
+            }
+        }
         self.block(body, slots)?;
+        self.ranges.remove(&binding.id);
+        self.loop_depth -= 1;
+        self.reciprocal_loop = previous_reciprocal_loop;
         let index =
             unsafe { LLVMBuildLoad2(self.builder, self.int_ty(), slot, c"for.next".as_ptr()) };
         if inclusive {
@@ -752,6 +833,14 @@ impl Compiler {
             return Ok(self.phi(ty, &[(condition.value, origin), (right.value, right_end)]));
         }
         let floating = left.ty == Type::Float;
+        let numerator_upper = super::range::infer(left, &self.ranges)
+            .filter(|(lo, hi)| *lo >= 0 && *hi <= u32::MAX as i64)
+            .map(|(_, hi)| hi as u32);
+        let right_small = super::range::fits_u32(super::range::infer(right, &self.ranges));
+        let reciprocal = self.mode == BuildMode::Release
+            && self.reciprocal_loop
+            && matches!(&right.kind,
+            E::Local(id) if self.immutable_depths.get(id).is_some_and(|depth| *depth < self.loop_depth));
         let left = self.expr(left, slots)?;
         let mut right = self.expr(right, slots)?;
         if matches!(op, B::Div | B::Rem) && !floating {
@@ -792,6 +881,14 @@ impl Compiler {
                     c"div.safe".as_ptr(),
                 );
             }
+            return Ok(self.integer_division(
+                op,
+                left,
+                right,
+                right_small,
+                reciprocal,
+                numerator_upper,
+            ));
         }
         let name = c"binary".as_ptr();
         let value = unsafe {
@@ -848,10 +945,444 @@ impl Compiler {
         Ok(Value { value, ty })
     }
 
+    // A guarded narrowing optimization, not a language-level numeric conversion.
+    // Nonnegative operands fitting u32 have exactly the same quotient/remainder
+    // in i64. Wide and negative values retain the original signed i64 path.
+    // The caller has already checked zero and made MIN / -1 well-defined.
+    fn integer_division(
+        &self,
+        op: B,
+        left: Value,
+        right: Value,
+        right_small: bool,
+        reciprocal: bool,
+        numerator_upper: Option<u32>,
+    ) -> Value {
+        unsafe {
+            let limit = self.integer(u32::MAX as i64).value;
+            let left_fits = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntULE,
+                left.value,
+                limit,
+                c"div.left_fits_u32".as_ptr(),
+            );
+            let right_fits = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntULE,
+                right.value,
+                limit,
+                c"div.right_fits_u32".as_ptr(),
+            );
+            let true_value = LLVMConstInt(LLVMInt1TypeInContext(self.context), 1, 0);
+            let small = LLVMBuildAnd(
+                self.builder,
+                if numerator_upper.is_some() {
+                    true_value
+                } else {
+                    left_fits
+                },
+                if right_small { true_value } else { right_fits },
+                c"div.small".as_ptr(),
+            );
+            let narrow_block = self.new_block(c"div.u32");
+            let wide_block = self.new_block(c"div.i64");
+            let merge = self.new_block(c"div.result");
+            LLVMBuildCondBr(self.builder, small, narrow_block, wide_block);
+            LLVMPositionBuilderAtEnd(self.builder, narrow_block);
+            let int32 = LLVMInt32TypeInContext(self.context);
+            let lhs = LLVMBuildTrunc(self.builder, left.value, int32, c"div.lhs32".as_ptr());
+            let rhs = LLVMBuildTrunc(self.builder, right.value, int32, c"div.rhs32".as_ptr());
+            let narrow = if reciprocal {
+                self.reciprocal_division(op, left, right, numerator_upper)
+            } else {
+                let narrow = if op == B::Div {
+                    LLVMBuildUDiv(self.builder, lhs, rhs, c"div32".as_ptr())
+                } else {
+                    LLVMBuildURem(self.builder, lhs, rhs, c"rem32".as_ptr())
+                };
+                LLVMBuildZExt(self.builder, narrow, self.int_ty(), c"div.extend".as_ptr())
+            };
+            let narrow_end = LLVMGetInsertBlock(self.builder);
+            LLVMBuildBr(self.builder, merge);
+            LLVMPositionBuilderAtEnd(self.builder, wide_block);
+            let wide = if op == B::Div {
+                LLVMBuildSDiv(self.builder, left.value, right.value, c"div64".as_ptr())
+            } else {
+                LLVMBuildSRem(self.builder, left.value, right.value, c"rem64".as_ptr())
+            };
+            LLVMBuildBr(self.builder, merge);
+            LLVMPositionBuilderAtEnd(self.builder, merge);
+            self.phi(self.int_ty(), &[(narrow, narrow_end), (wide, wide_block)])
+        }
+    }
+
+    // For 0 <= n < 2^32 and 1 <= d < 2^32, m=floor(2^32/d).
+    // q=floor(n*m/2^32) underestimates floor(n/d) by at most one:
+    // n/2^32 < 1 bounds the reciprocal's rounding error. One correction is
+    // therefore exact. Products fit u64, including d=1 (m=2^32).
+    // Only immutable divisors defined outside the current loop use this path;
+    // LLVM LICM can hoist the setup division without changing evaluation order.
+    fn reciprocal_division(
+        &self,
+        op: B,
+        left: Value,
+        right: Value,
+        numerator_upper: Option<u32>,
+    ) -> LLVMValueRef {
+        unsafe {
+            if let Some(upper) = numerator_upper {
+                return self.bounded_reciprocal_division(op, left, right, upper);
+            }
+            let multiplier = LLVMBuildUDiv(
+                self.builder,
+                self.integer(1_i64 << 32).value,
+                right.value,
+                c"div.reciprocal".as_ptr(),
+            );
+            self.corrected_reciprocal_division(op, left, right, multiplier)
+        }
+    }
+
+    // Rounded-up reciprocal m=ceil(2^32/d), error e=m*d-2^32.
+    // If B*e < 2^32, then for every 0<=n<=B the quotient floor(n*m/2^32)
+    // is exact: its error n*e/(d*2^32) is strictly less than 1/d, the
+    // smallest gap between a non-integer n/d and the next integer.
+    // The runtime predicate depends only on the invariant divisor and the
+    // proven source interval, so LLVM can unswitch it outside the loop.
+    fn bounded_reciprocal_division(
+        &self,
+        op: B,
+        left: Value,
+        right: Value,
+        upper: u32,
+    ) -> LLVMValueRef {
+        unsafe {
+            let scale = self.integer(1_i64 << 32).value;
+            let quotient = LLVMBuildUDiv(
+                self.builder,
+                self.integer(u32::MAX as i64).value,
+                right.value,
+                c"div.reciprocal".as_ptr(),
+            );
+            let rounded = LLVMBuildAdd(
+                self.builder,
+                quotient,
+                self.integer(1).value,
+                c"div.rounded".as_ptr(),
+            );
+            let product = LLVMBuildMul(self.builder, rounded, right.value, c"div.scaled".as_ptr());
+            let error = LLVMBuildSub(self.builder, product, scale, c"div.error".as_ptr());
+            let error_bound = LLVMBuildMul(
+                self.builder,
+                error,
+                self.integer(upper as i64).value,
+                c"div.error_bound".as_ptr(),
+            );
+            let exact = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntULT,
+                error_bound,
+                scale,
+                c"div.exact".as_ptr(),
+            );
+            let fast = self.new_block(c"div.bounded");
+            let corrected = self.new_block(c"div.corrected");
+            let merge = self.new_block(c"div.bounded.result");
+            LLVMBuildCondBr(self.builder, exact, fast, corrected);
+            LLVMPositionBuilderAtEnd(self.builder, fast);
+            let int32 = LLVMInt32TypeInContext(self.context);
+            let numerator32 = LLVMBuildTrunc(
+                self.builder,
+                left.value,
+                int32,
+                c"div.exact_numerator32".as_ptr(),
+            );
+            let magic32 =
+                LLVMBuildTrunc(self.builder, rounded, int32, c"div.exact_magic32".as_ptr());
+            let magic = LLVMBuildZExt(
+                self.builder,
+                magic32,
+                self.int_ty(),
+                c"div.exact_magic".as_ptr(),
+            );
+            let numerator = LLVMBuildZExt(
+                self.builder,
+                numerator32,
+                self.int_ty(),
+                c"div.exact_numerator".as_ptr(),
+            );
+            let product = LLVMBuildMul(
+                self.builder,
+                numerator,
+                magic,
+                c"div.exact_product".as_ptr(),
+            );
+            let quotient64 = LLVMBuildLShr(
+                self.builder,
+                product,
+                self.integer(32).value,
+                c"div.exact_quotient".as_ptr(),
+            );
+            let quotient = LLVMBuildTrunc(
+                self.builder,
+                quotient64,
+                int32,
+                c"div.exact_quotient32".as_ptr(),
+            );
+            let result = if op == B::Div {
+                quotient
+            } else {
+                let divisor32 = LLVMBuildTrunc(
+                    self.builder,
+                    right.value,
+                    int32,
+                    c"div.exact_divisor32".as_ptr(),
+                );
+                let consumed = LLVMBuildMul(
+                    self.builder,
+                    quotient,
+                    divisor32,
+                    c"div.exact_consumed".as_ptr(),
+                );
+                LLVMBuildSub(
+                    self.builder,
+                    numerator32,
+                    consumed,
+                    c"div.exact_remainder".as_ptr(),
+                )
+            };
+            let is_one = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntEQ,
+                right.value,
+                self.integer(1).value,
+                c"div.exact_is_one".as_ptr(),
+            );
+            let result = LLVMBuildSelect(
+                self.builder,
+                is_one,
+                if op == B::Div {
+                    numerator32
+                } else {
+                    LLVMConstInt(int32, 0, 0)
+                },
+                result,
+                c"div.exact_unit".as_ptr(),
+            );
+            let result = LLVMBuildZExt(
+                self.builder,
+                result,
+                self.int_ty(),
+                c"div.exact_extend".as_ptr(),
+            );
+            LLVMBuildBr(self.builder, merge);
+            LLVMPositionBuilderAtEnd(self.builder, corrected);
+            let no_error = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntEQ,
+                error,
+                self.integer(0).value,
+                c"div.no_error".as_ptr(),
+            );
+            let down = LLVMBuildSub(
+                self.builder,
+                rounded,
+                self.integer(1).value,
+                c"div.round_down".as_ptr(),
+            );
+            let floor =
+                LLVMBuildSelect(self.builder, no_error, rounded, down, c"div.floor".as_ptr());
+            let fallback = self.corrected_reciprocal_division(op, left, right, floor);
+            LLVMBuildBr(self.builder, merge);
+            LLVMPositionBuilderAtEnd(self.builder, merge);
+            self.phi(self.int_ty(), &[(result, fast), (fallback, corrected)])
+                .value
+        }
+    }
+
+    fn corrected_reciprocal_division(
+        &self,
+        op: B,
+        left: Value,
+        right: Value,
+        multiplier: LLVMValueRef,
+    ) -> LLVMValueRef {
+        unsafe {
+            // d=1 is handled separately below, allowing a widening 32x32
+            // multiply instead of an expensive vector i64 multiply.
+            let int32 = LLVMInt32TypeInContext(self.context);
+            let multiplier32 = LLVMBuildTrunc(
+                self.builder,
+                multiplier,
+                int32,
+                c"div.multiplier32".as_ptr(),
+            );
+            let multiplier = LLVMBuildZExt(
+                self.builder,
+                multiplier32,
+                self.int_ty(),
+                c"div.multiplier".as_ptr(),
+            );
+            let numerator =
+                LLVMBuildTrunc(self.builder, left.value, int32, c"div.numerator32".as_ptr());
+            let numerator64 = LLVMBuildZExt(
+                self.builder,
+                numerator,
+                self.int_ty(),
+                c"div.numerator".as_ptr(),
+            );
+            let product = LLVMBuildMul(
+                self.builder,
+                numerator64,
+                multiplier,
+                c"div.product".as_ptr(),
+            );
+            let quotient = LLVMBuildLShr(
+                self.builder,
+                product,
+                self.integer(32).value,
+                c"div.estimate".as_ptr(),
+            );
+            // The estimate and q*d are <= n <= u32::MAX. Keep correction
+            // arithmetic narrow so the target can use widening SIMD multiplies.
+            let quotient =
+                LLVMBuildTrunc(self.builder, quotient, int32, c"div.estimate32".as_ptr());
+            let divisor =
+                LLVMBuildTrunc(self.builder, right.value, int32, c"div.divisor32".as_ptr());
+            let consumed = LLVMBuildMul(self.builder, quotient, divisor, c"div.consumed".as_ptr());
+            let remainder =
+                LLVMBuildSub(self.builder, numerator, consumed, c"div.remainder".as_ptr());
+            let correct = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntUGE,
+                remainder,
+                divisor,
+                c"div.correct".as_ptr(),
+            );
+            let result = if op == B::Div {
+                let adjustment =
+                    LLVMBuildZExt(self.builder, correct, int32, c"div.adjustment".as_ptr());
+                LLVMBuildAdd(self.builder, quotient, adjustment, c"div.quotient".as_ptr())
+            } else {
+                let adjustment = LLVMBuildSelect(
+                    self.builder,
+                    correct,
+                    divisor,
+                    LLVMConstInt(int32, 0, 0),
+                    c"div.adjustment".as_ptr(),
+                );
+                LLVMBuildSub(self.builder, remainder, adjustment, c"div.reduced".as_ptr())
+            };
+            let is_one = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntEQ,
+                right.value,
+                self.integer(1).value,
+                c"div.is_one".as_ptr(),
+            );
+            let result = LLVMBuildSelect(
+                self.builder,
+                is_one,
+                if op == B::Div {
+                    numerator
+                } else {
+                    LLVMConstInt(int32, 0, 0)
+                },
+                result,
+                c"div.unit".as_ptr(),
+            );
+            LLVMBuildZExt(self.builder, result, self.int_ty(), c"div.extend".as_ptr())
+        }
+    }
+
+    fn array_length(&self, expression: &ir::Expr) -> Option<i64> {
+        match &expression.kind {
+            E::Local(id) => self.array_lengths.get(id).copied(),
+            E::Array(elements) => i64::try_from(elements.len()).ok(),
+            E::ArrayRepeat { length, .. } => super::range::infer(length, &self.ranges)
+                .and_then(|(lo, hi)| (lo == hi && lo >= 0).then_some(lo)),
+            E::Runtime { symbol, args } if symbol == "nerv_array_i64_new" => {
+                super::range::infer(&args[0], &self.ranges)
+                    .and_then(|(lo, hi)| (lo == hi && lo >= 0).then_some(lo))
+            }
+            _ => None,
+        }
+    }
+
+    fn proven_index(&self, base: &ir::Expr, index: &ir::Expr) -> bool {
+        self.array_length(base)
+            .zip(super::range::infer(index, &self.ranges))
+            .is_some_and(|(length, (lo, hi))| lo >= 0 && hi < length)
+    }
+
     fn array_element(&mut self, array: Value, index: Value) -> Result<LLVMValueRef, Error> {
-        Ok(self
-            .external("nerv_array_i64_at", self.pointer_ty(), &[array, index])?
-            .value)
+        self.array_element_checked(array, index, false)
+    }
+
+    fn array_element_checked(
+        &mut self,
+        array: Value,
+        index: Value,
+        proven: bool,
+    ) -> Result<LLVMValueRef, Error> {
+        unsafe {
+            let valid = LLVMBuildIsNotNull(self.builder, array.value, c"array.valid".as_ptr());
+            self.guard(valid, 4)?;
+            // ABI v2 exposes only this immutable C-layout prefix, never Vec's
+            // private Rust layout. Element memory remains mutable and aliasable.
+            let header = LLVMStructTypeInContext(
+                self.context,
+                [self.pointer_ty(), self.int_ty()].as_mut_ptr(),
+                2,
+                0,
+            );
+            let length_ptr = LLVMBuildStructGEP2(
+                self.builder,
+                header,
+                array.value,
+                1,
+                c"array.length.ptr".as_ptr(),
+            );
+            let length = self.invariant_load(self.int_ty(), length_ptr, c"array.length");
+            // Unsigned comparison also rejects all negative i64 indices.
+            let in_bounds = LLVMBuildICmp(
+                self.builder,
+                IP::LLVMIntULT,
+                index.value,
+                length,
+                c"array.in_bounds".as_ptr(),
+            );
+            if !proven {
+                self.guard(in_bounds, 3)?;
+            }
+            let data_ptr = LLVMBuildStructGEP2(
+                self.builder,
+                header,
+                array.value,
+                0,
+                c"array.data.ptr".as_ptr(),
+            );
+            let data = self.invariant_load(self.pointer_ty(), data_ptr, c"array.data");
+            Ok(LLVMBuildInBoundsGEP2(
+                self.builder,
+                self.int_ty(),
+                data,
+                [index.value].as_mut_ptr(),
+                1,
+                c"array.element".as_ptr(),
+            ))
+        }
+    }
+
+    fn invariant_load(&self, ty: LLVMTypeRef, pointer: LLVMValueRef, name: &CStr) -> LLVMValueRef {
+        unsafe {
+            let value = LLVMBuildLoad2(self.builder, ty, pointer, name.as_ptr());
+            let kind = LLVMGetMDKindIDInContext(self.context, c"invariant.load".as_ptr(), 14);
+            let metadata = LLVMMDNodeInContext2(self.context, ptr::null_mut(), 0);
+            LLVMSetMetadata(value, kind, LLVMMetadataAsValue(self.context, metadata));
+            value
+        }
     }
     fn array_store(&mut self, array: Value, index: Value, value: Value) -> Result<(), Error> {
         let pointer = self.array_element(array, index)?;

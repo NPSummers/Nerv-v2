@@ -75,6 +75,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.0
       - name: Test LLVM-independent crates
         run: bash ./tools/test.sh -p nerv-lexer -p nerv-syntax -p nerv-sema -p nerv-runtime -p nerv-test-runner
+      - name: Test benchmark tooling without running the large workload
+        run: |
+          python3 -m unittest discover -s tools -p 'test_compare_binaries.py'
+          cargo test --locked --manifest-path time-release/Cargo.toml
 
   memory:
     name: Runtime memory safety (Miri)

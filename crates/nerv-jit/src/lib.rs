@@ -21,6 +21,7 @@ use std::path::Path;
 
 mod compiler;
 mod optimize;
+mod range;
 #[cfg(test)]
 mod tests;
 
@@ -59,9 +60,26 @@ pub enum BuildMode {
     Release,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuTarget {
+    Generic,
+    Native,
+}
+
 /// Emit a host-native, position-independent object without creating a JIT.
-/// The object includes a C main adapter and links against runtime ABI version 1.
+/// The object includes a C main adapter and links against runtime ABI version 2.
 pub fn emit_object(program: &CheckedProgram, output: &Path, mode: BuildMode) -> Result<(), Error> {
+    emit_object_for_cpu(program, output, mode, CpuTarget::Generic)
+}
+
+/// Native uses the same host CPU/features as the JIT. Such objects are not
+/// guaranteed to run on older CPUs; Generic remains the distribution default.
+pub fn emit_object_for_cpu(
+    program: &CheckedProgram,
+    output: &Path,
+    mode: BuildMode,
+    cpu: CpuTarget,
+) -> Result<(), Error> {
     use llvm_sys::target_machine::{LLVMCodeGenFileType, LLVMTargetMachineEmitToFile};
     let _lock = JIT_LOCK
         .lock()
@@ -70,8 +88,8 @@ pub fn emit_object(program: &CheckedProgram, output: &Path, mode: BuildMode) -> 
     if program.main().is_none() {
         return Err(Error::new("missing `main` function"));
     }
-    let generated = compiler::generate(program, mode, true)?;
-    let machine = optimize::Machine::new(generated.module, mode, true)?;
+    let generated = compiler::generate_for_cpu(program, mode, true, cpu)?;
+    let machine = optimize::Machine::new(generated.module, mode, cpu, true)?;
     let path = CString::new(output.as_os_str().as_encoded_bytes())
         .map_err(|_| Error::new("NUL byte in object path"))?;
     let mut message = ptr::null_mut();

@@ -6,7 +6,7 @@ if ($arguments.Count -gt 0 -and $arguments[0] -eq '-Path') {
     $arguments = @($arguments | Select-Object -Skip 1)
 }
 if ($arguments.Count -eq 0) {
-    throw 'Usage: nerv.ps1 <file.nerv> | build <file.nerv> [-o output] [--debug|--release] [--emit-object]'
+    throw 'Usage: nerv.ps1 <file.nerv> | build <file.nerv> [-o output] [--debug|--release] [--cpu generic|native] [--emit-object]'
 }
 
 $isBuild = $arguments[0] -eq 'build'

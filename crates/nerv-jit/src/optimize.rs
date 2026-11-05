@@ -16,7 +16,12 @@ impl Drop for Machine {
 }
 
 impl Machine {
-    pub fn new(module: LLVMModuleRef, mode: BuildMode, portable: bool) -> Result<Self, Error> {
+    pub fn new(
+        module: LLVMModuleRef,
+        mode: BuildMode,
+        cpu_target: CpuTarget,
+        standalone: bool,
+    ) -> Result<Self, Error> {
         unsafe {
             let triple = LLVMGetDefaultTargetTriple();
             if triple.is_null() {
@@ -39,27 +44,31 @@ impl Machine {
                 BuildMode::Debug => LLVMCodeGenOptLevel::LLVMCodeGenLevelNone,
                 BuildMode::Release => LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
             };
-            let raw = if portable {
+            let relocation = if standalone {
+                LLVMRelocMode::LLVMRelocPIC
+            } else {
+                LLVMRelocMode::LLVMRelocDefault
+            };
+            let model = if standalone {
+                LLVMCodeModel::LLVMCodeModelDefault
+            } else {
+                LLVMCodeModel::LLVMCodeModelJITDefault
+            };
+            let raw = if cpu_target == CpuTarget::Generic {
                 LLVMCreateTargetMachine(
                     target,
                     triple,
                     c"generic".as_ptr(),
                     c"".as_ptr(),
                     level,
-                    LLVMRelocMode::LLVMRelocPIC,
-                    LLVMCodeModel::LLVMCodeModelDefault,
+                    relocation,
+                    model,
                 )
             } else {
                 let cpu = LLVMGetHostCPUName();
                 let features = LLVMGetHostCPUFeatures();
                 let raw = LLVMCreateTargetMachine(
-                    target,
-                    triple,
-                    cpu,
-                    features,
-                    level,
-                    LLVMRelocMode::LLVMRelocDefault,
-                    LLVMCodeModel::LLVMCodeModelJITDefault,
+                    target, triple, cpu, features, level, relocation, model,
                 );
                 LLVMDisposeMessage(cpu);
                 LLVMDisposeMessage(features);
@@ -84,9 +93,10 @@ impl Machine {
 pub(super) fn optimize(
     module: LLVMModuleRef,
     mode: BuildMode,
-    portable: bool,
+    cpu: CpuTarget,
+    standalone: bool,
 ) -> Result<(), Error> {
-    let machine = Machine::new(module, mode, portable)?;
+    let machine = Machine::new(module, mode, cpu, standalone)?;
     unsafe {
         let options = LLVMCreatePassBuilderOptions();
         let passes = match mode {

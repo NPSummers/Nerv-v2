@@ -1,4 +1,4 @@
-use nerv_jit::{BuildMode, emit_object};
+use nerv_jit::{BuildMode, CpuTarget, emit_object_for_cpu};
 use nerv_sema::check_path;
 use std::{
     env,
@@ -63,11 +63,12 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let mut output = None;
     let mut selected_mode = None;
     let mut object_only = false;
+    let mut selected_cpu = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-h" | "--help") => {
                 println!(
-                    "usage: nerv build <file.nerv> [-o <output>] [--debug|--release] [--emit-object]"
+                    "usage: nerv build <file.nerv> [-o <output>] [--debug|--release] [--cpu generic|native] [--emit-object]"
                 );
                 return Ok(());
             }
@@ -90,6 +91,20 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
                 }
             }
             Some("--emit-object") => object_only = true,
+            Some("--cpu") => {
+                let cpu = args.next().ok_or("--cpu requires generic or native")?;
+                if selected_cpu.replace(parse_cpu(&cpu)?).is_some() {
+                    return Err("CPU target specified more than once".into());
+                }
+            }
+            Some(arg) if arg.starts_with("--cpu=") => {
+                if selected_cpu
+                    .replace(parse_cpu(arg.trim_start_matches("--cpu=").as_ref())?)
+                    .is_some()
+                {
+                    return Err("CPU target specified more than once".into());
+                }
+            }
             Some(arg) if arg.starts_with('-') => {
                 return Err(format!("unknown build option `{arg}`"));
             }
@@ -101,8 +116,9 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         }
     }
     let source = source
-        .ok_or("usage: nerv build <file.nerv> [-o <output>] [--debug|--release] [--emit-object]")?;
+        .ok_or("usage: nerv build <file.nerv> [-o <output>] [--debug|--release] [--cpu generic|native] [--emit-object]")?;
     let mode = selected_mode.unwrap_or(BuildMode::Debug);
+    let cpu = selected_cpu.unwrap_or(CpuTarget::Generic);
     let output = output.unwrap_or_else(|| {
         let mut name = PathBuf::from(source.file_stem().unwrap_or_default());
         if object_only {
@@ -134,7 +150,7 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     } else {
         "program.o"
     });
-    emit_object(&program.ir, &object, mode).map_err(|error| {
+    emit_object_for_cpu(&program.ir, &object, mode, cpu).map_err(|error| {
         if let Some(span) = error.span {
             program
                 .sources
@@ -180,15 +196,28 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             .map_err(|error| format!("could not save executable: {error}"))?;
     }
     println!(
-        "Built {} ({})",
+        "Built {} ({}, CPU {})",
         output.display(),
         if mode == BuildMode::Debug {
             "debug"
         } else {
             "release"
+        },
+        if cpu == CpuTarget::Native {
+            "native"
+        } else {
+            "generic"
         }
     );
     Ok(())
+}
+
+fn parse_cpu(value: &std::ffi::OsStr) -> Result<CpuTarget, String> {
+    match value.to_str() {
+        Some("generic") => Ok(CpuTarget::Generic),
+        Some("native") => Ok(CpuTarget::Native),
+        _ => Err("CPU target must be generic or native".into()),
+    }
 }
 
 fn linker() -> Result<Command, String> {

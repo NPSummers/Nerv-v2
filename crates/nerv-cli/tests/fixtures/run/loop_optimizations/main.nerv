@@ -1,0 +1,61 @@
+fn main() -> i64
+    let seed = nerv.random(1) + 2
+    let input = nerv.arrays.new(256, seed)
+    let mut output = nerv.arrays.new(256, 0)
+    for i in 0..256
+        output[i] = input[i] * 3 + 7
+    let mut dot = 0
+    for i in 0..256
+        dot = dot + input[i] * output[i]
+    assert(dot == 6656)
+
+    let mut stencil = nerv.arrays.new(256, 0)
+    for i in 1..255
+        stencil[i] = output[i - 1] + output[i] + output[i + 1]
+    assert(stencil[0] == 0)
+    assert(stencil[128] == 39)
+    assert(stencil[255] == 0)
+
+    -- Aliases must preserve loop-carried dependencies; no false noalias promises.
+    let mut prefix = nerv.arrays.new(256, 0)
+    let alias = prefix
+    prefix[0] = 1
+    for i in 1..256
+        prefix[i] = alias[i - 1] + 1
+    assert(prefix[255] == 256)
+
+    let divisor = nerv.random(1) + 22
+    let mut quotient = 0
+    let mut remainder = 0
+    for i in 0..256
+        quotient = quotient + i / divisor
+        remainder = remainder + i % divisor
+    assert(quotient * divisor + remainder == 32640)
+
+    -- This upper bound does not satisfy the no-correction proof for divisor 7.
+    let seven = nerv.random(1) + 7
+    for n in 4294967232..=4294967295
+        let q = n / seven
+        let r = n % seven
+        assert(q * seven + r == n)
+        assert(r >= 0)
+        assert(r < seven)
+
+    -- Divisor 1's multiplier is 2^32, requiring its dedicated narrow case.
+    let one = nerv.random(1) + 1
+    for n in 0..64
+        assert(n / one == n)
+        assert(n % one == 0)
+
+    -- A zero-trip loop must not execute its division or access checks.
+    let zero = nerv.random(1)
+    let empty = nerv.arrays.new(0, 0)
+    for i in 1..0
+        println(i / zero)
+        println(empty[i])
+
+    let mut count = 0
+    for i in 9223372036854775807..=9223372036854775807
+        count = count + 1
+    assert(count == 1)
+    return 42

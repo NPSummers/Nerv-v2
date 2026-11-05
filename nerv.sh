@@ -9,7 +9,7 @@ if [[ $# -gt 0 && "$1" == build ]]; then
     exec cargo run --quiet -p nerv -- "$@"
 fi
 if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <file.nerv> | build <file.nerv> [-o output] [--debug|--release] [--emit-object]" >&2
+    echo "Usage: $0 <file.nerv> | build <file.nerv> [-o output] [--debug|--release] [--cpu generic|native] [--emit-object]" >&2
     exit 1
 fi
 target=$1

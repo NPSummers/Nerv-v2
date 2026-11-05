@@ -1,10 +1,263 @@
 use super::*;
 use nerv_syntax::parse;
 
+fn run_main_with_mode(program: &CheckedProgram, mode: BuildMode) -> Result<i64, Error> {
+    let _lock = JIT_LOCK.lock().unwrap();
+    let _execution = nerv_runtime::Execution::new();
+    let mut jit = Jit::new()?;
+    jit.add_module(compiler::generate(program, mode, false)?)?;
+    jit.run(&symbol(program.main().unwrap()), true)
+}
+
+#[test]
+fn division_narrowing_preserves_signed_and_boundary_results() {
+    let operands = [
+        0_i64,
+        1,
+        22,
+        i32::MAX as i64,
+        1_i64 << 31,
+        u32::MAX as i64,
+        (u32::MAX as i64) + 1,
+        -1,
+        -22,
+        i64::MIN,
+        i64::MAX,
+    ];
+    let mut source = String::from(
+        "fn quotient(a: i64, b: i64) -> i64 => a / b\nfn remainder(a: i64, b: i64) -> i64 => a % b\nfn main() -> i64\n",
+    );
+    for a in operands {
+        for b in operands.into_iter().filter(|b| *b != 0) {
+            let literal = |n: i64| {
+                if n == i64::MIN {
+                    "(-9223372036854775807 - 1)".to_string()
+                } else {
+                    format!("({n})")
+                }
+            };
+            source.push_str(&format!(
+                "    assert(quotient({}, {}) == {})\n    assert(remainder({}, {}) == {})\n",
+                literal(a),
+                literal(b),
+                literal(a.wrapping_div(b)),
+                literal(a),
+                literal(b),
+                literal(a.wrapping_rem(b))
+            ));
+        }
+    }
+    source.push_str("    return 42\n");
+    let checked = nerv_sema::check_modules(&[parse(&source).unwrap()]).unwrap();
+    for mode in [BuildMode::Debug, BuildMode::Release] {
+        assert_eq!(run_main_with_mode(&checked, mode).unwrap(), 42);
+    }
+}
+
+#[test]
+fn inline_array_access_preserves_aliases_across_calls() {
+    let source = "fn update(input: []i64) -> i64\n    let mut values = input\n    values[0] = 40\n    return 2\nfn main() -> i64\n    let mut values: []i64 = [1]\n    let alias = values\n    values[0] = update(alias) + alias[0]\n    return values[0]\n";
+    let checked = nerv_sema::check_modules(&[parse(source).unwrap()]).unwrap();
+    for mode in [BuildMode::Debug, BuildMode::Release] {
+        assert_eq!(run_main_with_mode(&checked, mode).unwrap(), 42);
+    }
+}
+
 fn run(source: &str) -> i64 {
     let module = parse(source).unwrap();
     let checked = nerv_sema::check_modules(&[module]).unwrap();
     run_main(&checked).unwrap()
+}
+
+#[test]
+fn reciprocal_loops_match_wrapping_i64_division_and_remainder() {
+    let mut values = vec![
+        0_i64,
+        1,
+        2,
+        3,
+        21,
+        22,
+        23,
+        65535,
+        65536,
+        i32::MAX as i64,
+        1_i64 << 31,
+        (1_i64 << 32) - 2,
+        u32::MAX as i64,
+        1_i64 << 32,
+        -1,
+        -22,
+        i64::MIN,
+        i64::MAX,
+    ];
+    let mut state = 0x12345678_u32;
+    for _ in 0..12 {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        values.push(state as i64);
+    }
+    let divisors = values
+        .iter()
+        .copied()
+        .filter(|value| *value != 0)
+        .collect::<Vec<_>>();
+    let expected = divisors
+        .iter()
+        .flat_map(|d| {
+            values
+                .iter()
+                .flat_map(move |n| [n.wrapping_div(*d), n.wrapping_rem(*d)])
+        })
+        .collect::<Vec<_>>();
+    let list = |values: &[i64]| {
+        values
+            .iter()
+            .map(|n| {
+                if *n == i64::MIN {
+                    "(-9223372036854775807 - 1)".to_string()
+                } else {
+                    n.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let source = format!(
+        "fn main() -> i64\n    let numerators: []i64 = [{}]\n    let divisors: []i64 = [{}]\n    let expected: []i64 = [{}]\n    for row in 0..{}\n        let divisor = divisors[row]\n        for column in 0..{}\n            let numerator = numerators[column]\n            let offset = (row * {} + column) * 2\n            assert(numerator / divisor == expected[offset])\n            assert(numerator % divisor == expected[offset + 1])\n    return 42\n",
+        list(&values),
+        list(&divisors),
+        list(&expected),
+        divisors.len(),
+        values.len(),
+        values.len()
+    );
+    let checked = nerv_sema::check_modules(&[parse(&source).unwrap()]).unwrap();
+    for mode in [BuildMode::Debug, BuildMode::Release] {
+        assert_eq!(run_main_with_mode(&checked, mode).unwrap(), 42);
+    }
+}
+
+#[test]
+fn bounded_reciprocals_match_exact_division_at_proof_boundaries() {
+    let divisors = [
+        1_i64,
+        2,
+        3,
+        7,
+        22,
+        31,
+        255,
+        65535,
+        65537,
+        i32::MAX as i64,
+        1_i64 << 31,
+        u32::MAX as i64,
+        1_i64 << 32,
+        -1,
+        -22,
+        i64::MIN,
+        i64::MAX,
+    ];
+    let literal = |n: i64| {
+        if n == i64::MIN {
+            "(-9223372036854775807 - 1)".to_string()
+        } else {
+            n.to_string()
+        }
+    };
+    let mut source = format!(
+        "fn main() -> i64\n    let divisors: []i64 = [{}]\n",
+        divisors
+            .iter()
+            .map(|n| literal(*n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // For d=3 the rounded reciprocal's error is 2: the exactness predicate
+    // changes at B=2^31. Exercise just below, exactly at, and above that bound.
+    for (case, start) in [
+        0_i64,
+        65520,
+        (1_i64 << 31) - 64,
+        (1_i64 << 31) - 63,
+        (1_i64 << 31) - 32,
+        (1_i64 << 32) - 64,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let end = start + 63;
+        let expected = divisors
+            .iter()
+            .flat_map(|d| {
+                [
+                    (start..=end).map(|n| n / d).sum::<i64>(),
+                    (start..=end).map(|n| n % d).sum::<i64>(),
+                ]
+            })
+            .map(literal)
+            .collect::<Vec<_>>()
+            .join(", ");
+        source.push_str(&format!("    let expected{case}: []i64 = [{expected}]\n    for row in 0..{}\n        let divisor = divisors[row]\n        let mut quotient = 0\n        let mut remainder = 0\n        for n in {start}..={end}\n            quotient = quotient + n / divisor\n            remainder = remainder + n % divisor\n        assert(quotient == expected{case}[row * 2])\n        assert(remainder == expected{case}[row * 2 + 1])\n", divisors.len()));
+    }
+    source.push_str("    return 42\n");
+    let checked = nerv_sema::check_modules(&[parse(&source).unwrap()]).unwrap();
+    for mode in [BuildMode::Debug, BuildMode::Release] {
+        assert_eq!(run_main_with_mode(&checked, mode).unwrap(), 42);
+    }
+    assert!(optimized_ir(&source).contains("div.error_bound"));
+}
+
+#[test]
+fn range_facts_do_not_survive_rebinding_or_wrapping() {
+    let source = "fn main() -> i64\n    let mut values: []i64 = [1, 2, 3]\n    let mut divisor = 2\n    let mut total = 0\n    for i in 0..3\n        total = total + values[0] / divisor\n        if i == 0\n            values = [24]\n            divisor = 3\n        else\n            divisor = divisor\n    let mut x = 9223372036854775807\n    x = x + 1\n    assert(x < 0)\n    return total\n";
+    let checked = nerv_sema::check_modules(&[parse(source).unwrap()]).unwrap();
+    for mode in [BuildMode::Debug, BuildMode::Release] {
+        assert_eq!(run_main_with_mode(&checked, mode).unwrap(), 16);
+    }
+}
+
+fn optimized_ir(source: &str) -> String {
+    let checked = nerv_sema::check_modules(&[parse(source).unwrap()]).unwrap();
+    let generated = compiler::generate(&checked, BuildMode::Release, false).unwrap();
+    unsafe {
+        let text = llvm_sys::core::LLVMPrintModuleToString(generated.module);
+        let result = CStr::from_ptr(text).to_string_lossy().into_owned();
+        llvm_sys::core::LLVMDisposeMessage(text);
+        result
+    }
+}
+
+#[test]
+fn fixed_length_map_and_reduction_are_vectorizable() {
+    let source = "fn main() -> i64\n    let input = nerv.arrays.new(4096, nerv.random(1) + 2)\n    let mut output = nerv.arrays.new(4096, 0)\n    for i in 0..4096\n        output[i] = input[i] * 3 + 7\n    let mut total = 0\n    for i in 0..4096\n        total = total + output[i]\n    return total\n";
+    assert_eq!(run(source), 4096 * 13);
+    let ir = optimized_ir(source);
+    assert!(
+        !ir.contains("array.in_bounds"),
+        "proven accesses should not retain bounds comparisons"
+    );
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    assert!(
+        ir.contains("vector.body"),
+        "expected target-costed vectorization: {ir}"
+    );
+}
+
+#[test]
+fn dot_stencil_and_division_loops_preserve_results() {
+    let source = include_str!("../../nerv-cli/tests/fixtures/run/loop_optimizations/main.nerv");
+    assert_eq!(run(source), 42);
+    let ir = optimized_ir(source);
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    assert!(ir.contains("vector.body"));
+}
+
+#[test]
+fn short_loops_do_not_pay_for_reciprocal_setup() {
+    let source = "fn main() -> i64\n    let divisor = nerv.random(1) + 22\n    let mut total = 0\n    for i in 0..4\n        total = total + i % divisor\n    return total\n";
+    assert_eq!(run(source), 6);
+    assert!(!optimized_ir(source).contains("div.reciprocal"));
 }
 
 #[test]

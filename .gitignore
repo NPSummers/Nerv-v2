@@ -1,5 +1,6 @@
 /target/
 /time-release/target/
+/tools/__pycache__/
 /clang/
 *.pdb
 *.exe
@@ -7,5 +8,4 @@
 *.lib
 *.obj
 *.log
-/old/
 /llvm/

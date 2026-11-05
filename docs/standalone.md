@@ -17,7 +17,7 @@ On Windows:
 An installed compiler exposes the same CLI directly:
 
 ```text
-nerv build main.nerv [-o app] [--debug|--release] [--emit-object]
+nerv build main.nerv [-o app] [--debug|--release] [--cpu generic|native] [--emit-object]
 ```
 
 The default output is the source file stem in the current working directory (`main` or `main.exe`). Output parent directories must already exist. Source files, including imported files, are protected against accidental overwrite. Generated files are staged beside the destination, then renamed only after success; failed links preserve an existing output and remove their temporary files.
@@ -26,11 +26,13 @@ The default output is the source file stem in the current working directory (`ma
 
 - `--debug` (default) uses LLVM O0 and unoptimized machine-code emission. Locals have one stack slot per binding/invocation, including inside loops. Full source-level DWARF/PDB debugging is **not yet implemented**; that belongs to the editor/debugging milestone.
 - `--release` uses LLVM O3 and aggressive machine-code optimization. Both modes retain all language runtime checks and have the same observable behavior.
-- `--emit-object` emits a host `.o`/`.obj` instead of linking an executable. Use `-o` to choose its path. This needs LLVM but not the native linker. The object contains a C `main` adapter and references the version-1 Nerv runtime ABI; it is not a self-contained executable.
+- `--emit-object` emits a host `.o`/`.obj` instead of linking an executable. Use `-o` to choose its path. This needs LLVM but not the native linker. The object contains a C `main` adapter and references the version-2 Nerv runtime ABI; it is not a self-contained executable.
 
-Unlike the JIT's host-tuned code, standalone code uses the generic CPU for the host target and PIC relocations. There is no cross-compilation flag yet. Objects and the statically embedded runtime must target the same OS/architecture.
+Standalone code defaults to `--cpu generic` for portability within the host target. `--cpu native` uses the same host CPU/features as the JIT, but the resulting application may not run on older CPUs. Both use PIC relocations. There is no cross-compilation flag yet. Objects and the statically embedded runtime must target the same OS/architecture.
 
 ## Runtime and distribution
+
+See [integer ranges and loop optimization](optimization.md) for proven bounds-check elimination, reused-divisor arithmetic, and vectorization limits.
 
 The CLI build script compiles the dependency-free Rust runtime into a native static archive and embeds it in the compiler. It also records the native link libraries reported by that Rust toolchain. A later `nerv build` extracts that archive temporarily and links it with the generated object. No Cargo, Rust compiler, source checkout, runtime archive installation, or LLVM is needed **to run the resulting application**. Native system libraries and a compatible OS/architecture are still required.
 

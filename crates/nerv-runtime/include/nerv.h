@@ -7,7 +7,13 @@
 extern "C" {
 #endif
 
-#define NERV_ABI_VERSION 1
+#define NERV_ABI_VERSION 2
+/* Read-only array prefix, stable until destruction. Only elements may be written.
+   Never allocate/copy a NervArray by sizeof this prefix or modify these fields. */
+typedef struct NervArrayHeader {
+    int64_t *data;
+    int64_t length;
+} NervArrayHeader;
 typedef struct NervString NervString;
 typedef struct NervArray NervArray;
 
@@ -16,6 +22,7 @@ typedef struct NervArray NervArray;
 int32_t nerv_start_i64(int64_t (*entry)(void));
 int32_t nerv_start_void(void (*entry)(void));
 void nerv_fail(int64_t code);
+void nerv_runtime_abi_v2(void);
 int64_t nerv_f64_to_i64(double value);
 double nerv_sqrt(double value);
 double nerv_pow(double left, double right);

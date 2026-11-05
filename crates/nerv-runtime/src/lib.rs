@@ -18,8 +18,32 @@ pub struct RuntimeSymbol {
 /// Opaque UTF-8 string handle. Its Rust layout is never accessed by generated code.
 pub struct NervString(String);
 
-/// Opaque fixed-length i64 array handle; elements are accessed only through the ABI.
-pub struct NervArray(Vec<i64>);
+/// Read-only C-layout prefix of an array handle (runtime ABI v2).
+/// Neither the pointer nor the length changes during the allocation's lifetime.
+#[repr(C)]
+pub struct ArrayHeader {
+    pub data: *mut i64,
+    pub length: i64,
+}
+
+#[repr(C)]
+pub struct NervArray {
+    header: ArrayHeader,
+    // Owns the backing allocation. Never resized or accessed through references
+    // after publishing header.data; native operations use the cached raw pointer.
+    _storage: Vec<i64>,
+}
+
+fn array(mut values: Vec<i64>) -> *mut NervArray {
+    let header = ArrayHeader {
+        data: values.as_mut_ptr(),
+        length: values.len() as i64,
+    };
+    allocate(NervArray {
+        header,
+        _storage: values,
+    })
+}
 
 struct NervVec(Vec<i64>);
 
@@ -149,6 +173,8 @@ fn runtime_error(message: &str) -> ! {
 pub extern "C" fn nerv_fail(code: i64) {
     runtime_error(match code {
         1 => "integer division by zero",
+        3 => "array index out of bounds",
+        4 => "invalid array",
         _ => "assertion failed",
     });
 }
@@ -164,7 +190,12 @@ pub extern "C" fn nerv_f64_to_i64(value: f64) -> i64 {
 }
 
 /// Version of the C ABI used by generated host objects and the JIT.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
+
+/// Referenced by generated objects: linking ABI-v2 inline array code against an
+/// older runtime must fail at link time, not silently misinterpret a Rust layout.
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_runtime_abi_v2() {}
 
 /// Standalone entry adapters deliberately preserve the JIT's printed result and
 /// process status: a returned integer is output, not an operating-system exit code.
@@ -186,6 +217,10 @@ pub extern "C" fn nerv_start_void(entry: extern "C" fn()) -> i32 {
 
 pub fn symbols() -> Vec<RuntimeSymbol> {
     vec![
+        RuntimeSymbol {
+            name: "nerv_runtime_abi_v2",
+            address: nerv_runtime_abi_v2 as *const (),
+        },
         RuntimeSymbol {
             name: "nerv_start_i64",
             address: nerv_start_i64 as *const (),
@@ -602,33 +637,30 @@ pub extern "C" fn nerv_array_i64_new(length: i64, initial: i64) -> *mut NervArra
         .try_reserve_exact(length)
         .unwrap_or_else(|_| runtime_error("array allocation failed"));
     values.resize(length, initial);
-    allocate(NervArray(values))
+    array(values)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_len(array: *const NervArray) -> i64 {
     unsafe { array.as_ref() }
-        .map(|array| array.0.len() as i64)
+        .map(|array| array.header.length)
         .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_data(array: *mut NervArray) -> *mut i64 {
-    unsafe { array.as_mut() }
-        .map(|array| array.0.as_mut_ptr())
+    unsafe { array.as_ref() }
+        .map(|array| array.header.data)
         .unwrap_or(std::ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_get(array: *const NervArray, index: i64) -> i64 {
     let array = unsafe { array.as_ref() }.unwrap_or_else(|| runtime_error("invalid array"));
-    let index =
-        usize::try_from(index).unwrap_or_else(|_| runtime_error("array index out of bounds"));
-    array
-        .0
-        .get(index)
-        .copied()
-        .unwrap_or_else(|| runtime_error("array index out of bounds"))
+    if index < 0 || index >= array.header.length {
+        runtime_error("array index out of bounds");
+    }
+    unsafe { array.header.data.add(index as usize).read() }
 }
 
 #[unsafe(no_mangle)]
@@ -638,14 +670,11 @@ pub unsafe extern "C" fn nerv_array_i64_set(array: *mut NervArray, index: i64, v
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nerv_array_i64_at(array: *mut NervArray, index: i64) -> *mut i64 {
-    let array = unsafe { array.as_mut() }.unwrap_or_else(|| runtime_error("invalid array"));
-    let index =
-        usize::try_from(index).unwrap_or_else(|_| runtime_error("array index out of bounds"));
-    array
-        .0
-        .get_mut(index)
-        .map(|slot| slot as *mut i64)
-        .unwrap_or_else(|| runtime_error("array index out of bounds"))
+    let array = unsafe { array.as_ref() }.unwrap_or_else(|| runtime_error("invalid array"));
+    if index < 0 || index >= array.header.length {
+        runtime_error("array index out of bounds");
+    }
+    unsafe { array.header.data.add(index as usize) }
 }
 
 #[unsafe(no_mangle)]
@@ -661,8 +690,8 @@ pub unsafe extern "C" fn nerv_array_i64_map(
 ) -> *mut NervArray {
     let available = unsafe { array.as_ref() }
         .unwrap_or_else(|| runtime_error("invalid array"))
-        .0
-        .len();
+        .header
+        .length as usize;
     let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
     if length > available {
         runtime_error("array length out of bounds");
@@ -674,10 +703,10 @@ pub unsafe extern "C" fn nerv_array_i64_map(
     for index in 0..length {
         // End the Rust borrow before invoking native code: a callback may mutate
         // a shared array handle, but may not free it during this operation.
-        let value = unsafe { (&(*array).0)[index] };
+        let value = unsafe { (*array).header.data.add(index).read() };
         values.push(callback(value));
     }
-    allocate(NervArray(values))
+    self::array(values)
 }
 
 #[unsafe(no_mangle)]
@@ -689,15 +718,15 @@ pub unsafe extern "C" fn nerv_array_i64_reduce(
 ) -> i64 {
     let available = unsafe { array.as_ref() }
         .unwrap_or_else(|| runtime_error("invalid array"))
-        .0
-        .len();
+        .header
+        .length as usize;
     let length = usize::try_from(length).unwrap_or_else(|_| runtime_error("invalid array length"));
     if length > available {
         runtime_error("array length out of bounds");
     }
     let mut result = initial;
     for index in 0..length {
-        let next = unsafe { (&(*array).0)[index] };
+        let next = unsafe { (*array).header.data.add(index).read() };
         result = callback(result, next);
     }
     result
@@ -1287,6 +1316,31 @@ pub unsafe extern "C" fn nerv_str_split_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_prefix_matches_abi_and_remains_stable_through_element_writes() {
+        assert_eq!(std::mem::offset_of!(NervArray, header), 0);
+        assert_eq!(std::mem::offset_of!(ArrayHeader, data), 0);
+        assert_eq!(
+            std::mem::offset_of!(ArrayHeader, length),
+            std::mem::size_of::<*mut i64>()
+        );
+        let _execution = Execution::new();
+        unsafe {
+            let array = nerv_array_i64_new(2, 1);
+            let prefix = array.cast::<ArrayHeader>();
+            let data = (*prefix).data;
+            assert_eq!((*prefix).length, 2);
+            data.add(1).write(42);
+            assert_eq!(nerv_array_i64_get(array, 1), 42);
+            nerv_array_i64_set(array, 0, 23);
+            assert_eq!(data.read(), 23);
+            assert_eq!((*prefix).data, data);
+            assert_eq!((*prefix).length, 2);
+            let empty = nerv_array_i64_new(0, 0);
+            assert_eq!((*empty.cast::<ArrayHeader>()).length, 0);
+        }
+    }
     use std::{cell::Cell, rc::Rc};
 
     struct CountDrop(Rc<Cell<usize>>);
@@ -1482,7 +1536,7 @@ mod tests {
         unsafe {
             let shared = &*array;
             assert_eq!(nerv_array_i64_get(shared, 0), 3);
-            assert_eq!(shared.0[1], 3);
+            assert_eq!(shared.header.data.add(1).read(), 3);
             assert_eq!(nerv_array_i64_get(shared, 1), 3);
         }
     }
@@ -1494,7 +1548,7 @@ mod tests {
             assert!(names.insert(symbol.name));
             assert!(!symbol.address.is_null());
         }
-        assert_eq!(ABI_VERSION, 1);
+        assert_eq!(ABI_VERSION, 2);
     }
 
     #[cfg(not(miri))]

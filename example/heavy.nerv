@@ -4,7 +4,7 @@ import nerv
 
 fn main() -> void
     let r: i64 = nerv.random(10000)
-    let u: i64 = 22
+    let u: i64 = nerv.random(1) + 22
     let mut a: []i64 = nerv.arrays.new(10000, 0)
 
     for i in 0..10000
