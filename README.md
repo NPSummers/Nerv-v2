@@ -1,5 +1,5 @@
 <div align="center">
-    <img src="./git-assets/nerv.png" height=300>
+    <img src="./git-assets/nerv.png" height=600>
     <h1>Nerv</h1>
 
 [**Quick Start**](#quick-start) | [**Contributing**](#contributing) | [**License**](#license)
