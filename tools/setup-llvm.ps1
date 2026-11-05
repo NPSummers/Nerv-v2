@@ -26,9 +26,12 @@ function Initialize-LLVM {
     if (Test-Path -LiteralPath $destination) {
         throw 'llvm/ exists but is not a usable LLVM 23.1 installation. Move it aside and retry.'
     }
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    # Windows PowerShell's .NET Framework may not expose OSArchitecture.
+    # Prefer the native architecture when running under 32-bit PowerShell.
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
     switch ($arch) {
-        'X64' {
+        'AMD64' {
             $triple = 'x86_64-pc-windows-msvc'
             $checksum = '9ee6a2192fbb30c776415af529927f76ca6b5d1d55699bb1315f9878e610b5b8'
         }
