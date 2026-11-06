@@ -1046,7 +1046,9 @@ impl<'source> Parser<'source> {
             };
             self.expect(TokenKind::FatArrow)?;
             let body = self.expr(0)?;
-            self.end_line()?;
+            if self.tokens[self.index - 1].kind != TokenKind::Dedent {
+                self.end_line()?;
+            }
             arms.push(MatchArm {
                 span: self.span_from(start),
                 variant,
@@ -1424,6 +1426,15 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_nested_blocks_in_match_arms() {
+        let module = parse(
+            "fn choose(value: Option<i64>) -> i64\n    match value\n        Some(item) => if item > 0\n            item\n        else\n            0\n        None => match value\n            Some(other) => other\n            None => 0\n    let after = 1\n    after\n",
+        )
+        .unwrap();
+        assert_eq!(module.functions[0].body.len(), 3);
     }
 
     #[test]
