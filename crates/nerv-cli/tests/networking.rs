@@ -345,3 +345,40 @@ fn main() -> i64
         text(&output.stderr)
     );
 }
+
+#[test]
+fn captured_websocket_handlers_preserve_supported_environments() {
+    let project = Project::new();
+    for mode in ["jit", "--debug", "--release"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = thread::spawn(move || {
+            let mut socket = tungstenite::accept(accept(&listener)).unwrap();
+            assert_eq!(
+                socket.read().unwrap().into_text().unwrap(),
+                "captured hello"
+            );
+            assert!(socket.read().unwrap().is_close());
+        });
+        let mut command = project.program(mode, r#"import nerv.net
+fn main() -> i64
+    let prefix = "captured hello"
+    let callback = fn(handle: i64, kind: string, message: string, bytes: []u8, state: string) -> []string => if kind == "open"
+        assert(result_or(websocket_send(handle, prefix), false))
+        ["close", "done"]
+    else
+        ["continue", state]
+    let outcome = websocket_run(option_or(environment("TEST_URL"), ""), "", 1000, callback)
+    assert(outcome.error == "")
+    assert(outcome.state == "done")
+    let shared = ["unsafe capture"]
+    let forbidden = fn(handle: i64, kind: string, message: string, bytes: []u8, state: string) -> []string => ["close", shared[0]]
+    let rejected = websocket_run("ws://127.0.0.1:1", "", 100, forbidden)
+    assert(nerv.string.starts_with(rejected.error, "WebSocket callbacks cannot capture") == 1)
+    42
+"#);
+        command.env("TEST_URL", url);
+        success(command.output().unwrap(), mode);
+        server.join().unwrap();
+    }
+}

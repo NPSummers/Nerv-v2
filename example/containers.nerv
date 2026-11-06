@@ -1,0 +1,28 @@
+import nerv.std
+
+fn main() -> i64
+    let mut values = buffer(0)
+    for i in 0 .. 1000
+        values = values:push(i)
+    assert(values:len() == 1000)
+    assert(values:capacity() >= 1000 and values:capacity() < 2000)
+    assert(values:get(999) == 999)
+    values = values:pop()
+    assert(values:len() == 999)
+    let mut entries = hash_map(0)
+    for i in 0 .. 1000
+        entries = entries:insert(integer_text(i), i * 2)
+    assert(entries:len() == 1000)
+    for i in 0 .. 1000
+        assert(option_or(entries:get(integer_text(i)), -1) == i * 2)
+    entries = entries:insert("42", 9000)
+    assert(entries:len() == 1000)
+    assert(option_or(entries:get("42"), -1) == 9000)
+    for i in 0 .. 500
+        entries = entries:remove(integer_text(i))
+    assert(entries:len() == 500)
+    for i in 0 .. 500
+        entries = entries:insert(integer_text(i), i)
+    assert(entries:len() == 1000)
+    assert(option_or(entries:get("42"), -1) == 42)
+    42

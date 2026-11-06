@@ -521,3 +521,89 @@ fn file_processing_example_uses_program_arguments() {
         "hello UTF-8: ?"
     );
 }
+
+#[test]
+fn foundation_library_matches_jit_and_native_modes() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../example/foundation.nerv");
+    let project = Project::new();
+    let output = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "42\n");
+    parity(&source);
+}
+
+#[test]
+fn nested_control_flow_matches_jit_and_native_modes() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../example/control-flow.nerv");
+    let project = Project::new();
+    let output = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "42\n");
+    parity(&source);
+}
+
+#[test]
+fn propagation_matches_jit_and_native_modes() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../example/propagation.nerv");
+    let project = Project::new();
+    let output = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "42\n");
+    parity(&source);
+}
+
+#[test]
+fn capturing_closures_match_jit_and_native_modes() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../example/closures.nerv");
+    let project = Project::new();
+    let output = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "42\n");
+    parity(&source);
+}
+
+#[test]
+fn module_namespaces_match_jit_and_native_modes() {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../example/namespaces/main.nerv");
+    let project = Project::new();
+    let output = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "42\n");
+    parity(&source);
+}
+
+#[test]
+fn tasks_cancellation_and_regions_match_jit_and_native_modes() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../example/tasks.nerv");
+    let project = Project::new();
+    let output = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "42\n");
+    parity(&source);
+}
+
+#[test]
+fn growing_buffers_and_hash_maps_match_jit_and_native_modes() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../example/containers.nerv");
+    let project = Project::new();
+    let output = project.cli().arg(&source).arg("--run").output().unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "42\n");
+    parity(&source);
+}
+
+#[test]
+fn imported_main_does_not_become_the_application_entry() {
+    let project = Project::new();
+    fs::write(project.0.join("helper.nerv"), "fn main() -> i64 => 99\n").unwrap();
+    let source = project.0.join("main.nerv");
+    fs::write(&source, "import helper\nfn answer() -> i64 => 42\n").unwrap();
+    let output = project.build(&source, "--debug");
+    assert!(!output.status.success());
+    assert!(
+        text(&output.stderr).contains("main"),
+        "{}",
+        text(&output.stderr)
+    );
+}

@@ -12,6 +12,7 @@ pub(super) fn assigned_locals(body: &[nerv_sema::ir::Statement]) -> HashSet<Symb
     fn block(body: &[Statement], writes: &mut HashSet<SymbolId>) {
         for statement in body {
             match &statement.kind {
+                S::Break | S::Continue | S::ReturnVoid => {}
                 S::Assign { target, value } | S::AssignField { target, value, .. } => {
                     writes.insert(*target);
                     expr(value, writes);
@@ -61,7 +62,7 @@ pub(super) fn assigned_locals(body: &[nerv_sema::ir::Statement]) -> HashSet<Symb
                     expr(arg, writes);
                 }
             }
-            E::Array(args) | E::Runtime { args, .. } => {
+            E::Closure { captures: args, .. } | E::Array(args) | E::Runtime { args, .. } => {
                 for arg in args {
                     expr(arg, writes);
                 }
@@ -80,7 +81,8 @@ pub(super) fn assigned_locals(body: &[nerv_sema::ir::Statement]) -> HashSet<Symb
                     expr(value, writes);
                 }
             }
-            E::Field { base, .. }
+            E::Try { value: base, .. }
+            | E::Field { base, .. }
             | E::Unary { value: base, .. }
             | E::Convert { value: base, .. }
             | E::Assert(base) => expr(base, writes),

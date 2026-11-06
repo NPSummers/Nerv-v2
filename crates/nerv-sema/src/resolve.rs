@@ -15,6 +15,8 @@ type Scope = HashMap<String, Local>;
 
 struct Resolver<'a> {
     next: u32,
+    result: T,
+    loop_depth: usize,
     functions: HashMap<&'a str, &'a ast::Function>,
     function_ids: HashMap<&'a str, ir::SymbolId>,
     structs: HashMap<&'a str, &'a ast::Struct>,
@@ -27,6 +29,8 @@ struct Resolver<'a> {
 pub(super) fn resolve(modules: &[LoadedModule]) -> Result<ir::CheckedProgram, Error> {
     let mut resolver = Resolver {
         next: 0,
+        result: T::Void,
+        loop_depth: 0,
         functions: HashMap::new(),
         function_ids: HashMap::new(),
         structs: HashMap::new(),
@@ -267,6 +271,8 @@ impl Resolver<'_> {
         function: &ast::Function,
         id: ir::SymbolId,
     ) -> Result<ir::Function, Error> {
+        self.result = function.result.clone();
+        self.loop_depth = 0;
         let (params, mut scope) = self.parameters(&function.params)?;
         let body = self.block(&function.body, &mut scope)?;
         Ok(ir::Function {
@@ -370,10 +376,13 @@ impl Resolver<'_> {
                     value: self.expression(value, scope)?,
                 }
             }
-            S::While { condition, body } => K::While {
-                condition: self.expression(condition, scope)?,
-                body: self.block(body, &mut scope.clone())?,
-            },
+            S::While { condition, body } => {
+                let condition = self.expression(condition, scope)?;
+                self.loop_depth += 1;
+                let body = self.block(body, &mut scope.clone())?;
+                self.loop_depth -= 1;
+                K::While { condition, body }
+            }
             S::For {
                 name,
                 start,
@@ -392,15 +401,45 @@ impl Resolver<'_> {
                         ty: T::Int,
                     },
                 );
+                self.loop_depth += 1;
+                let body = self.block(body, &mut inner)?;
+                self.loop_depth -= 1;
                 K::For {
                     binding,
                     start,
                     end,
                     inclusive: *inclusive,
-                    body: self.block(body, &mut inner)?,
+                    body,
                 }
             }
-            S::Return(value) => K::Return(self.expression(value, scope)?),
+            S::ReturnVoid => {
+                if self.result != T::Void {
+                    return Err(failure(
+                        statement.span,
+                        "bare return requires a void function",
+                    ));
+                }
+                K::ReturnVoid
+            }
+            S::Break | S::Continue => {
+                if self.loop_depth == 0 {
+                    return Err(failure(statement.span, "loop exit outside a loop"));
+                }
+                if matches!(statement.kind, S::Break) {
+                    K::Break
+                } else {
+                    K::Continue
+                }
+            }
+            S::Return(value) => {
+                if self.inferred(value, scope)? != self.result {
+                    return Err(failure(
+                        value.span,
+                        "return type does not match function result",
+                    ));
+                }
+                K::Return(self.expression(value, scope)?)
+            }
             S::Expr(value) => K::Expr(self.expression(value, scope)?),
         };
         let ty = if let K::Expr(expr) = &kind {
@@ -420,6 +459,43 @@ impl Resolver<'_> {
         let actual = self.inferred(expression, scope)?;
         let ty = self.ty(&actual, expression.span)?;
         let kind = match &expression.kind {
+            E::Try(value) => {
+                let T::Named(source) = self.inferred(value, scope)? else {
+                    unreachable!("checked propagation");
+                };
+                let T::Named(target) = &self.result else {
+                    return Err(failure(
+                        expression.span,
+                        "? requires a Result or Option return type",
+                    ));
+                };
+                let (family, failure_name, has_error) = if source.starts_with("Result__generic_") {
+                    ("Result__generic_", "Err", true)
+                } else {
+                    ("Option__generic_", "None", false)
+                };
+                if !target.starts_with(family) {
+                    return Err(failure(
+                        expression.span,
+                        "? source and function result must use the same error container",
+                    ));
+                }
+                let source_key = format!("{source}__{failure_name}");
+                let target_key = format!("{target}__{failure_name}");
+                if self.variants[&*source_key].payload != self.variants[&*target_key].payload {
+                    return Err(failure(
+                        expression.span,
+                        "? error type does not match function result",
+                    ));
+                }
+                let (failure_enum, _, failure_tag) = self.constructors[&*target_key];
+                K::Try {
+                    value: Box::new(self.expression(value, scope)?),
+                    failure_enum,
+                    failure_tag,
+                    has_error,
+                }
+            }
             E::Int(value) => K::Int(*value),
             E::Float(value) => K::Float(*value),
             E::Bool(value) => K::Bool(*value),
@@ -534,12 +610,45 @@ impl Resolver<'_> {
                 body,
             } => {
                 let id = self.id();
-                let (params, inner) = self.parameters(params)?;
+                let mut names = HashSet::new();
+                expression_names(body, &mut names);
+                let mut captured = scope
+                    .iter()
+                    .filter(|(name, _)| {
+                        names.contains(*name) && !params.iter().any(|p| p.name == **name)
+                    })
+                    .collect::<Vec<_>>();
+                captured.sort_by_key(|(name, _)| *name);
+                let (mut lifted_params, mut inner) = self.parameters(&[])?;
+                let mut captures = Vec::new();
+                for (name, local) in captured {
+                    let binding = self.binding(name, &local.ty, false, expression.span)?;
+                    lifted_params.push(binding.clone());
+                    inner.insert(
+                        name.clone(),
+                        Local {
+                            binding,
+                            ty: local.ty.clone(),
+                        },
+                    );
+                    captures.push(ir::Expr {
+                        span: expression.span,
+                        ty: local.binding.ty.clone(),
+                        kind: K::Local(local.binding.id),
+                    });
+                }
+                let (params, parameters) = self.parameters(params)?;
+                lifted_params.extend(params);
+                inner.extend(parameters);
+                let previous_result = std::mem::replace(&mut self.result, result.clone());
+                let previous_depth = std::mem::replace(&mut self.loop_depth, 0);
                 let body = self.expression(body, &inner)?;
+                self.result = previous_result;
+                self.loop_depth = previous_depth;
                 self.lifted.push(ir::Function {
                     id,
                     name: format!("lambda_{}", id.0),
-                    params,
+                    params: lifted_params,
                     result: self.ty(result, expression.span)?,
                     span: expression.span,
                     body: vec![ir::Statement {
@@ -548,8 +657,12 @@ impl Resolver<'_> {
                         kind: ir::StatementKind::Expr(body),
                     }],
                 });
-                K::Function(id)
+                K::Closure {
+                    function: id,
+                    captures,
+                }
             }
+
             E::Method { base, name, args } => {
                 let T::Named(type_name) = self.inferred(base, scope)? else {
                     unreachable!("checked receiver")
@@ -691,6 +804,17 @@ fn runtime_symbol(name: &str, args: &[ir::Expr]) -> String {
             };
             format!("nerv_{name}_{suffix}")
         }
+        name if name.starts_with("nerv.task.")
+            || name.starts_with("nerv.memory.")
+            || name.starts_with("nerv.text.")
+            || name.starts_with("nerv.fs.")
+            || name.starts_with("nerv.path.") =>
+        {
+            name.replace('.', "_")
+        }
+        "nerv.arrays.map" => "nerv_array_i64_map_closure".into(),
+        "nerv.arrays.reduce" => "nerv_array_i64_reduce_closure".into(),
+        "nerv.net.websocket_run" => "nerv_net_websocket_run_closure".into(),
         "nerv.arrays.len" => "nerv_array_length".into(),
         name if name.starts_with("nerv.json.") => {
             format!("nerv_json_{}", name.trim_start_matches("nerv.json."))
@@ -797,4 +921,125 @@ fn validate_layouts(program: &ir::CheckedProgram) -> Result<(), Error> {
         visit(*id, &layouts, &mut HashSet::new(), &mut done)?;
     }
     Ok(())
+}
+
+fn expression_names(expr: &ast::Expr, names: &mut HashSet<String>) {
+    fn block(body: &[ast::Statement], bound: &mut HashSet<String>, names: &mut HashSet<String>) {
+        for statement in body {
+            match &statement.kind {
+                S::Let { name, value, .. } => {
+                    collect(value, bound, names);
+                    bound.insert(name.clone());
+                }
+                S::Assign { name, value } => {
+                    if !bound.contains(name) {
+                        names.insert(name.clone());
+                    }
+                    collect(value, bound, names);
+                }
+                S::Return(value) | S::Expr(value) => collect(value, bound, names),
+                S::AssignIndex { base, index, value } => {
+                    for expr in [base, index, value] {
+                        collect(expr, bound, names);
+                    }
+                }
+                S::AssignField { base, value, .. } => {
+                    collect(base, bound, names);
+                    collect(value, bound, names);
+                }
+                S::While { condition, body } => {
+                    collect(condition, bound, names);
+                    block(body, &mut bound.clone(), names);
+                }
+                S::For {
+                    name,
+                    start,
+                    end,
+                    body,
+                    ..
+                } => {
+                    collect(start, bound, names);
+                    collect(end, bound, names);
+                    let mut inner = bound.clone();
+                    inner.insert(name.clone());
+                    block(body, &mut inner, names);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn collect(expr: &ast::Expr, bound: &HashSet<String>, names: &mut HashSet<String>) {
+        match &expr.kind {
+            E::Name(name) => {
+                if !bound.contains(name) {
+                    names.insert(name.clone());
+                }
+            }
+            E::Array(values) => {
+                for value in values {
+                    collect(value, bound, names);
+                }
+            }
+            E::ArrayRepeat { value, length } => {
+                collect(value, bound, names);
+                collect(length, bound, names);
+            }
+            E::Struct { fields, .. } => {
+                for (_, value) in fields {
+                    collect(value, bound, names);
+                }
+            }
+            E::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                collect(condition, bound, names);
+                block(then_body, &mut bound.clone(), names);
+                block(else_body, &mut bound.clone(), names);
+            }
+            E::Match { value, arms } => {
+                collect(value, bound, names);
+                for arm in arms {
+                    let mut inner = bound.clone();
+                    if let Some(name) = &arm.binding {
+                        inner.insert(name.clone());
+                    }
+                    collect(&arm.body, &inner, names);
+                }
+            }
+            E::Lambda { params, body, .. } => {
+                let mut inner = bound.clone();
+                for param in params {
+                    inner.insert(param.name.clone());
+                }
+                collect(body, &inner, names);
+            }
+            E::Try(body) | E::Unary { value: body, .. } | E::Field { base: body, .. } => {
+                collect(body, bound, names)
+            }
+            E::Call { callee, args } => {
+                collect(callee, bound, names);
+                for arg in args {
+                    collect(arg, bound, names);
+                }
+            }
+            E::Method { base, args, .. } => {
+                collect(base, bound, names);
+                for arg in args {
+                    collect(arg, bound, names);
+                }
+            }
+            E::Index { base, index } => {
+                collect(base, bound, names);
+                collect(index, bound, names);
+            }
+            E::Binary { left, right, .. } => {
+                collect(left, bound, names);
+                collect(right, bound, names);
+            }
+            _ => {}
+        }
+    }
+    collect(expr, &HashSet::new(), names);
 }

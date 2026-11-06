@@ -34,9 +34,12 @@ struct Compiler {
     array_lengths: HashMap<SymbolId, i64>,
     immutable_depths: HashMap<SymbolId, usize>,
     loop_depth: usize,
+    loops: Vec<(LLVMBasicBlockRef, LLVMBasicBlockRef)>,
     mode: BuildMode,
     assigned: HashSet<SymbolId>,
     reciprocal_loop: bool,
+    next_closure: usize,
+    noncapturing_closures: HashMap<SymbolId, LLVMValueRef>,
 }
 
 pub(super) fn generate(
@@ -81,9 +84,12 @@ pub(super) fn generate_for_cpu(
             array_lengths: HashMap::new(),
             immutable_depths: HashMap::new(),
             loop_depth: 0,
+            loops: Vec::new(),
             mode,
             assigned: HashSet::new(),
             reciprocal_loop: false,
+            next_closure: 0,
+            noncapturing_closures: HashMap::new(),
         };
         let result = compiler
             .compile(program, standalone)
@@ -195,6 +201,153 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    fn closure(
+        &mut self,
+        function: SymbolId,
+        captures: &[ir::Expr],
+        ty: &Type,
+        slots: &mut Slots,
+    ) -> Result<Value, Error> {
+        if captures.is_empty() {
+            if let Some(value) = self.noncapturing_closures.get(&function) {
+                return Ok(Value {
+                    value: *value,
+                    ty: self.pointer_ty(),
+                });
+            }
+        }
+        let Type::Function { params, result } = ty else {
+            unreachable!("checked closure");
+        };
+        let mut fields = captures.iter().map(|e| self.ty(&e.ty)).collect::<Vec<_>>();
+        let environment_ty = unsafe {
+            LLVMStructTypeInContext(self.context, fields.as_mut_ptr(), fields.len() as u32, 0)
+        };
+        let environment = if captures.is_empty() {
+            Value {
+                value: unsafe { LLVMConstNull(self.pointer_ty()) },
+                ty: self.pointer_ty(),
+            }
+        } else {
+            let array = self.new_array(self.integer(1), environment_ty)?;
+            let mut value = unsafe { LLVMGetUndef(environment_ty) };
+            for (index, capture) in captures.iter().enumerate() {
+                let captured = self.expr(capture, slots)?;
+                value = unsafe {
+                    LLVMBuildInsertValue(
+                        self.builder,
+                        value,
+                        captured.value,
+                        index as u32,
+                        c"capture".as_ptr(),
+                    )
+                };
+            }
+            self.array_store(
+                array,
+                self.integer(0),
+                Value {
+                    value,
+                    ty: environment_ty,
+                },
+            )?;
+            array
+        };
+        let mut types = vec![self.pointer_ty()];
+        types.extend(params.iter().map(|p| self.ty(p)));
+        let signature =
+            unsafe { LLVMFunctionType(self.ty(result), types.as_mut_ptr(), types.len() as u32, 0) };
+        let name = cstring(&format!("closure_{}", self.next_closure))?;
+        self.next_closure += 1;
+        let thunk = unsafe { LLVMAddFunction(self.module, name.as_ptr(), signature) };
+        let origin = unsafe { LLVMGetInsertBlock(self.builder) };
+        let entry =
+            unsafe { LLVMAppendBasicBlockInContext(self.context, thunk, c"entry".as_ptr()) };
+        unsafe { LLVMPositionBuilderAtEnd(self.builder, entry) };
+        let mut arguments = Vec::new();
+        if !captures.is_empty() {
+            let array = Value {
+                value: unsafe { LLVMGetParam(thunk, 0) },
+                ty: self.pointer_ty(),
+            };
+            let pointer = self.array_element(array, self.integer(0), environment_ty)?;
+            let value = unsafe {
+                LLVMBuildLoad2(
+                    self.builder,
+                    environment_ty,
+                    pointer,
+                    c"environment".as_ptr(),
+                )
+            };
+            for index in 0..captures.len() {
+                arguments.push(unsafe {
+                    LLVMBuildExtractValue(self.builder, value, index as u32, c"capture".as_ptr())
+                });
+            }
+        }
+        arguments.extend((0..params.len()).map(|i| unsafe { LLVMGetParam(thunk, (i + 1) as u32) }));
+        let target = self.functions[&function];
+        unsafe {
+            let value = LLVMBuildCall2(
+                self.builder,
+                target.ty,
+                target.value,
+                arguments.as_mut_ptr(),
+                arguments.len() as u32,
+                c"".as_ptr(),
+            );
+            if **result == Type::Void {
+                LLVMBuildRetVoid(self.builder);
+            } else {
+                LLVMBuildRet(self.builder, value);
+            }
+            LLVMPositionBuilderAtEnd(self.builder, origin);
+        }
+        if captures.is_empty() {
+            let mut fields = [self.pointer_ty(), self.pointer_ty(), self.int_ty()];
+            let closure_ty =
+                unsafe { LLVMStructTypeInContext(self.context, fields.as_mut_ptr(), 3, 0) };
+            let name = cstring(&format!("closure_value_{}", function.0))?;
+            let value = unsafe {
+                let global = LLVMAddGlobal(self.module, closure_ty, name.as_ptr());
+                let mut values = [
+                    thunk,
+                    LLVMConstNull(self.pointer_ty()),
+                    self.integer(0).value,
+                ];
+                LLVMSetInitializer(
+                    global,
+                    LLVMConstNamedStruct(closure_ty, values.as_mut_ptr(), 3),
+                );
+                LLVMSetGlobalConstant(global, 1);
+                global
+            };
+            self.noncapturing_closures.insert(function, value);
+            Ok(Value {
+                value,
+                ty: self.pointer_ty(),
+            })
+        } else {
+            self.external(
+                "nerv_closure_new",
+                self.pointer_ty(),
+                &[
+                    Value {
+                        value: thunk,
+                        ty: self.pointer_ty(),
+                    },
+                    environment,
+                    self.integer(i64::from(captures.iter().any(|capture| {
+                        matches!(
+                            capture.ty,
+                            Type::Array(_) | Type::Named(_) | Type::Function { .. }
+                        )
+                    }))),
+                ],
+            )
+        }
     }
 
     fn entry_adapter(&mut self, program: &CheckedProgram) -> Result<(), Error> {
@@ -384,6 +537,22 @@ impl Compiler {
                 inclusive,
                 body,
             } => self.for_loop(binding, start, end, *inclusive, body, slots)?,
+            S::ReturnVoid => unsafe {
+                LLVMBuildRetVoid(self.builder);
+            },
+            S::Break | S::Continue => {
+                let (next, exit) = self.loops.last().copied().expect("checked loop exit");
+                unsafe {
+                    LLVMBuildBr(
+                        self.builder,
+                        if matches!(statement.kind, S::Break) {
+                            exit
+                        } else {
+                            next
+                        },
+                    );
+                }
+            }
             S::Return(value) => {
                 let value = self.expr(value, slots)?;
                 unsafe { LLVMBuildRet(self.builder, value.value) };
@@ -401,6 +570,56 @@ impl Compiler {
     fn expr_inner(&mut self, expression: &ir::Expr, slots: &mut Slots) -> Result<Value, Error> {
         let ty = self.ty(&expression.ty);
         let value = match &expression.kind {
+            E::Try {
+                value,
+                failure_enum,
+                failure_tag,
+                has_error,
+            } => {
+                let value = self.expr(value, slots)?;
+                let success = self.new_block(c"try.success");
+                let failure = self.new_block(c"try.failure");
+                unsafe {
+                    let tag =
+                        LLVMBuildExtractValue(self.builder, value.value, 0, c"try.tag".as_ptr());
+                    let ok = LLVMBuildICmp(
+                        self.builder,
+                        IP::LLVMIntEQ,
+                        tag,
+                        self.integer(0).value,
+                        c"try.ok".as_ptr(),
+                    );
+                    LLVMBuildCondBr(self.builder, ok, success, failure);
+                    LLVMPositionBuilderAtEnd(self.builder, failure);
+                    let target_ty = self.types[failure_enum];
+                    let mut propagated = LLVMGetUndef(target_ty);
+                    propagated = LLVMBuildInsertValue(
+                        self.builder,
+                        propagated,
+                        self.integer(*failure_tag).value,
+                        0,
+                        c"try.error.tag".as_ptr(),
+                    );
+                    if *has_error {
+                        let error = LLVMBuildExtractValue(
+                            self.builder,
+                            value.value,
+                            2,
+                            c"try.error".as_ptr(),
+                        );
+                        propagated = LLVMBuildInsertValue(
+                            self.builder,
+                            propagated,
+                            error,
+                            (*failure_tag + 1) as u32,
+                            c"try.error.value".as_ptr(),
+                        );
+                    }
+                    LLVMBuildRet(self.builder, propagated);
+                    LLVMPositionBuilderAtEnd(self.builder, success);
+                    LLVMBuildExtractValue(self.builder, value.value, 1, c"try.value".as_ptr())
+                }
+            }
             E::Int(value) => unsafe { LLVMConstInt(ty, *value as u64, 1) },
             E::Float(value) => unsafe { LLVMConstReal(ty, *value) },
             E::Bool(value) => unsafe { LLVMConstInt(ty, *value as u64, 0) },
@@ -424,7 +643,10 @@ impl Compiler {
             E::Local(id) => unsafe {
                 LLVMBuildLoad2(self.builder, ty, slots[id].value, c"load".as_ptr())
             },
-            E::Function(id) => self.functions[id].value,
+            E::Function(id) => return self.closure(*id, &[], &expression.ty, slots),
+            E::Closure { function, captures } => {
+                return self.closure(*function, captures, &expression.ty, slots);
+            }
             E::Array(elements) => {
                 let Type::Array(element) = &expression.ty else {
                     unreachable!("checked array")
@@ -571,16 +793,36 @@ impl Compiler {
             }
             E::Binary { left, op, right } => return self.binary(*op, left, right, ty, slots),
             E::Call { target, args } => {
+                let mut environment = None;
                 let function = match target {
                     ir::CallTarget::Direct(id) => self.functions[id],
                     ir::CallTarget::Indirect(callee) => {
                         let Type::Function { params, result } = &callee.ty else {
                             unreachable!("checked call signature")
                         };
-                        let signature = self.signature(params, result);
-                        let value = self.expr(callee, slots)?;
+                        let mut types = vec![self.pointer_ty()];
+                        types.extend(params.iter().map(|p| self.ty(p)));
+                        let signature = unsafe {
+                            LLVMFunctionType(
+                                self.ty(result),
+                                types.as_mut_ptr(),
+                                types.len() as u32,
+                                0,
+                            )
+                        };
+                        let closure = self.expr(callee, slots)?;
+                        let code =
+                            self.external("nerv_closure_code", self.pointer_ty(), &[closure])?;
+                        environment = Some(
+                            self.external(
+                                "nerv_closure_environment",
+                                self.pointer_ty(),
+                                &[closure],
+                            )?
+                            .value,
+                        );
                         Function {
-                            value: value.value,
+                            value: code.value,
                             ty: signature,
                         }
                     }
@@ -589,6 +831,9 @@ impl Compiler {
                     .iter()
                     .map(|arg| self.expr(arg, slots).map(|value| value.value))
                     .collect::<Result<Vec<_>, _>>()?;
+                if let Some(environment) = environment {
+                    args.insert(0, environment);
+                }
                 unsafe {
                     LLVMBuildCall2(
                         self.builder,
@@ -722,20 +967,34 @@ impl Compiler {
         }
         let then_value = self.block(then_body, slots)?;
         let then_end = unsafe { LLVMGetInsertBlock(self.builder) };
+        let then_live = unsafe { LLVMGetBasicBlockTerminator(then_end).is_null() };
         unsafe {
-            LLVMBuildBr(self.builder, merge);
+            if then_live {
+                LLVMBuildBr(self.builder, merge);
+            }
             LLVMPositionBuilderAtEnd(self.builder, else_block);
         }
         let else_value = self.block(else_body, slots)?;
         let else_end = unsafe { LLVMGetInsertBlock(self.builder) };
+        let else_live = unsafe { LLVMGetBasicBlockTerminator(else_end).is_null() };
+        let mut incoming = Vec::new();
         unsafe {
-            LLVMBuildBr(self.builder, merge);
+            if else_live {
+                LLVMBuildBr(self.builder, merge);
+            }
             LLVMPositionBuilderAtEnd(self.builder, merge);
+            if !then_live && !else_live {
+                LLVMBuildUnreachable(self.builder);
+                return Ok(self.void());
+            }
         }
-        Ok(self.phi(
-            ty,
-            &[(then_value.value, then_end), (else_value.value, else_end)],
-        ))
+        if then_live {
+            incoming.push((then_value.value, then_end));
+        }
+        if else_live {
+            incoming.push((else_value.value, else_end));
+        }
+        Ok(self.phi(ty, &incoming))
     }
 
     fn match_expr(
@@ -784,13 +1043,22 @@ impl Compiler {
                 )?;
             }
             let result = self.expr(&arm.body, slots)?;
-            incoming.push((result.value, unsafe { LLVMGetInsertBlock(self.builder) }));
-            unsafe { LLVMBuildBr(self.builder, merge) };
+            let end = unsafe { LLVMGetInsertBlock(self.builder) };
+            if unsafe { LLVMGetBasicBlockTerminator(end).is_null() } {
+                incoming.push((result.value, end));
+                unsafe { LLVMBuildBr(self.builder, merge) };
+            }
         }
         unsafe {
             LLVMPositionBuilderAtEnd(self.builder, fallback);
             LLVMBuildUnreachable(self.builder);
             LLVMPositionBuilderAtEnd(self.builder, merge);
+        }
+        if incoming.is_empty() {
+            unsafe {
+                LLVMBuildUnreachable(self.builder);
+            }
+            return Ok(self.void());
         }
         Ok(self.phi(ty, &incoming))
     }
@@ -834,11 +1102,15 @@ impl Compiler {
         }
         self.loop_depth += 1;
         let previous_reciprocal_loop = std::mem::replace(&mut self.reciprocal_loop, false);
+        self.loops.push((test, exit));
         self.block(body, slots)?;
+        self.loops.pop();
         self.reciprocal_loop = previous_reciprocal_loop;
         self.loop_depth -= 1;
         unsafe {
-            LLVMBuildBr(self.builder, test);
+            if LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(self.builder)).is_null() {
+                LLVMBuildBr(self.builder, test);
+            }
             LLVMPositionBuilderAtEnd(self.builder, exit);
         }
         Ok(())
@@ -905,7 +1177,16 @@ impl Compiler {
                 self.ranges.insert(binding.id, range);
             }
         }
+        let next_block = self.new_block(c"for.next");
+        self.loops.push((next_block, exit));
         self.block(body, slots)?;
+        self.loops.pop();
+        unsafe {
+            if LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(self.builder)).is_null() {
+                LLVMBuildBr(self.builder, next_block);
+            }
+            LLVMPositionBuilderAtEnd(self.builder, next_block);
+        }
         self.ranges.remove(&binding.id);
         self.loop_depth -= 1;
         self.reciprocal_loop = previous_reciprocal_loop;
@@ -967,6 +1248,26 @@ impl Compiler {
                 LLVMPositionBuilderAtEnd(self.builder, merge);
             }
             return Ok(self.phi(ty, &[(condition.value, origin), (right.value, right_end)]));
+        }
+        if left.ty == Type::String && matches!(op, B::Eq | B::NotEq) {
+            let left = self.expr(left, slots)?;
+            let right = self.expr(right, slots)?;
+            let equal = self.external("nerv_str_equal", self.int_ty(), &[left, right])?;
+            let predicate = if op == B::Eq {
+                IP::LLVMIntNE
+            } else {
+                IP::LLVMIntEQ
+            };
+            let value = unsafe {
+                LLVMBuildICmp(
+                    self.builder,
+                    predicate,
+                    equal.value,
+                    self.integer(0).value,
+                    c"string.equal".as_ptr(),
+                )
+            };
+            return Ok(Value { value, ty });
         }
         let floating = matches!(left.ty, Type::Float | Type::Float32);
         let integer = match left.ty {

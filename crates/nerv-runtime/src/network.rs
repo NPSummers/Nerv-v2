@@ -518,8 +518,63 @@ pub unsafe extern "C" fn nerv_net_websocket_run(
     strings(vec![state, error])
 }
 
+thread_local! {
+    static CLOSURE_CALLBACKS: RefCell<Vec<*const super::closure::Closure>> = const { RefCell::new(Vec::new()) };
+}
+
+struct ClosureCallback;
+impl Drop for ClosureCallback {
+    fn drop(&mut self) {
+        CLOSURE_CALLBACKS.with(|callbacks| {
+            callbacks.borrow_mut().pop();
+        });
+    }
+}
+
+unsafe extern "C" fn invoke_closure(
+    handle: i64,
+    kind: *const NervString,
+    text: *const NervString,
+    bytes: *const c_void,
+    state: *const NervString,
+) -> *const ArrayHeader {
+    let closure = CLOSURE_CALLBACKS
+        .with(|callbacks| *callbacks.borrow().last().expect("active closure callback"));
+    let closure = unsafe { &*closure };
+    let callback: unsafe extern "C" fn(
+        *mut c_void,
+        i64,
+        *const NervString,
+        *const NervString,
+        *const c_void,
+        *const NervString,
+    ) -> *const ArrayHeader = unsafe { std::mem::transmute(closure.code) };
+    unsafe { callback(closure.environment, handle, kind, text, bytes, state) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nerv_net_websocket_run_closure(
+    url: *const NervString,
+    headers: *const ArrayHeader,
+    state: *const NervString,
+    timeout: i64,
+    ca_file: *const NervString,
+    callback: *const super::closure::Closure,
+) -> *mut c_void {
+    if unsafe { (*callback).mutable_captures } != 0 {
+        return strings(vec![unsafe { text(state) }.to_owned(), "WebSocket callbacks cannot capture arrays, aggregates, or functions; use explicit state".into()]);
+    }
+    CLOSURE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(callback));
+    let _scope = ClosureCallback;
+    unsafe { nerv_net_websocket_run(url, headers, state, timeout, ca_file, invoke_closure) }
+}
+
 pub(super) fn symbols() -> Vec<RuntimeSymbol> {
     vec![
+        RuntimeSymbol {
+            name: "nerv_net_websocket_run_closure",
+            address: nerv_net_websocket_run_closure as *const (),
+        },
         RuntimeSymbol {
             name: "nerv_net_http_request",
             address: nerv_net_http_request as *const (),

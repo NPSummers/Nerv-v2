@@ -1,0 +1,33 @@
+import nerv.std
+
+fn adder(base: i64) -> fn(i64) -> i64
+    fn(value: i64) -> i64 => base + value
+
+fn greeting(prefix: string) -> fn(string) -> string
+    fn(value: string) -> string => nerv.string.concat(prefix, value)
+
+fn main() -> i64
+    let add = adder(10)
+    assert(add(5) == 15)
+    let other = adder(20)
+    assert(other(5) == 25)
+    let greet = greeting("Hello ")
+    assert(greet("world") == "Hello world")
+    let callbacks = [add, other]
+    assert(callbacks [1](2) == 22)
+    let mut number = 10
+    let snapshot = fn() -> i64 => number
+    number = 20
+    assert(snapshot() == 10)
+    let outer = 99
+    let shadowed = fn() -> i64 => if true
+        let outer = 42
+        outer
+    else
+        0
+    assert(shadowed() == 42)
+    let offset = 3
+    let mapped = nerv.arrays.map([1, 2, 3], 3, fn(value: i64) -> i64 => value + offset)
+    assert(mapped [0] == 4)
+    assert(mapped [2] == 6)
+    42

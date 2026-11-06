@@ -1,0 +1,5 @@
+struct Value
+    number: i64
+    fn doubled(self) -> i64 => self.number * 2
+
+fn value() -> i64 => 10

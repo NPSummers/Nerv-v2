@@ -1,0 +1,45 @@
+import nerv.std
+
+fn main() -> i64
+    assert("hello" == nerv.string.concat("hel", "lo"))
+    assert("é" == nerv.string.slice("é!", 0, 2))
+    assert("hello" != "world")
+    assert("" == nerv.string.trim(" "))
+    let parts = split_text("a,,c", ",")
+    assert(nerv.arrays.len(parts) == 3)
+    assert(parts [1] == "")
+    assert(join_text(parts, "|") == "a||c")
+    assert(nerv.arrays.len(text_lines("one\r\ntwo\n")) == 2)
+    assert(integer_text(-9223372036854775808) == "-9223372036854775808")
+    assert(result_or(parse_integer("9223372036854775807"), 0) == 9223372036854775807)
+    let overflow = match parse_integer("9223372036854775808")
+        Ok(value) => false
+        Err(error) => true
+    assert(overflow)
+    assert(result_or(parse_float("1.25"), 0.0) == 1.25)
+    let nonfinite = match parse_float("NaN")
+        Ok(value) => false
+        Err(error) => true
+    assert(nonfinite)
+    assert(result_or(format_text("{{{}}}: {}", ["value", integer_text(42)]), "") == "{value}: 42")
+    let missing = match format_text("{} {}", ["one"])
+        Ok(value) => false
+        Err(error) => true
+    assert(missing)
+    let file = path("folder"):join("file.txt")
+    assert(file:file_name() == "file.txt")
+    assert(file:parent().text == "folder")
+    assert(not file:is_absolute())
+    let absent = match read_text("nerv-foundation-missing/file.txt")
+        Ok(value) => false
+        Err(error) => error.kind == "not_found"
+    assert(absent)
+    assert(file:extension() == "txt")
+    let cwd = result_or(current_directory(), path(""))
+    assert(cwd:is_absolute())
+    let cwd_metadata = file_metadata(cwd)
+    let directory = match cwd_metadata
+        Ok(info) => info.is_directory
+        Err(error) => false
+    assert(directory)
+    42

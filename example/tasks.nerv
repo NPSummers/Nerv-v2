@@ -1,0 +1,31 @@
+import nerv.std
+
+fn square(value: i64) -> i64 => value * value
+
+fn cancellable(value: i64) -> i64
+    while not cancellation_requested()
+        sleep_ms(1)
+    value
+
+fn allocate_temporary(value: i64) -> i64
+    let text = nerv.string.repeat("temporary", 1000)
+    assert(nerv.string.len(text) == 9000)
+    value + 1
+
+fn main() -> i64
+    let first = result_or(spawn_task(6, square), Task { id: - 1 })
+    let second = result_or(spawn_task(7, square), Task { id: - 1 })
+    assert(result_or(join_task(first), -1) == 36)
+    assert(result_or(join_task(second), -1) == 49)
+    let cancelled = result_or(spawn_task(42, cancellable), Task { id: - 1 })
+    assert(cancel_task(cancelled))
+    assert(result_or(join_task(cancelled), -1) == 42)
+    assert(not cancel_task(cancelled))
+    let invalid = match join_task(cancelled)
+        Ok(value) => false
+        Err(error) => true
+    assert(invalid)
+    let callback = allocate_temporary
+    for i in 0 .. 100
+        assert(allocation_scope(i, callback) == i + 1)
+    42

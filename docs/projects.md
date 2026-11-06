@@ -31,7 +31,7 @@ math = { path = "../math" }
 
 Dependency resolution follows the declared paths, detects cycles, and writes `Nerv.lock` in stable order. The lock records package names, exact versions, relative manifest paths, dependency edges, and SHA-256 manifest checksums. Commit the manifest and lock together. Source edits rebuild code without changing the lock. Manifest edits require re-resolution. `--locked` fails on a missing, edited, or stale lockfile; it never updates it. The current resolver has no registry, network fetching, version ranges, or automatic upgrades. Move related local packages together to preserve their relative paths. Dependencies on another filesystem volume are rejected because their lock paths cannot be portable.
 
-Imported declarations still share the language's global namespace; dependency aliases select files and do not introduce symbol namespaces. Packages must avoid conflicting function/type names. Libraries are compiled with their importing application; `check` and `test` support library-only packages, while `build` and `run` require `main`.
+Dependency aliases support qualified functions, types, and constructors, such as `math.add(...)` or `math.Value`. Conflicting declarations in different modules are separated during semantic resolution; qualify ambiguous imports. Unique legacy unqualified references remain available for compatibility. Libraries are compiled with their importing application; `check` and `test` support library-only packages, while `build` and `run` require `main`.
 
 ## Commands and process behavior
 

@@ -293,9 +293,9 @@ fn main() -> i64
 
 ## 6. Functions, returns, and expression-valued blocks
 
-Functions are declared before checking any bodies, so forward calls and recursion are permitted. Arguments must match the declared parameter count and types. Scalars, structs, and enum values are passed by value. Strings and arrays pass shared handles. Non-capturing function values use `fn(types) -> result`; lambdas cannot access enclosing local bindings.
+Functions are declared before checking any bodies, so forward calls and recursion are permitted. Arguments must match the declared parameter count and types. Scalars, structs, and enum values are passed by value. Strings and arrays pass shared handles. Function values use `fn(types) -> result`. Lambdas capture referenced outer bindings by value when created; string and array handles retain their normal sharing semantics. Captured bindings cannot be rebound inside the lambda.
 
-A non-void function returns its final expression or a top-level `return expression`. A final `if` or `match` is an expression whose branches must have matching types. A block ending in a declaration, assignment, or loop has type `void`; a void function discards its final expression. Void values cannot be bound to variables. In this alpha core, explicit `return` inside a conditional or loop is rejected rather than partially implemented; bare `return` is not supported.
+A non-void function returns its final expression or `return expression`, including from nested branches and loops. A final `if` or `match` is an expression whose branches must have matching types. A block ending in a declaration, assignment, or loop has type `void`; a void function discards its final expression. Void values cannot be bound to variables. Bare `return` exits a void function. `break` exits the innermost loop and `continue` advances it. Both are rejected outside loops. An `if` without `else` has an empty else branch; value-producing branches must still agree on type, except branches that exit control flow.
 
 The executable entry point is `main()` returning `i64` or `void`. The current CLI prints an `i64` result, or `0` for a void main, and exits successfully after normal execution. The integer main result is not the process exit status.
 
@@ -365,7 +365,7 @@ fn main() -> i64
         false
 ```
 
-Example (`reject:return is only supported directly in a function body`):
+Example (`run:42`):
 
 ```nerv
 fn main() -> i64
@@ -389,7 +389,7 @@ fn apply(callback: fn(i64) -> i64, value: i64) -> i64 => callback(value)
 fn main() -> i64 => apply(fn(value: i64) -> i64 => value + 1, 41)
 ```
 
-Example (`reject:unknown name `):
+Example (`run:42`):
 
 ```nerv
 fn main() -> i64
@@ -402,7 +402,7 @@ fn main() -> i64
 
 An import `import lib.math` resolves to `lib/math.nerv` relative to the importing file, not the process's working directory. Resolution is recursive. Canonical paths deduplicate repeated imports, and cycles are compile errors. An import beginning with `nerv` names the built-in runtime and does not load a source file. Built-in runtime calls are also available without such an import.
 
-The optional `module name` declaration is informational in this alpha version; it does not change the file path or establish a namespace. All declarations in the loaded import graph are visible without qualification, including transitive imports. `export fn` is accepted but does not restrict visibility: functions without `export` are also public. Duplicate function names across the graph are rejected. Private declarations and isolated module namespaces are not implemented.
+Imported declarations can be qualified by their import path, including functions, constructors, and types: `lib.math.answer()` or `lib.models.Value`. Names from different modules may collide; qualified references select the defining module, while unqualified references prefer local declarations and must resolve without ambiguity among imports. Unique legacy unqualified names remain supported, including transitive imports. A `module name` declaration supplies an additional qualified name without changing path resolution. `export fn` remains accepted; functions without `export` are also public. Private declarations are not implemented.
 
 Multi-file example, tested by `module_resolution_visibility_and_cycles`:
 
@@ -505,7 +505,7 @@ fn main() -> void
 
 ## 9. Memory ownership, copying, and lifetime
 
-The alpha core uses **execution-region ownership**, not a tracing collector, per-object reference counting, or Rust-style moves and borrowing. Each JIT invocation or standalone entry owns its runtime allocations. Allocations remain alive across function returns and lexical scope exits, and are released together when the invocation finishes normally. Strings and arrays cannot escape into a later invocation. A test/benchmark batch currently shares one execution region for the batch. Fatal process exit lets the operating system reclaim memory. See the [runtime ABI](runtime-abi.md) and [standalone compilation](standalone.md) documents for implementation and validation details.
+The alpha core uses **execution-region ownership**, not a tracing collector, per-object reference counting, or Rust-style moves and borrowing. Each JIT invocation or standalone entry owns its runtime allocations. Allocations remain alive across function returns and lexical scope exits, and are released together when the invocation finishes normally. Strings and arrays cannot escape into a later invocation. `allocation_scope` reclaims a nested region after a noncapturing integer worker returns; tasks run in separate regions with scalar inputs/results and cooperative cancellation. See the standard-library documentation for these APIs and their restrictions. A test/benchmark batch currently shares one execution region for the batch. Fatal process exit lets the operating system reclaim memory. See the [runtime ABI](runtime-abi.md) and [standalone compilation](standalone.md) documents for implementation and validation details.
 
 Integers, floats, booleans, structs, and enum payloads copy by value. A copied struct containing an array or string copies its handle, not its allocation. Array assignment and argument passing share storage; they do not deep-copy. Strings are immutable and can safely share their allocation. There are no user-visible core string/array free operations, and no borrow checker. Programs that continually allocate retain memory until the execution ends; this model is intentionally limited and is not a claim of bounded memory use.
 
@@ -552,7 +552,7 @@ Strings contain UTF-8. Double-quoted literals accept Unicode text and escapes `\
 
 Core arrays contain elements of any single non-void type, including structs, enums, function values, and nested arrays. `[a, b]` allocates elements in source order; `[value] * length` evaluates the initializer once and fills the array. `[]T` is an array-handle type; the legacy `[i64; N]` annotation currently denotes the same type and does not enforce a static length. Arrays have fixed length after construction. Empty array literals default to `[]i64`.
 
-For strings and arrays, `==` and `!=` currently compare handle identity, not content. Equal contents in separately created allocations do not imply equality. Scalar comparisons compare values. Fieldless enums support equality within the same enum type. Struct, payload-enum, function, and void equality are rejected; aggregate structural equality is not part of this alpha core.
+For strings, `==` and `!=` compare UTF-8 contents. For arrays, they compare handle identity; equal contents in separately created arrays do not imply equality. Scalar comparisons compare values. Fieldless enums support equality within the same enum type. Struct, payload-enum, function, and void equality are rejected; aggregate structural equality is not part of this alpha core.
 
 Example (`run:0`):
 
@@ -574,7 +574,7 @@ fn main() -> i64
     let original = "Nerv"
     let alias = original
     assert(original == alias)
-    assert(original != "Nerv")
+    assert(original == "Nerv")
     0
 ```
 
@@ -632,7 +632,7 @@ Functions, structs, and enums declare parameters with `<T, E>`. Type arguments i
 
 A parameter may require one trait, as in `fn read<T: Read>(value: T) -> i64 => value:read()`. The concrete type must declare that implementation. Generic struct methods inherit the struct's parameters. Unused generic bodies are checked when instantiated. Generic method declarations and generic trait declarations are not supported.
 
-Optional and result values are ordinary enums; use exhaustive `match` to supply defaults or propagate errors. Propagation is an explicit match whose error arm constructs the enclosing function's error variant. There is no implicit propagation or `?` operator. Runtime violations and allocation failure remain unrecoverable; recoverable application errors are values.
+Optional and result values are ordinary enums; use exhaustive `match` to supply defaults or propagate errors. Propagation is an explicit match whose error arm constructs the enclosing function's error variant. `value?` unwraps `Ok`/`Some` and returns `Err`/`None` from the enclosing function. Result propagation requires an identical error type; it may change the success type. Option propagation requires an Option return type. Runtime violations and allocation failure remain unrecoverable; recoverable application errors are values.
 
 Example (`run:42`):
 

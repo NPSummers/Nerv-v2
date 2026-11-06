@@ -15,7 +15,9 @@ A basic showcase is in the [**Showcase**](./example/hello.nerv) file.
 
 The [language specification](./docs/language-spec.md) defines the supported alpha rules and includes executable examples and platform-specific instructions for running its conformance suite.
 
-The [small standard library](docs/standard-library.md) provides generic collections, optional/result values, UTF-8 file I/O, directories, process inputs, and time utilities through `import nerv.std`.
+The [standard library](docs/standard-library.md) provides snapshot collections, growing buffers, string-keyed hash maps, text formatting/parsing, paths, structured I/O errors, allocation scopes, native tasks with cooperative cancellation, and process/time utilities through `import nerv.std`.
+
+The current compiler supports content-based string equality, qualified module references, capturing closures, nested early returns, loop exits, and `Result`/`Option` propagation with `?`. These source-tree additions require rebuilding; older release archives do not include them.
 
 The current source tree also provides [JSON, HTTPS, and WebSocket client APIs](docs/networking.md) through `import nerv.json` and `import nerv.net`. These additions require rebuilding the compiler; older release archives do not include them.
 

@@ -66,6 +66,49 @@ void nerv_array_i64_set(NervArray *array, int64_t index, int64_t value);
 NervArray *nerv_array_i64_map(const NervArray *array, int64_t length, int64_t (*callback)(int64_t));
 int64_t nerv_array_i64_reduce(const NervArray *array, int64_t length, int64_t initial, int64_t (*callback)(int64_t, int64_t));
 
+typedef struct NervClosure {
+    const void *code;
+    void *environment;
+    int64_t mutable_captures;
+} NervClosure;
+NervClosure *nerv_closure_new(const void *code, void *environment, int64_t mutable_captures);
+const void *nerv_closure_code(const NervClosure *closure);
+void *nerv_closure_environment(const NervClosure *closure);
+int64_t nerv_str_equal(const NervString *left, const NervString *right);
+void *nerv_text_split(const NervString *value, const NervString *separator);
+void *nerv_text_lines(const NervString *value);
+NervString *nerv_text_join(const NervArrayHeader *values, const NervString *separator);
+NervString *nerv_text_integer(int64_t value);
+NervString *nerv_text_float(double value);
+void *nerv_text_format(const NervString *value, const NervArrayHeader *arguments);
+int64_t nerv_text_valid_integer(const NervString *value);
+int64_t nerv_text_parse_integer(const NervString *value);
+int64_t nerv_text_valid_float(const NervString *value);
+double nerv_text_parse_float(const NervString *value);
+int64_t nerv_text_hash(const NervString *value);
+NervString *nerv_path_join(const NervString *value, const NervString *child);
+NervString *nerv_path_parent(const NervString *value);
+NervString *nerv_path_file_name(const NervString *value);
+NervString *nerv_path_extension(const NervString *value);
+int64_t nerv_path_is_absolute(const NervString *value);
+void *nerv_path_current_directory(void);
+void *nerv_path_canonicalize(const NervString *value);
+void *nerv_fs_read_text(const NervString *path);
+void *nerv_fs_write_text(const NervString *path, const NervString *contents);
+void *nerv_fs_create_directory(const NervString *path);
+void *nerv_fs_remove_file(const NervString *path);
+void *nerv_fs_remove_directory(const NervString *path);
+void *nerv_fs_rename(const NervString *source, const NervString *destination);
+void *nerv_fs_exists(const NervString *path);
+void *nerv_fs_metadata(const NervString *path);
+int64_t nerv_memory_scope(int64_t input, const NervClosure *worker);
+void *nerv_task_spawn(int64_t input, const NervClosure *worker);
+void *nerv_task_join(int64_t task);
+int64_t nerv_task_cancel(int64_t task);
+int64_t nerv_task_cancelled(void);
+NervArray *nerv_array_i64_map_closure(const NervArray *array, int64_t length, const NervClosure *callback);
+int64_t nerv_array_i64_reduce_closure(const NervArray *array, int64_t length, int64_t initial, const NervClosure *callback);
+
 /* Native-only escape hatches. Do not free a shared core handle; do not retain raw
    element pointers across mutation/free. Foreign callers must pass live handles
    of the correct type and callbacks must not free the iterated array. */

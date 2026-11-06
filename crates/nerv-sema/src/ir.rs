@@ -164,6 +164,9 @@ pub enum StatementKind {
         body: Vec<Statement>,
     },
     Return(Expr),
+    ReturnVoid,
+    Break,
+    Continue,
     Expr(Expr),
 }
 
@@ -176,12 +179,22 @@ pub struct Expr {
 
 #[derive(Debug, Clone)]
 pub enum ExprKind {
+    Try {
+        value: Box<Expr>,
+        failure_enum: SymbolId,
+        failure_tag: i64,
+        has_error: bool,
+    },
     Int(i64),
     Float(f64),
     String(String),
     Bool(bool),
     Local(SymbolId),
     Function(SymbolId),
+    Closure {
+        function: SymbolId,
+        captures: Vec<Expr>,
+    },
     Array(Vec<Expr>),
     ArrayRepeat {
         value: Box<Expr>,
@@ -415,7 +428,10 @@ mod tests {
                 result: Box::new(Type::Int)
             }
         );
-        let ExprKind::Function(lambda) = value.kind else {
+        let ExprKind::Closure {
+            function: lambda, ..
+        } = value.kind
+        else {
             panic!()
         };
         assert_ne!(lambda, main.id);

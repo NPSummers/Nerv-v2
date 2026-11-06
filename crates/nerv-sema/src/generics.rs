@@ -3,6 +3,7 @@ use syntax::GenericParameter;
 
 struct Expansion {
     modules: Vec<LoadedModule>,
+    return_type: Type,
     functions: HashMap<String, (usize, Function)>,
     structs: HashMap<String, (usize, StructDecl)>,
     enums: HashMap<String, (usize, syntax::Enum)>,
@@ -41,6 +42,7 @@ pub(super) fn expand(modules: &[LoadedModule]) -> Result<Vec<LoadedModule>, Erro
     }
     let mut expansion = Expansion {
         modules: modules.to_vec(),
+        return_type: Type::Void,
         functions: HashMap::new(),
         structs: HashMap::new(),
         enums: HashMap::new(),
@@ -139,6 +141,7 @@ pub(super) fn expand(modules: &[LoadedModule]) -> Result<Vec<LoadedModule>, Erro
                 )
             })
             .collect();
+        expansion.return_type = function.result.clone();
         expansion.block(&mut function.body, &mut scope, &function.result)?;
         let module = &mut expansion.modules[index].module;
         let target = module
@@ -408,6 +411,7 @@ impl Expansion {
     ) -> Result<(), Error> {
         for statement in body {
             match &mut statement.kind {
+                Statement::Break | Statement::Continue | Statement::ReturnVoid => {}
                 Statement::Let { ty, value, .. } => {
                     if let Some(ty) = ty {
                         self.ty(ty, substitutions, statement.span)?;
@@ -448,6 +452,7 @@ impl Expansion {
         substitutions: &HashMap<String, Type>,
     ) -> Result<(), Error> {
         match &mut expression.kind {
+            Expr::Try(value) => self.substitute_expr(value, substitutions)?,
             Expr::Lambda {
                 params,
                 result,
@@ -526,6 +531,7 @@ impl Expansion {
         let last = body.len().saturating_sub(1);
         for (index, statement) in body.iter_mut().enumerate() {
             match &mut statement.kind {
+                Statement::Break | Statement::Continue | Statement::ReturnVoid => {}
                 Statement::Let {
                     name,
                     mutable,
@@ -545,7 +551,10 @@ impl Expansion {
                         },
                     );
                 }
-                Statement::Return(value) => self.expression(value, scope, Some(result))?,
+                Statement::Return(value) => {
+                    let expected_return = self.return_type.clone();
+                    self.expression(value, scope, Some(&expected_return))?;
+                }
                 Statement::Expr(value) => self.expression(
                     value,
                     scope,
@@ -754,19 +763,24 @@ impl Expansion {
                     self.ty(&mut param.ty, &HashMap::new(), span)?;
                 }
                 self.ty(result, &HashMap::new(), span)?;
-                let inner = params
-                    .iter()
-                    .map(|p| {
-                        (
-                            p.name.clone(),
-                            Binding {
-                                ty: p.ty.clone(),
-                                mutable: false,
-                            },
-                        )
-                    })
-                    .collect();
+                let mut inner = scope.clone();
+                inner.extend(
+                    params
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.name.clone(),
+                                Binding {
+                                    ty: p.ty.clone(),
+                                    mutable: false,
+                                },
+                            )
+                        })
+                        .collect::<HashMap<_, _>>(),
+                );
+                let previous = std::mem::replace(&mut self.return_type, result.clone());
                 self.expression(body, &inner, Some(result))?;
+                self.return_type = previous;
             }
             Expr::Method { base, args, .. } => {
                 self.expression(base, scope, None)?;

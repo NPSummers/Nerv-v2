@@ -1,0 +1,11 @@
+import alpha
+import beta
+
+fn read(value: alpha.Value) -> i64 => value:doubled()
+
+fn main() -> i64
+    let first = alpha.Value { number: alpha.value() }
+    let second = beta.Value { number: beta.value() }
+    assert(read(first) == 20)
+    assert(second:doubled() == 60)
+    42

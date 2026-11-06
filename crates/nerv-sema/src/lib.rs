@@ -12,6 +12,7 @@ use nerv_syntax::{
 
 mod generics;
 pub mod ir;
+mod namespaces;
 mod resolve;
 
 #[derive(Debug)]
@@ -23,6 +24,7 @@ pub struct Program {
 
 #[derive(Debug, Clone)]
 pub struct LoadedModule {
+    pub resolved_imports: BTreeMap<String, PathBuf>,
     pub source: SourceId,
     pub path: PathBuf,
     pub module: Module,
@@ -170,7 +172,8 @@ pub fn check_path_with_imports(
 }
 
 fn check_loaded(modules: &[LoadedModule]) -> Result<ir::CheckedProgram, Errors> {
-    let modules = generics::expand(modules)?;
+    let modules = namespaces::qualify(modules)?;
+    let modules = generics::expand(&modules)?;
     check(&modules)?;
     resolve::resolve(&modules).map_err(Into::into)
 }
@@ -182,6 +185,7 @@ pub fn check_modules(modules: &[Module]) -> Result<ir::CheckedProgram, Errors> {
         .iter()
         .cloned()
         .map(|module| LoadedModule {
+            resolved_imports: BTreeMap::new(),
             source: module.source,
             path: PathBuf::from("<buffer>"),
             module,
@@ -212,12 +216,30 @@ fn load(
     let id = sources.add(path.clone(), source.clone());
     let module =
         syntax::parse_source(&source, id).map_err(|error| frontend_error(&path, id, error))?;
+    let mut resolved_imports = BTreeMap::new();
     for import in &module.imports {
         if import.path.first().is_some_and(|part| part == "nerv") {
             if import.path.len() == 2
-                && matches!(import.path[1].as_str(), "core" | "std" | "json" | "net")
+                && matches!(
+                    import.path[1].as_str(),
+                    "core" | "std" | "json" | "net" | "text" | "path" | "fs" | "task" | "memory"
+                )
             {
                 load_standard(&import.path[1], modules, visited, sources)?;
+                resolved_imports.insert(
+                    import.path.join("."),
+                    PathBuf::from(format!(
+                        "<stdlib>/{}.nerv",
+                        if matches!(
+                            import.path[1].as_str(),
+                            "text" | "path" | "fs" | "task" | "memory"
+                        ) {
+                            "std"
+                        } else {
+                            &import.path[1]
+                        }
+                    )),
+                );
             }
             continue;
         }
@@ -257,6 +279,9 @@ fn load(
                 target.set_extension("nerv");
             }
         }
+        if let Ok(canonical) = target.canonicalize() {
+            resolved_imports.insert(import.path.join("."), canonical);
+        }
         load(&target, modules, visited, loading, sources, imports).map_err(|mut error| {
             if error.span.is_none() && !sources.files.iter().any(|file| file.path == error.path) {
                 error.path = path.clone();
@@ -275,6 +300,7 @@ fn load(
     loading.remove(&path);
     visited.insert(path.clone());
     modules.push(LoadedModule {
+        resolved_imports,
         source: id,
         path,
         module,
@@ -288,6 +314,9 @@ fn load_standard(
     visited: &mut HashSet<PathBuf>,
     sources: &mut SourceMap,
 ) -> Result<(), Error> {
+    if matches!(name, "text" | "path" | "fs" | "task" | "memory") {
+        return load_standard("std", modules, visited, sources);
+    }
     let path = PathBuf::from(format!("<stdlib>/{name}.nerv"));
     if !visited.insert(path.clone()) {
         return Ok(());
@@ -309,6 +338,7 @@ fn load_standard(
     let module =
         syntax::parse_source(text, source).map_err(|error| frontend_error(&path, source, error))?;
     modules.push(LoadedModule {
+        resolved_imports: BTreeMap::new(),
         source,
         path,
         module,
@@ -520,6 +550,7 @@ fn check_function(
     for statement in &function.body {
         last = (|| {
             Ok(match &statement.kind {
+                Statement::Break | Statement::Continue | Statement::ReturnVoid => Type::Void,
                 Statement::Let {
                     name,
                     mutable,
@@ -667,7 +698,11 @@ fn check_function(
         })()
         .map_err(|error: Error| error.at(statement.span))?;
     }
-    if function.result != Type::Void && !returns && last != function.result {
+    if function.result != Type::Void
+        && !returns
+        && !block_returns(&function.body)
+        && last != function.result
+    {
         return Err(error_at(
             path,
             function.line,
@@ -710,6 +745,23 @@ fn expr_type_inner(
     variants: &HashMap<&str, VariantInfo>,
 ) -> Result<Type, Error> {
     match &expr.kind {
+        Expr::Try(value) => {
+            let source = expr_type(path, value, values, functions, structs, variants)?;
+            let Type::Named(name) = source else {
+                return Err(error_at(path, 0, 0, "? requires Result or Option"));
+            };
+            let suffix = if name.starts_with("Result__generic_") {
+                "__Ok"
+            } else if name.starts_with("Option__generic_") {
+                "__Some"
+            } else {
+                return Err(error_at(path, 0, 0, "? requires Result or Option"));
+            };
+            variants
+                .get(format!("{name}{suffix}").as_str())
+                .and_then(|v| v.payload.clone())
+                .ok_or_else(|| error_at(path, 0, 0, "? requires a success payload"))
+        }
         Expr::Int(_) => Ok(Type::Int),
         Expr::Float(_) => Ok(Type::Float),
         Expr::String(_) => Ok(Type::String),
@@ -760,20 +812,23 @@ fn expr_type_inner(
             result,
             body,
         } => {
-            let lambda_values = params
-                .iter()
-                .map(|param| {
-                    (
-                        param.name.clone(),
-                        Binding {
-                            ty: param.ty.clone(),
-                            mutable: false,
-                        },
-                    )
-                })
-                .collect();
+            let mut lambda_values = values.clone();
+            lambda_values.extend(
+                params
+                    .iter()
+                    .map(|param| {
+                        (
+                            param.name.clone(),
+                            Binding {
+                                ty: param.ty.clone(),
+                                mutable: false,
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+            );
             let actual = expr_type(path, body, &lambda_values, functions, structs, variants)?;
-            if actual != *result {
+            if actual != *result && !expression_returns(body) {
                 return Err(error_at(path, 0, 0, "lambda result type mismatch")
                     .at(body.span)
                     .note(format!("expected {result:?}, found {actual:?}")));
@@ -869,6 +924,9 @@ fn expr_type_inner(
                     (None, None) => {}
                 }
                 let ty = expr_type(path, &arm.body, &arm_values, functions, structs, variants)?;
+                if expression_exits(&arm.body) {
+                    continue;
+                }
                 if let Some(expected) = &result {
                     if *expected != ty {
                         return Err(error_at(path, 0, 0, "match arms have different types"));
@@ -887,7 +945,11 @@ fn expr_type_inner(
             {
                 return Err(error_at(path, 0, 0, "non-exhaustive match"));
             }
-            result.ok_or_else(|| error_at(path, 0, 0, "match needs at least one arm"))
+            if arms.is_empty() {
+                Err(error_at(path, 0, 0, "match needs at least one arm"))
+            } else {
+                Ok(result.unwrap_or(Type::Void))
+            }
         }
         Expr::If {
             condition,
@@ -913,7 +975,11 @@ fn expr_type_inner(
                 structs,
                 variants,
             )?;
-            if then_type == else_type {
+            if block_exits(then_body) {
+                Ok(else_type)
+            } else if block_exits(else_body) {
+                Ok(then_type)
+            } else if then_type == else_type {
                 Ok(then_type)
             } else {
                 Err(error_at(path, 0, 0, "if branches have different types"))
@@ -1181,6 +1247,63 @@ fn runtime_type(name: &str, args: &[Type]) -> Option<Option<Type>> {
     let strings = || Type::Array(Box::new(Type::String));
     match (name, args) {
         (
+            "nerv.task.spawn" | "nerv.memory.scope",
+            [Type::Int, Type::Function { params, result }],
+        ) if *params == [Type::Int] && **result == Type::Int => {
+            return Some(Some(if name == "nerv.task.spawn" {
+                strings()
+            } else {
+                Type::Int
+            }));
+        }
+        ("nerv.task.join", [Type::Int]) => return Some(Some(strings())),
+        ("nerv.task.cancel", [Type::Int]) | ("nerv.task.cancelled", []) => {
+            return Some(Some(Type::Int));
+        }
+        _ => {}
+    }
+
+    match (name, args) {
+        ("nerv.text.split", [Type::String, Type::String])
+        | ("nerv.text.lines", [Type::String])
+        | (
+            "nerv.fs.read_text"
+            | "nerv.fs.create_directory"
+            | "nerv.fs.remove_file"
+            | "nerv.fs.remove_directory"
+            | "nerv.fs.exists"
+            | "nerv.fs.metadata"
+            | "nerv.path.canonicalize",
+            [Type::String],
+        )
+        | ("nerv.fs.write_text" | "nerv.fs.rename", [Type::String, Type::String])
+        | ("nerv.path.current_directory", []) => return Some(Some(strings())),
+        ("nerv.text.format", [Type::String, values]) if *values == strings() => {
+            return Some(Some(strings()));
+        }
+        ("nerv.text.join", [values, Type::String]) if *values == strings() => {
+            return Some(Some(Type::String));
+        }
+        ("nerv.text.integer", [Type::Int])
+        | ("nerv.text.float", [Type::Float])
+        | ("nerv.path.join", [Type::String, Type::String])
+        | ("nerv.path.parent" | "nerv.path.file_name" | "nerv.path.extension", [Type::String]) => {
+            return Some(Some(Type::String));
+        }
+        (
+            "nerv.text.hash"
+            | "nerv.text.valid_integer"
+            | "nerv.text.valid_float"
+            | "nerv.text.parse_integer"
+            | "nerv.path.is_absolute",
+            [Type::String],
+        ) => return Some(Some(Type::Int)),
+        ("nerv.text.parse_float", [Type::String]) => return Some(Some(Type::Float)),
+        _ => {}
+    }
+
+    match (name, args) {
+        (
             "nerv.io.read_text" | "nerv.io.list_directory" | "nerv.io.environment",
             [Type::String],
         ) => return Some(Some(strings())),
@@ -1437,6 +1560,7 @@ fn block_type(
     for statement in body {
         last = (|| {
             Ok(match &statement.kind {
+                Statement::Break | Statement::Continue | Statement::ReturnVoid => Type::Void,
                 Statement::Let {
                     name,
                     mutable,
@@ -1541,13 +1665,9 @@ fn block_type(
                     block_type(path, body, &mut loop_values, functions, structs, variants)?;
                     Type::Void
                 }
-                Statement::Return(_) => {
-                    return Err(error_at(
-                        path,
-                        0,
-                        0,
-                        "return is only supported directly in a function body",
-                    ));
+                Statement::Return(value) => {
+                    expr_type(path, value, values, functions, structs, variants)?;
+                    Type::Void
                 }
                 Statement::Expr(value) => {
                     expr_type(path, value, values, functions, structs, variants)?
@@ -1735,5 +1855,51 @@ mod tests {
         .unwrap();
         assert!(check_path(root.join("main.nerv")).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn block_exits(body: &[SpannedStatement]) -> bool {
+    body.iter().any(|statement| match &statement.kind {
+        Statement::Return(_) | Statement::ReturnVoid | Statement::Break | Statement::Continue => {
+            true
+        }
+        Statement::Expr(value) => expression_exits(value),
+        _ => false,
+    })
+}
+
+fn block_returns(body: &[SpannedStatement]) -> bool {
+    body.iter().any(|statement| match &statement.kind {
+        Statement::Return(_) | Statement::ReturnVoid => true,
+        Statement::Expr(value) => expression_returns(value),
+        _ => false,
+    })
+}
+
+fn expression_returns(value: &SpannedExpr) -> bool {
+    match &value.kind {
+        Expr::If {
+            then_body,
+            else_body,
+            ..
+        } => block_returns(then_body) && block_returns(else_body),
+        Expr::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|arm| expression_returns(&arm.body))
+        }
+        _ => false,
+    }
+}
+
+fn expression_exits(value: &SpannedExpr) -> bool {
+    match &value.kind {
+        Expr::If {
+            then_body,
+            else_body,
+            ..
+        } => block_exits(then_body) && block_exits(else_body),
+        Expr::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|arm| expression_exits(&arm.body))
+        }
+        _ => false,
     }
 }

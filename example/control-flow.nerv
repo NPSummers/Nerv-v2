@@ -1,0 +1,41 @@
+import nerv.std
+
+fn find_value(values: []i64, wanted: i64) -> i64
+    for i in 0 .. nerv.arrays.len(values)
+        if values [i] == wanted
+            return i
+    -1
+
+fn branch(value: bool) -> i64
+    if value
+        return 10
+    else
+        return 20
+
+fn early_void(value: bool)
+    if value
+        return
+    assert(false)
+
+fn main() -> i64
+    assert(find_value([1, 4, 8], 4) == 1)
+    assert(find_value([1, 4, 8], 5) == - 1)
+    assert(branch(true) == 10)
+    assert(branch(false) == 20)
+    early_void(true)
+    let mut sum = 0
+    for i in 0 ..= 10
+        if i == 2
+            continue
+        if i == 5
+            break
+        sum = sum + i
+    assert(sum == 8)
+    let mut index = 0
+    while true
+        index = index + 1
+        if index < 3
+            continue
+        break
+    assert(index == 3)
+    42

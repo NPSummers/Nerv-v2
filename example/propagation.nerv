@@ -1,0 +1,41 @@
+import nerv.std
+
+fn increment(value: string) -> Result<i64, ParseError>
+    let parsed = parse_integer(value) ?
+    Ok(parsed + 1)
+
+fn convert(value: string) -> Result<string, ParseError>
+    let number = increment(value) ?
+    Ok(integer_text(number))
+
+fn optional(value: Option<i64>) -> Option<string>
+    let number = value ?
+    Some(integer_text(number))
+
+fn reject_early(value: bool) -> Result<i64, string>
+    if value
+        return Err("rejected")
+    Ok(42)
+
+fn generic_optional <T>(value: Option<T>) -> Option<T>
+    let present = value ?
+    Some(present)
+
+fn main() -> i64
+    assert(result_or(convert("41"), "") == "42")
+    let rejected = match reject_early(true)
+        Ok(value) => false
+        Err(error) => error == "rejected"
+    assert(rejected)
+    assert(result_or(reject_early(false), 0) == 42)
+    let optional_value: Option<i64> = Some(42)
+    assert(option_or(generic_optional(optional_value), 0) == 42)
+    let error = match convert("invalid")
+        Ok(value) => false
+        Err(error) => error.message == "invalid or out-of-range integer"
+    assert(error)
+    let present: Option<i64> = Some(42)
+    let absent: Option<i64> = None()
+    assert(option_or(optional(present), "") == "42")
+    assert(option_or(optional(absent), "missing") == "missing")
+    42

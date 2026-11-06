@@ -1,7 +1,10 @@
+mod closure;
+mod foundation;
 mod json;
 #[cfg(feature = "networking")]
 mod network;
 mod standard;
+mod tasks;
 
 use std::{
     alloc::{Layout, alloc},
@@ -136,6 +139,7 @@ pub fn active_region_allocations() -> usize {
 
 impl Drop for Execution {
     fn drop(&mut self) {
+        tasks::finish_region(self.depth);
         let allocations = ALLOCATIONS.with(|regions| {
             let mut regions = regions.borrow_mut();
             assert_eq!(
@@ -544,6 +548,10 @@ pub fn symbols() -> Vec<RuntimeSymbol> {
             address: nerv_str_is_empty as *const (),
         },
         RuntimeSymbol {
+            name: "nerv_str_equal",
+            address: nerv_str_equal as *const (),
+        },
+        RuntimeSymbol {
             name: "nerv_str_contains",
             address: nerv_str_contains as *const (),
         },
@@ -601,6 +609,9 @@ pub fn symbols() -> Vec<RuntimeSymbol> {
         },
     ];
     symbols.extend(standard::symbols());
+    symbols.extend(foundation::symbols());
+    symbols.extend(closure::symbols());
+    symbols.extend(tasks::symbols());
     symbols.extend(json::symbols());
     #[cfg(feature = "networking")]
     symbols.extend(network::symbols());
@@ -1202,6 +1213,11 @@ pub unsafe extern "C" fn nerv_str_is_empty(value: *const NervString) -> i64 {
     unsafe { value.as_ref() }
         .map(|value| value.0.is_empty() as i64)
         .unwrap_or(1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nerv_str_equal(left: *const NervString, right: *const NervString) -> i64 {
+    i64::from(unsafe { standard::text(left) == standard::text(right) })
 }
 
 #[unsafe(no_mangle)]

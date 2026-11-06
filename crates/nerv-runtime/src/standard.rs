@@ -25,8 +25,12 @@ pub(super) unsafe fn text<'a>(value: *const NervString) -> &'a str {
 
 fn response(result: io::Result<String>) -> *mut std::ffi::c_void {
     match result {
-        Ok(value) => strings(vec![value, String::new()]),
-        Err(error) => strings(vec![String::new(), error.to_string()]),
+        Ok(value) => strings(vec![value, String::new(), String::new()]),
+        Err(error) => strings(vec![
+            String::new(),
+            error.to_string(),
+            foundation::error_kind(&error).into(),
+        ]),
     }
 }
 
@@ -70,7 +74,10 @@ pub unsafe extern "C" fn nerv_io_list_directory(path: *const NervString) -> *mut
             entries.insert(0, String::new());
             strings(entries)
         }
-        Err(error) => strings(vec![error.to_string()]),
+        Err(error) => strings(vec![
+            error.to_string(),
+            foundation::error_kind(&error).into(),
+        ]),
     }
 }
 

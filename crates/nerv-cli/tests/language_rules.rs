@@ -135,13 +135,22 @@ fn module_resolution_visibility_and_cycles() {
     );
     verify(
         &project,
-        "reject:duplicate function",
-        "import lib.math\nfn answer() -> i64 => 1\nfn main() -> i64 => answer()\n",
+        "run:43",
+        "import lib.math\nfn answer() -> i64 => 1\nfn main() -> i64 => answer() + lib.math.answer()\n",
     );
     verify(
         &project,
         "reject:unknown function",
         "fn main() -> i64 => answer()\n",
+    );
+    project.write(
+        "other.nerv",
+        "module unrelated.label\nfn other() -> i64 => 1\n",
+    );
+    verify(
+        &project,
+        "reject:duplicate module name",
+        "import lib.math\nimport other\nfn main() -> i64 => 0\n",
     );
     project.write("a.nerv", "import b\nfn a() -> i64 => 1\n");
     project.write("b.nerv", "import a\nfn b() -> i64 => 2\n");
@@ -205,4 +214,34 @@ fn numeric_widths_and_signedness() {
         "fail:integer division by zero",
         "fn main() -> i64 => i64(u8(1) / u8(0))\n",
     );
+}
+
+#[test]
+fn rejects_invalid_control_flow_and_propagation() {
+    let project = Project::new();
+    for (expected, source) in [
+        ("loop exit outside a loop", "fn main() -> void\n    break\n"),
+        (
+            "loop exit outside a loop",
+            "fn main() -> void\n    continue\n",
+        ),
+        (
+            "bare return requires a void function",
+            "fn main() -> i64\n    return\n",
+        ),
+        (
+            "return type does not match function result",
+            "fn main() -> i64\n    if true\n        return \"wrong\"\n    42\n",
+        ),
+        (
+            "? requires Result or Option",
+            "fn main() -> i64\n    let value = 42?\n    value\n",
+        ),
+        (
+            "? requires a Result or Option return type",
+            "import nerv.std\nfn main() -> i64\n    parse_integer(\"42\")?\n",
+        ),
+    ] {
+        verify(&project, &format!("reject:{expected}"), source);
+    }
 }

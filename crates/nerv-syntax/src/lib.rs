@@ -207,6 +207,9 @@ pub enum StatementKind {
         body: Vec<Statement>,
     },
     Return(Expr),
+    ReturnVoid,
+    Break,
+    Continue,
     Expr(Expr),
 }
 
@@ -218,6 +221,7 @@ pub struct Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
+    Try(Box<Expr>),
     Int(i64),
     Float(f64),
     String(String),
@@ -454,7 +458,7 @@ impl<'source> Parser<'source> {
                 return Err(self.error("duplicate generic parameter"));
             }
             let constraint = if self.consume(TokenKind::Colon) {
-                Some(self.ident()?)
+                Some(self.path()?.join("."))
             } else {
                 None
             };
@@ -472,7 +476,7 @@ impl<'source> Parser<'source> {
         let name = self.ident()?;
         let generics = self.generic_parameters()?;
         let implements = if self.consume(TokenKind::Implements) {
-            Some(self.ident()?)
+            Some(self.path()?.join("."))
         } else {
             None
         };
@@ -542,9 +546,9 @@ impl<'source> Parser<'source> {
 
     fn impl_decl(&mut self) -> Result<Impl, ParseError> {
         let start = self.expect(TokenKind::Impl)?;
-        let type_name = self.ident()?;
+        let type_name = self.path()?.join(".");
         let trait_name = if self.consume(TokenKind::For) {
-            Some(self.ident()?)
+            Some(self.path()?.join("."))
         } else {
             None
         };
@@ -739,7 +743,17 @@ impl<'source> Parser<'source> {
                 column: token.column,
             });
         }
+        if self.consume(TokenKind::Break) {
+            return Ok(StatementKind::Break);
+        }
+        if self.consume(TokenKind::Continue) {
+            return Ok(StatementKind::Continue);
+        }
         if self.consume(TokenKind::Return) {
+            if self.at(TokenKind::Newline) || self.at(TokenKind::Dedent) || self.at(TokenKind::Eof)
+            {
+                return Ok(StatementKind::ReturnVoid);
+            }
             return Ok(StatementKind::Return(self.expr(0)?));
         }
         if self.consume(TokenKind::While) {
@@ -904,6 +918,13 @@ impl<'source> Parser<'source> {
             span: self.span_from(start),
         };
         loop {
+            if self.consume(TokenKind::Question) {
+                left = Expr {
+                    kind: ExprKind::Try(Box::new(left)),
+                    span: self.span_from(start),
+                };
+                continue;
+            }
             if self.consume(TokenKind::LParen) {
                 let mut args = Vec::new();
                 if !self.at(TokenKind::RParen) {
@@ -970,9 +991,17 @@ impl<'source> Parser<'source> {
                 continue;
             }
             if self.consume(TokenKind::LBrace) {
-                let ExprKind::Name(name) = left.kind else {
-                    return Err(self.error("expected struct name"));
-                };
+                fn qualified_name(expr: &Expr) -> Option<String> {
+                    match &expr.kind {
+                        ExprKind::Name(name) => Some(name.clone()),
+                        ExprKind::Field { base, name } => {
+                            Some(format!("{}.{}", qualified_name(base)?, name))
+                        }
+                        _ => None,
+                    }
+                }
+                let name =
+                    qualified_name(&left).ok_or_else(|| self.error("expected struct name"))?;
                 let mut fields = Vec::new();
                 if !self.at(TokenKind::RBrace) {
                     loop {
@@ -1017,9 +1046,12 @@ impl<'source> Parser<'source> {
         let condition = self.expr(0)?;
         self.expect(TokenKind::Newline)?;
         let then_body = self.block()?;
-        self.expect(TokenKind::Else)?;
-        self.expect(TokenKind::Newline)?;
-        let else_body = self.block()?;
+        let else_body = if self.consume(TokenKind::Else) {
+            self.expect(TokenKind::Newline)?;
+            self.block()?
+        } else {
+            Vec::new()
+        };
         Ok(ExprKind::If {
             condition: Box::new(condition),
             then_body,
@@ -1128,7 +1160,7 @@ impl<'source> Parser<'source> {
             self.expect(TokenKind::RBracket)?;
             return Ok(Type::Array(Box::new(element)));
         }
-        let name = self.ident()?;
+        let name = self.path()?.join(".");
         if self.consume(TokenKind::Lt) {
             let mut args = Vec::new();
             loop {
