@@ -1,0 +1,17 @@
+enum Option<T>
+    Some(T)
+    None
+
+enum Result<T, E>
+    Ok(T)
+    Err(E)
+
+fn option_or<T>(value: Option<T>, fallback: T) -> T
+    match value
+        Some(item) => item
+        None => fallback
+
+fn result_or<T, E>(value: Result<T, E>, fallback: T) -> T
+    match value
+        Ok(item) => item
+        Err(error) => fallback

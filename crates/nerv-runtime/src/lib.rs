@@ -1,3 +1,5 @@
+mod standard;
+
 use std::{
     alloc::{Layout, alloc},
     cell::RefCell,
@@ -43,6 +45,37 @@ fn array(mut values: Vec<i64>) -> *mut NervArray {
         header,
         _storage: values,
     })
+}
+
+#[repr(C)]
+struct TypedArray {
+    data: *mut u64,
+    length: i64,
+    storage: Vec<u64>,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_array_new(length: i64, stride: i64) -> *mut std::ffi::c_void {
+    let bytes = length
+        .checked_mul(stride)
+        .filter(|_| length >= 0 && stride >= 0)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or_else(|| runtime_error("array allocation failed"));
+    let words = bytes
+        .checked_add(7)
+        .map(|n| n / 8)
+        .unwrap_or_else(|| runtime_error("array allocation failed"));
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(words)
+        .unwrap_or_else(|_| runtime_error("array allocation failed"));
+    storage.resize(words, 0u64);
+    allocate(TypedArray {
+        data: storage.as_mut_ptr(),
+        length,
+        storage,
+    })
+    .cast()
 }
 
 struct NervVec(Vec<i64>);
@@ -175,6 +208,7 @@ pub extern "C" fn nerv_fail(code: i64) {
         1 => "integer division by zero",
         3 => "array index out of bounds",
         4 => "invalid array",
+        5 => "float is outside the target integer range",
         _ => "assertion failed",
     });
 }
@@ -216,7 +250,11 @@ pub extern "C" fn nerv_start_void(entry: extern "C" fn()) -> i32 {
 }
 
 pub fn symbols() -> Vec<RuntimeSymbol> {
-    vec![
+    let mut symbols = vec![
+        RuntimeSymbol {
+            name: "nerv_array_new",
+            address: nerv_array_new as *const (),
+        },
         RuntimeSymbol {
             name: "nerv_runtime_abi_v2",
             address: nerv_runtime_abi_v2 as *const (),
@@ -240,6 +278,14 @@ pub fn symbols() -> Vec<RuntimeSymbol> {
         RuntimeSymbol {
             name: "nerv_array_i64_at",
             address: nerv_array_i64_at as *const (),
+        },
+        RuntimeSymbol {
+            name: "nerv_print_u64",
+            address: nerv_print_u64 as *const (),
+        },
+        RuntimeSymbol {
+            name: "nerv_println_u64",
+            address: nerv_println_u64 as *const (),
         },
         RuntimeSymbol {
             name: "nerv_print_i64",
@@ -537,7 +583,19 @@ pub fn symbols() -> Vec<RuntimeSymbol> {
             name: "nerv_str_split_once",
             address: nerv_str_split_once as *const (),
         },
-    ]
+    ];
+    symbols.extend(standard::symbols());
+    symbols
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_print_u64(value: u64) {
+    output(format_args!("{value}"));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_println_u64(value: u64) {
+    output(format_args!("{value}\n"));
 }
 
 #[unsafe(no_mangle)]
@@ -1316,6 +1374,26 @@ pub unsafe extern "C" fn nerv_str_split_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_arrays_preserve_pointer_values_and_release_storage() {
+        let before = active_region_allocations();
+        {
+            let _execution = Execution::new();
+            let value = string("hello".to_owned());
+            let array = nerv_array_new(2, std::mem::size_of::<*mut NervString>() as i64)
+                .cast::<TypedArray>();
+            unsafe {
+                let data = (*array).data.cast::<*mut NervString>();
+                data.write(value);
+                data.add(1).write(value);
+                assert_eq!((*data.read()).0, "hello");
+                assert_eq!(standard::nerv_array_length(array.cast()), 2);
+            }
+            assert_eq!(active_region_allocations(), before + 2);
+        }
+        assert_eq!(active_region_allocations(), before);
+    }
 
     #[test]
     fn array_prefix_matches_abi_and_remains_stable_through_element_writes() {

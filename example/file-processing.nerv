@@ -1,0 +1,24 @@
+import nerv.std
+
+fn report(error: IoError) -> i64
+    stderr(nerv.string.concat(error.operation, ": "))
+    stderr(nerv.string.concat(error.message, "\n"))
+    1
+
+fn save(contents: string, path: string) -> i64
+    match write_text(path, nerv.string.trim(contents))
+        Ok(bytes) => 0
+        Err(error) => report(error)
+
+fn process(input: string, output: string) -> i64
+    match read_text(input)
+        Ok(contents) => save(contents, output)
+        Err(error) => report(error)
+
+fn main() -> i64
+    let args = arguments()
+    if nerv.arrays.len(args) == 3
+        process(args[1], args[2])
+    else
+        stderr("usage: file-processing INPUT OUTPUT\n")
+        1

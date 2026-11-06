@@ -106,12 +106,10 @@ pub(super) fn resolve(modules: &[LoadedModule]) -> Result<ir::CheckedProgram, Er
         for enumeration in &loaded.module.enums {
             let mut variants = Vec::new();
             for variant in &enumeration.variants {
-                if variant.fields.len() > 1
-                    || variant.fields.first().is_some_and(|ty| *ty != T::Int)
-                {
+                if variant.fields.len() > 1 {
                     return Err(failure(
                         variant.span,
-                        "enum payloads currently require at most one i64 value",
+                        "enum variants require at most one payload value",
                     ));
                 }
                 let (_, id, tag) = resolver.constructors[variant.name.as_str()];
@@ -119,7 +117,19 @@ pub(super) fn resolve(modules: &[LoadedModule]) -> Result<ir::CheckedProgram, Er
                     id,
                     name: variant.name.clone(),
                     tag,
-                    payload: variant.fields.first().map(|_| ir::Type::Int),
+                    payload: variant
+                        .fields
+                        .first()
+                        .map(|ty| {
+                            if *ty == T::Void {
+                                return Err(failure(
+                                    variant.span,
+                                    "enum payload cannot have type void",
+                                ));
+                            }
+                            resolver.ty(ty, variant.span)
+                        })
+                        .transpose()?,
                     span: variant.span,
                 });
             }
@@ -171,13 +181,23 @@ impl Resolver<'_> {
 
     fn ty(&self, ty: &T, span: ast::Span) -> Result<ir::Type, Error> {
         Ok(match ty {
+            T::Applied { .. } => return Err(failure(span, "unresolved generic type")),
             T::Void => ir::Type::Void,
             T::Bool => ir::Type::Bool,
             T::Int => ir::Type::Int,
+            T::Integer { bits, signed } => ir::Type::Integer {
+                bits: *bits,
+                signed: *signed,
+            },
+            T::Float32 => ir::Type::Float32,
             T::Float => ir::Type::Float,
             T::String => ir::Type::String,
-            T::Array(element) if **element == T::Int => ir::Type::Array(Box::new(ir::Type::Int)),
-            T::Array(_) => return Err(failure(span, "only i64 arrays are supported")),
+            T::Array(element) => {
+                if **element == T::Void {
+                    return Err(failure(span, "array element cannot have type void"));
+                }
+                ir::Type::Array(Box::new(self.ty(element, span)?))
+            }
             T::Function { params, result } => ir::Type::Function {
                 params: params
                     .iter()
@@ -477,12 +497,16 @@ impl Resolver<'_> {
                     let (_, variant, tag) = self.constructors[arm.variant.as_str()];
                     let mut inner = scope.clone();
                     let binding = if let Some(name) = &arm.binding {
-                        let binding = self.binding(name, &T::Int, false, arm.span)?;
+                        let payload = self.variants[arm.variant.as_str()]
+                            .payload
+                            .clone()
+                            .expect("checked payload binding");
+                        let binding = self.binding(name, &payload, false, arm.span)?;
                         inner.insert(
                             name.clone(),
                             Local {
                                 binding: binding.clone(),
-                                ty: T::Int,
+                                ty: payload,
                             },
                         );
                         Some(binding)
@@ -549,12 +573,13 @@ impl Resolver<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 match name.as_deref() {
                     Some("assert") => K::Assert(Box::new(checked.into_iter().next().unwrap())),
-                    Some("i64" | "f64") => {
+                    Some(name) if ast::numeric_type(name).is_some() => {
                         let value = checked.into_iter().next().unwrap();
                         let conversion = match (&value.ty, &ty) {
                             (ir::Type::Int, ir::Type::Float) => ir::Conversion::IntToFloat,
                             (ir::Type::Float, ir::Type::Int) => ir::Conversion::FloatToInt,
-                            _ => ir::Conversion::Identity,
+                            _ if value.ty == ty => ir::Conversion::Identity,
+                            _ => ir::Conversion::Numeric,
                         };
                         K::Convert {
                             conversion,
@@ -571,6 +596,34 @@ impl Resolver<'_> {
                         )
                         .is_some() =>
                     {
+                        let checked = if matches!(name, "print" | "println") {
+                            checked
+                                .into_iter()
+                                .map(|value| {
+                                    let ty = match value.ty {
+                                        ir::Type::Integer { signed: true, .. } => ir::Type::Int,
+                                        ir::Type::Integer { signed: false, .. } => {
+                                            ir::Type::Integer {
+                                                bits: 64,
+                                                signed: false,
+                                            }
+                                        }
+                                        ir::Type::Float32 => ir::Type::Float,
+                                        _ => return value,
+                                    };
+                                    ir::Expr {
+                                        span: value.span,
+                                        ty,
+                                        kind: K::Convert {
+                                            conversion: ir::Conversion::Numeric,
+                                            value: Box::new(value),
+                                        },
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            checked
+                        };
                         K::Runtime {
                             symbol: runtime_symbol(name, &checked),
                             args: checked,
@@ -629,12 +682,17 @@ fn runtime_symbol(name: &str, args: &[ir::Expr]) -> String {
         "print" | "println" => {
             let suffix = match args[0].ty {
                 ir::Type::Int => "i64",
+                ir::Type::Integer { signed: false, .. } => "u64",
                 ir::Type::Float => "f64",
                 ir::Type::Bool => "bool",
                 ir::Type::String => "string",
                 _ => unreachable!("checked print"),
             };
             format!("nerv_{name}_{suffix}")
+        }
+        "nerv.arrays.len" => "nerv_array_length".into(),
+        name if name.starts_with("nerv.io.") => {
+            format!("nerv_io_{}", name.trim_start_matches("nerv.io."))
         }
         "nerv.math.sqrt" => "nerv_sqrt".into(),
         "nerv.math.pow" => "nerv_pow".into(),
@@ -663,40 +721,73 @@ fn runtime_symbol(name: &str, args: &[ir::Expr]) -> String {
 fn validate_layouts(program: &ir::CheckedProgram) -> Result<(), Error> {
     fn visit(
         id: ir::SymbolId,
-        structs: &HashMap<ir::SymbolId, &ir::Struct>,
+        layouts: &HashMap<ir::SymbolId, (ast::Span, Vec<ir::SymbolId>, bool)>,
         active: &mut HashSet<ir::SymbolId>,
         done: &mut HashSet<ir::SymbolId>,
     ) -> Result<(), Error> {
         if done.contains(&id) {
             return Ok(());
         }
-        let Some(structure) = structs.get(&id) else {
-            return Ok(());
-        };
+        let (span, children, is_struct) = &layouts[&id];
         if !active.insert(id) {
             return Err(failure(
-                structure.span,
-                "recursive struct has infinite size",
+                *span,
+                if *is_struct {
+                    "recursive struct has infinite size"
+                } else {
+                    "recursive enum has infinite size"
+                },
             ));
         }
-        for field in &structure.fields {
-            // Arrays and function values are handles, not inline aggregates.
-            if let ir::Type::Named(child) = field.ty {
-                visit(child, structs, active, done)?;
-            }
+        for child in children {
+            visit(*child, layouts, active, done)?;
         }
         active.remove(&id);
         done.insert(id);
         Ok(())
     }
-    let structs = program
-        .structs
-        .iter()
-        .map(|structure| (structure.id, structure))
-        .collect();
-    let mut done = HashSet::new();
+    let children = |types: Vec<&ir::Type>| {
+        types
+            .into_iter()
+            .filter_map(|ty| {
+                if let ir::Type::Named(id) = ty {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut layouts = HashMap::new();
     for structure in &program.structs {
-        visit(structure.id, &structs, &mut HashSet::new(), &mut done)?;
+        layouts.insert(
+            structure.id,
+            (
+                structure.span,
+                children(structure.fields.iter().map(|f| &f.ty).collect()),
+                true,
+            ),
+        );
+    }
+    for enumeration in &program.enums {
+        layouts.insert(
+            enumeration.id,
+            (
+                enumeration.span,
+                children(
+                    enumeration
+                        .variants
+                        .iter()
+                        .filter_map(|v| v.payload.as_ref())
+                        .collect(),
+                ),
+                false,
+            ),
+        );
+    }
+    let mut done = HashSet::new();
+    for id in layouts.keys() {
+        visit(*id, &layouts, &mut HashSet::new(), &mut done)?;
     }
     Ok(())
 }

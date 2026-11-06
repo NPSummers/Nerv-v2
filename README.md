@@ -15,6 +15,8 @@ A basic showcase is in the [**Showcase**](./example/hello.nerv) file.
 
 The [language specification](./docs/language-spec.md) defines the supported alpha rules and includes executable examples and platform-specific instructions for running its conformance suite.
 
+The [small standard library](docs/standard-library.md) provides generic collections, optional/result values, UTF-8 file I/O, directories, process inputs, and time utilities through `import nerv.std`.
+
 ## Contributing
 
 Contributions are welcome, but please make sure you clarify with me before submitting a pull request. You can contact me via my discord `non.menthol.newports`.

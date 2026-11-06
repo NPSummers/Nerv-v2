@@ -1,0 +1,56 @@
+struct Record
+    name: string
+    scores: []i64
+
+enum Value
+    Text(string)
+    Number(f64)
+    Flag(bool)
+    Item(Record)
+    Empty
+
+enum Result
+    Ok(Value)
+    Err(string)
+
+fn make() -> Result => Ok(Item(Record { name: "Nerv", scores: [40, 2] }))
+
+fn flag_value(b: bool) -> i64
+    if b
+        1
+    else
+        0
+
+fn value_sum(v: Value) -> i64
+    match v
+        Text(s) => 0
+        Number(n) => 0
+        Flag(b) => 0
+        Item(r) => r.scores[0] + r.scores[1]
+        Empty => 0
+
+fn main() -> i64
+    let text = match Text("abc")
+        Text(s) => nerv.string.len(s)
+        Number(n) => i64(n)
+        Flag(b) => flag_value(b)
+        Item(r) => r.scores[0]
+        Empty => 0
+    let flag = match Flag(true)
+        Text(s) => 0
+        Number(n) => 0
+        Flag(b) => flag_value(b)
+        Item(r) => 0
+        Empty => 0
+    let number = match Number(2.5)
+        Text(s) => 0
+        Number(n) => i64(n)
+        Flag(b) => 0
+        Item(r) => 0
+        Empty => 0
+    assert(text == 3)
+    assert(flag == 1)
+    assert(number == 2)
+    match make()
+        Ok(v) => value_sum(v)
+        Err(message) => 0

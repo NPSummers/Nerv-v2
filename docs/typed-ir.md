@@ -15,7 +15,7 @@ source files → spanned syntax → semantic checking/resolution → checked IR 
 - A deterministic, compilation-local `SymbolId` identifies each function, lifted lambda, nominal type, variant, parameter, local binding, and struct field declaration. IDs survive shadowing; references never use source names. Source/debug names do not control linkage.
 - Every expression and binding carries its checked type. Nominal types refer to IDs, not names. Statements also carry their result type. Function types retain parameter and result types, including inferred function-valued bindings.
 - Calls distinguish direct function IDs from indirect function-valued expressions. Methods are resolved direct calls with an explicit receiver argument. Enum construction and match arms carry their resolved enum/variant IDs and tags. Field operations carry declaration-order indices; construction retains **source evaluation order** separately from those indices.
-- Numeric casts are explicit identity, integer-to-float, or checked float-to-integer conversion nodes. Runtime overloads resolve to ABI symbols before code generation. Alpha width aliases already share their specified representation; trait annotations constrain concrete bindings without introducing dynamic dispatch or runtime layout conversions.
+- Numeric casts are explicit identity, integer-width/sign, float-width, integer-to-float, or checked float-to-integer conversion nodes. Runtime overloads resolve to ABI symbols before code generation. Numeric widths and signedness remain explicit in checked types; trait annotations constrain concrete bindings without introducing dynamic dispatch or runtime layout conversions.
 - Non-capturing lambdas are lifted to ordinary IR functions during semantic resolution, not synthesized by LLVM lowering.
 - Source spans remain on declarations, bindings, expressions, statements, and match arms, including lifted lambda bodies.
 
@@ -30,3 +30,5 @@ Compiler symbols use ID-based mangled names separate from runtime ABI symbols. D
 The earlier 19 JIT tests are retained and now pass through semantic checking. Two old backend-only array mutation tests now explicitly declare their bindings `mut`, matching the existing language rules. Added IR tests inspect IDs, shadowing, types, resolutions, conversions, lifting, and spans. Execution regressions cover identical-layout enum methods, higher-order calls, field evaluation order, recursion, runtime symbol collisions, and test/benchmark entry groups. Existing output/exit-status and diagnostic snapshots continue to run unchanged.
 
 Run all tests with `bash ./tools/test.sh` or `.\tools\test.ps1`; see [testing](testing.md).
+
+Generic declarations specialize during semantic elaboration, before checked IR resolution. Backends receive concrete functions, aggregate layouts, and ordinary typed operations; they do not infer generic arguments or resolve constraints.

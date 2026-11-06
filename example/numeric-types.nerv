@@ -1,0 +1,41 @@
+struct Numbers
+    small: u8
+    single: f32
+
+enum Numeric
+    Byte(u8)
+    Real(f32)
+
+fn main() -> i64
+    assert(i64(i8(127) + i8(1)) == -128)
+    assert(i64(u8(255) + u8(1)) == 0)
+    assert(i64(i16(32767) + i16(1)) == -32768)
+    assert(i64(u16(65535) + u16(1)) == 0)
+    assert(i64(i32(2147483647) + i32(1)) == -2147483648)
+    assert(i64(u32(4294967295) + u32(1)) == 0)
+    assert(u64(-1) > u64(1))
+    assert(u64(-1) / u64(2) == u64(9223372036854775807))
+    assert(u64(-1) % u64(2) == u64(1))
+    assert(i64(i8(-128) / i8(-1)) == -128)
+    assert(i64(i8(-128) % i8(-1)) == 0)
+    assert(i64(i8(-7) / i8(3)) == -2)
+    assert(i64(i8(-7) % i8(3)) == -1)
+    assert(i64(u8(255) / u8(2)) == 127)
+    assert(i64(u8(255)) == 255)
+    assert(i64(i8(255)) == -1)
+    assert(f64(u64(-1)) == 18446744073709551616.0)
+    assert(u64(9223372036854775808.0) == u64(-9223372036854775808))
+    assert(i64(f32(16777217.0)) == 16777216)
+    assert(f32(1.5) + f32(2.5) == f32(4.0))
+    assert(i64(f32(-2.9)) == -2)
+    assert(i64(u8(42.9)) == 42)
+    let mut bytes = [u8(1), u8(2)]
+    bytes[1] = u8(255)
+    assert(i64(bytes[0]) == 1 and i64(bytes[1]) == 255)
+    let floats = [f32(1.5)] * 4
+    assert(f64(floats[3]) == 1.5)
+    let n = Numbers { small: u8(42), single: f32(1.5) }
+    assert(i64(n.small) == 42)
+    match Byte(n.small)
+        Byte(value) => i64(value)
+        Real(value) => i64(value)

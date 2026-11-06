@@ -430,3 +430,94 @@ fn reciprocal_setup_preserves_output_before_zero_division() {
     assert!(text(&jit.stderr).contains("integer division by zero"));
     parity(&source);
 }
+
+#[test]
+fn compound_enum_payloads_match_jit_in_both_modes() {
+    parity(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/enum-payloads.nerv"));
+}
+
+#[test]
+fn generic_specializations_match_jit_in_both_modes() {
+    parity(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/generics.nerv"));
+}
+
+#[test]
+fn numeric_types_match_jit_in_both_modes() {
+    parity(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/numeric-types.nerv"));
+}
+
+#[test]
+fn standard_library_matches_jit_in_both_modes() {
+    parity(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/standard-library.nerv"));
+}
+
+#[test]
+fn standard_library_io_round_trip_and_errors() {
+    let project = Project::new();
+    let source = project.0.join("main.nerv");
+    fs::write(&source, r#"import nerv.std
+fn main() -> i64
+    let written = write_text("data.txt", "hello UTF-8: ?")
+    assert(result_or(written, -1) > 0)
+    assert_string_equal(result_or(read_text("data.txt"), "failed"), "hello UTF-8: ?")
+    let missing = read_text("missing-file")
+    let failed = match missing
+        Ok(value) => false
+        Err(error) => string_equal(error.operation, "read") and string_equal(error.path, "missing-file") and nerv.string.len(error.message) > 0
+    assert(failed)
+    assert(result_or(create_directory("subdir"), -1) == 0)
+    let entries = result_or(list_directory("subdir"), [""] * 0)
+    assert(nerv.arrays.len(entries) == 0)
+    let input = result_or(read_stdin(), "failed")
+    assert_string_equal(input, "input text")
+    assert_string_equal(option_or(environment("NERV_TEST_VALUE"), "missing"), "set")
+    assert_string_equal(option_or(environment("NERV_TEST_MISSING"), "missing"), "missing")
+    assert_equal(u8(255) + u8(1), u8(0))
+    sleep(duration_ms(0))
+    stderr("diagnostic")
+    println(u64(-1))
+    42
+"#).unwrap();
+    for mode in ["jit", "--debug", "--release"] {
+        let mut command = if mode == "jit" {
+            let mut command = project.cli();
+            command.arg(&source).arg("--run");
+            command
+        } else {
+            let build = project.build(&source, mode);
+            assert!(build.status.success(), "{}", text(&build.stderr));
+            clean_command(&project.executable(), &project.0)
+        };
+        command
+            .env("NERV_TEST_VALUE", "set")
+            .env_remove("NERV_TEST_MISSING")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"input text").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{mode}: {}", text(&output.stderr));
+        assert_eq!(text(&output.stdout), "18446744073709551615\n42\n");
+        assert_eq!(text(&output.stderr), "diagnostic");
+    }
+}
+
+#[test]
+fn file_processing_example_uses_program_arguments() {
+    let project = Project::new();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/file-processing.nerv");
+    let build = project.build(&source, "--release");
+    assert!(build.status.success(), "{}", text(&build.stderr));
+    fs::write(project.0.join("input.txt"), "  hello UTF-8: ?  ").unwrap();
+    let output = clean_command(&project.executable(), &project.0)
+        .args(["input.txt", "output.txt"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "0\n");
+    assert_eq!(
+        fs::read_to_string(project.0.join("output.txt")).unwrap(),
+        "hello UTF-8: ?"
+    );
+}

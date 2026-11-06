@@ -14,7 +14,7 @@ The goal is to make Nerv useful for real applications, not just examples and loo
 - [x] Choose a memory model: garbage collection, reference counting, or ownership.
 - [x] Specify string encoding, array lifetimes, and how values are copied or shared.
 
-Specified in [the alpha language specification](../docs/language-spec.md), with executable examples in `crates/nerv-cli/tests/language_rules.rs` and runtime ownership tests. The chosen model is execution-region ownership. Numeric width aliases, global import visibility, and other alpha limits are explicit; completing these definitions does not imply that distinct numeric widths or later roadmap features are implemented.
+Specified in [the alpha language specification](../docs/language-spec.md), with executable examples in `crates/nerv-cli/tests/language_rules.rs` and runtime ownership tests. The chosen model is execution-region ownership. Numeric widths, global import visibility, and other alpha limits are explicit; later milestone implementations and remaining limits are recorded below.
 
 **Done when:** each rule has a small example and an automated test, including invalid programs where appropriate.
 
@@ -91,28 +91,32 @@ Implemented in [standalone compilation](../docs/standalone.md), with both-mode J
 
 ## 7. Complete core types and structured errors
 
-- [ ] Finish the specified numeric types and explicit conversions across all compiler stages.
-- [ ] Add generics with clear rules for type inference and constraints.
-- [ ] Support generic structs, enums, and functions.
-- [ ] Provide optional values and result values through ordinary language types where possible.
-- [ ] Check pattern matches for exhaustiveness.
-- [ ] Define error propagation and unrecoverable failures.
-- [ ] Test interactions between generics, traits, methods, and enum payloads.
+- [x] Finish the specified numeric types and explicit conversions across all compiler stages.
+- [x] Add generics with clear rules for type inference and constraints.
+- [x] Support generic structs, enums, and functions.
+- [x] Provide optional values and result values through ordinary language types where possible.
+- [x] Check pattern matches for exhaustiveness.
+- [x] Define error propagation and unrecoverable failures.
+- [x] Test interactions between generics, traits, methods, and enum payloads.
+
+Implemented in the [language specification](../docs/language-spec.md#12-generics-and-recoverable-errors), with numeric, generic, compound-payload, and standalone regressions. Generics specialize concrete uses; inference rules and the 256-instance limit are documented. Errors propagate through explicit exhaustive matches. Generic methods and generic traits remain outside this milestone.
 
 **Done when:** reusable collections and recoverable errors do not require compiler special cases for each value type.
 
 ## 8. Build a small standard library
 
-- [ ] String manipulation and UTF-8 operations.
-- [ ] Growable arrays and iteration.
-- [ ] Maps and sets.
-- [ ] File and directory operations.
-- [ ] Standard input, standard output, and standard error.
-- [ ] Command-line arguments and environment variables.
-- [ ] Time, durations, and random numbers.
-- [ ] Assertions and test utilities.
-- [ ] Structured I/O errors.
-- [ ] Documentation and runnable examples for public APIs.
+- [x] String manipulation and UTF-8 operations.
+- [x] Growable arrays and iteration.
+- [x] Maps and sets.
+- [x] File and directory operations.
+- [x] Standard input, standard output, and standard error.
+- [x] Command-line arguments and environment variables.
+- [x] Time, durations, and random numbers.
+- [x] Assertions and test utilities.
+- [x] Structured I/O errors.
+- [x] Documentation and runnable examples for public APIs.
+
+Implemented in the [small standard library](../docs/standard-library.md), embedded as `nerv.core` and `nerv.std`. Includes generic value collections, string sets/maps, typed I/O errors, process inputs, and time utilities. Collections copy on update and use linear scans; these initial implementations target small applications. The file-processing CLI and JIT/debug/release I/O tests exercise the supported APIs.
 
 **Done when:** a small command-line application can handle input, process data, and write results using supported library APIs.
 

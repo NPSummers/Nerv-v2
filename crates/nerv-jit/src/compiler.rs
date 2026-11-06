@@ -110,19 +110,30 @@ impl Compiler {
         for enumeration in program.enums() {
             let payload = enumeration.has_payload();
             let ty = if payload {
-                unsafe {
-                    LLVMStructTypeInContext(
-                        self.context,
-                        [self.int_ty(), self.int_ty()].as_mut_ptr(),
-                        2,
-                        0,
-                    )
-                }
+                let name = cstring(&format!("enum_{}", enumeration.id.0))?;
+                unsafe { LLVMStructCreateNamed(self.context, name.as_ptr()) }
             } else {
                 self.int_ty()
             };
             self.types.insert(enumeration.id, ty);
             self.payloads.insert(enumeration.id, payload);
+        }
+        for enumeration in program.enums().iter().filter(|e| e.has_payload()) {
+            let mut fields = vec![self.int_ty()];
+            fields.extend(enumeration.variants.iter().map(|variant| {
+                variant
+                    .payload
+                    .as_ref()
+                    .map_or(self.int_ty(), |ty| self.ty(ty))
+            }));
+            unsafe {
+                LLVMStructSetBody(
+                    self.types[&enumeration.id],
+                    fields.as_mut_ptr(),
+                    fields.len() as u32,
+                    0,
+                );
+            }
         }
         for structure in program.structs() {
             let mut fields = structure
@@ -220,6 +231,8 @@ impl Compiler {
             Type::Void => self.void_ty(),
             Type::Bool => self.bool_ty(),
             Type::Int => self.int_ty(),
+            Type::Integer { bits, .. } => unsafe { LLVMIntTypeInContext(self.context, *bits) },
+            Type::Float32 => unsafe { LLVMFloatTypeInContext(self.context) },
             Type::Float => self.float_ty(),
             Type::String | Type::Array(_) | Type::Function { .. } => self.pointer_ty(),
             Type::Named(id) => self.types[id],
@@ -270,9 +283,17 @@ impl Compiler {
     ) -> Result<(), Error> {
         let name = cstring(&format!("local_{}", binding.id.0))?;
         let ty = self.ty(&binding.ty);
-        // A lexical binding needs one stack slot per invocation, not one alloca
-        // per loop iteration (especially important for unoptimized builds).
-        let pointer = unsafe {
+        let pointer = self.slot(ty, &name);
+        unsafe { LLVMBuildStore(self.builder, value.value, pointer) };
+        slots.insert(binding.id, Value { value: pointer, ty });
+        if !self.assigned.contains(&binding.id) {
+            self.immutable_depths.insert(binding.id, self.loop_depth);
+        }
+        Ok(())
+    }
+
+    fn slot(&self, ty: LLVMTypeRef, name: &CStr) -> LLVMValueRef {
+        unsafe {
             let allocator = LLVMCreateBuilderInContext(self.context);
             let function = LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.builder));
             let entry = LLVMGetEntryBasicBlock(function);
@@ -285,13 +306,7 @@ impl Compiler {
             let pointer = LLVMBuildAlloca(allocator, ty, name.as_ptr());
             LLVMDisposeBuilder(allocator);
             pointer
-        };
-        unsafe { LLVMBuildStore(self.builder, value.value, pointer) };
-        slots.insert(binding.id, Value { value: pointer, ty });
-        if !self.assigned.contains(&binding.id) {
-            self.immutable_depths.insert(binding.id, self.loop_depth);
         }
-        Ok(())
     }
 
     fn block(&mut self, body: &[ir::Statement], slots: &mut Slots) -> Result<Value, Error> {
@@ -332,7 +347,7 @@ impl Compiler {
                 let base = self.expr(base, slots)?;
                 let index = self.expr(index, slots)?;
                 let value = self.expr(value, slots)?;
-                let pointer = self.array_element_checked(base, index, proven)?;
+                let pointer = self.array_element_checked(base, index, proven, value.ty)?;
                 unsafe { LLVMBuildStore(self.builder, value.value, pointer) };
             }
             S::AssignField {
@@ -405,11 +420,11 @@ impl Compiler {
             },
             E::Function(id) => self.functions[id].value,
             E::Array(elements) => {
-                let array = self.external(
-                    "nerv_array_i64_new",
-                    ty,
-                    &[self.integer(elements.len() as i64), self.integer(0)],
-                )?;
+                let Type::Array(element) = &expression.ty else {
+                    unreachable!("checked array")
+                };
+                let array =
+                    self.new_array(self.integer(elements.len() as i64), self.ty(element))?;
                 for (index, element) in elements.iter().enumerate() {
                     let element = self.expr(element, slots)?;
                     self.array_store(array, self.integer(index as i64), element)?;
@@ -419,7 +434,50 @@ impl Compiler {
             E::ArrayRepeat { value, length } => {
                 let value = self.expr(value, slots)?;
                 let length = self.expr(length, slots)?;
-                return self.external("nerv_array_i64_new", ty, &[length, value]);
+                if value.ty == self.int_ty() {
+                    return self.external("nerv_array_i64_new", ty, &[length, value]);
+                }
+                let array = self.new_array(length, value.ty)?;
+                let index = self.slot(self.int_ty(), c"array.index");
+                unsafe {
+                    LLVMBuildStore(self.builder, self.integer(0).value, index);
+                }
+                let test = self.new_block(c"array.repeat.test");
+                let body = self.new_block(c"array.repeat.body");
+                let done = self.new_block(c"array.repeat.done");
+                unsafe {
+                    LLVMBuildBr(self.builder, test);
+                    LLVMPositionBuilderAtEnd(self.builder, test);
+                    let current =
+                        LLVMBuildLoad2(self.builder, self.int_ty(), index, c"array.index".as_ptr());
+                    let more = LLVMBuildICmp(
+                        self.builder,
+                        IP::LLVMIntSLT,
+                        current,
+                        length.value,
+                        c"array.more".as_ptr(),
+                    );
+                    LLVMBuildCondBr(self.builder, more, body, done);
+                    LLVMPositionBuilderAtEnd(self.builder, body);
+                    self.array_store(
+                        array,
+                        Value {
+                            value: current,
+                            ty: self.int_ty(),
+                        },
+                        value,
+                    )?;
+                    let next = LLVMBuildAdd(
+                        self.builder,
+                        current,
+                        self.integer(1).value,
+                        c"array.next".as_ptr(),
+                    );
+                    LLVMBuildStore(self.builder, next, index);
+                    LLVMBuildBr(self.builder, test);
+                    LLVMPositionBuilderAtEnd(self.builder, done);
+                }
+                return Ok(array);
             }
             E::Struct { fields, .. } => {
                 let mut value = unsafe { LLVMGetUndef(ty) };
@@ -454,7 +512,7 @@ impl Compiler {
                     unsafe {
                         let value = LLVMBuildInsertValue(
                             self.builder,
-                            LLVMGetUndef(ty),
+                            LLVMConstNull(ty),
                             self.integer(*tag).value,
                             0,
                             c"enum.tag".as_ptr(),
@@ -463,7 +521,7 @@ impl Compiler {
                             self.builder,
                             value,
                             payload.value,
-                            1,
+                            (*tag + 1) as u32,
                             c"enum.payload".as_ptr(),
                         )
                     }
@@ -479,7 +537,7 @@ impl Compiler {
                 let proven = self.proven_index(base, index);
                 let base = self.expr(base, slots)?;
                 let index = self.expr(index, slots)?;
-                let pointer = self.array_element_checked(base, index, proven)?;
+                let pointer = self.array_element_checked(base, index, proven, ty)?;
                 unsafe { LLVMBuildLoad2(self.builder, ty, pointer, c"array.load".as_ptr()) }
             }
             E::If {
@@ -493,7 +551,7 @@ impl Compiler {
                 arms,
             } => return self.match_expr(value, *enumeration, arms, ty, slots),
             E::Unary { op, value } => {
-                let floating = value.ty == Type::Float;
+                let floating = matches!(value.ty, Type::Float | Type::Float32);
                 let value = self.expr(value, slots)?;
                 unsafe {
                     match op {
@@ -553,8 +611,12 @@ impl Compiler {
                 return Ok(self.void());
             }
             E::Convert { conversion, value } => {
+                let source_type = value.ty.clone();
                 let value = self.expr(value, slots)?;
                 match conversion {
+                    ir::Conversion::Numeric => {
+                        return self.numeric_conversion(&source_type, &expression.ty, value);
+                    }
                     ir::Conversion::Identity => value.value,
                     ir::Conversion::IntToFloat => unsafe {
                         LLVMBuildSIToFP(self.builder, value.value, ty, c"to.float".as_ptr())
@@ -566,6 +628,74 @@ impl Compiler {
             }
         };
         Ok(Value { value, ty })
+    }
+
+    fn numeric_conversion(
+        &mut self,
+        source: &Type,
+        destination: &Type,
+        value: Value,
+    ) -> Result<Value, Error> {
+        let ty = self.ty(destination);
+        let integer = |t: &Type| match t {
+            Type::Int => Some((64, true)),
+            Type::Integer { bits, signed } => Some((*bits, *signed)),
+            _ => None,
+        };
+        let from = integer(source);
+        let to = integer(destination);
+        let name = c"convert".as_ptr();
+        let converted = unsafe {
+            match (from, to) {
+                (Some((from_bits, signed)), Some((to_bits, _))) => {
+                    if from_bits == to_bits {
+                        value.value
+                    } else if from_bits > to_bits {
+                        LLVMBuildTrunc(self.builder, value.value, ty, name)
+                    } else if signed {
+                        LLVMBuildSExt(self.builder, value.value, ty, name)
+                    } else {
+                        LLVMBuildZExt(self.builder, value.value, ty, name)
+                    }
+                }
+                (Some((_, true)), None) => LLVMBuildSIToFP(self.builder, value.value, ty, name),
+                (Some((_, false)), None) => LLVMBuildUIToFP(self.builder, value.value, ty, name),
+                (None, Some((bits, signed))) => {
+                    let upper = 2f64.powi(if signed { bits as i32 - 1 } else { bits as i32 });
+                    let lower = if signed { -upper } else { 0.0 };
+                    let above = LLVMBuildFCmp(
+                        self.builder,
+                        FP::LLVMRealOGE,
+                        value.value,
+                        LLVMConstReal(value.ty, lower),
+                        c"convert.lower".as_ptr(),
+                    );
+                    let below = LLVMBuildFCmp(
+                        self.builder,
+                        FP::LLVMRealOLT,
+                        value.value,
+                        LLVMConstReal(value.ty, upper),
+                        c"convert.upper".as_ptr(),
+                    );
+                    let valid = LLVMBuildAnd(self.builder, above, below, c"convert.valid".as_ptr());
+                    self.guard(valid, 5)?;
+                    if signed {
+                        LLVMBuildFPToSI(self.builder, value.value, ty, name)
+                    } else {
+                        LLVMBuildFPToUI(self.builder, value.value, ty, name)
+                    }
+                }
+                (None, None) if source == destination => value.value,
+                (None, None) if *destination == Type::Float32 => {
+                    LLVMBuildFPTrunc(self.builder, value.value, ty, name)
+                }
+                (None, None) => LLVMBuildFPExt(self.builder, value.value, ty, name),
+            }
+        };
+        Ok(Value {
+            value: converted,
+            ty,
+        })
     }
 
     fn if_expr(
@@ -617,13 +747,6 @@ impl Compiler {
         } else {
             value.value
         };
-        let payload = if has_payload {
-            Some(unsafe {
-                LLVMBuildExtractValue(self.builder, value.value, 1, c"enum.payload".as_ptr())
-            })
-        } else {
-            None
-        };
         let merge = self.new_block(c"match.merge");
         let fallback = self.new_block(c"match.invalid");
         let blocks = arms
@@ -641,7 +764,14 @@ impl Compiler {
                 self.bind(
                     binding,
                     Value {
-                        value: payload.expect("checked enum payload"),
+                        value: unsafe {
+                            LLVMBuildExtractValue(
+                                self.builder,
+                                value.value,
+                                (arm.tag + 1) as u32,
+                                c"enum.payload".as_ptr(),
+                            )
+                        },
                         ty: self.ty(&binding.ty),
                     },
                     slots,
@@ -832,7 +962,11 @@ impl Compiler {
             }
             return Ok(self.phi(ty, &[(condition.value, origin), (right.value, right_end)]));
         }
-        let floating = left.ty == Type::Float;
+        let floating = matches!(left.ty, Type::Float | Type::Float32);
+        let integer = match left.ty {
+            Type::Integer { bits, signed } => Some((bits, signed)),
+            _ => None,
+        };
         let numerator_upper = super::range::infer(left, &self.ranges)
             .filter(|(lo, hi)| *lo >= 0 && *hi <= u32::MAX as i64)
             .map(|(_, hi)| hi as u32);
@@ -843,7 +977,64 @@ impl Compiler {
             E::Local(id) if self.immutable_depths.get(id).is_some_and(|depth| *depth < self.loop_depth));
         let left = self.expr(left, slots)?;
         let mut right = self.expr(right, slots)?;
-        if matches!(op, B::Div | B::Rem) && !floating {
+        if let Some((bits, signed)) = integer {
+            if matches!(op, B::Div | B::Rem) {
+                unsafe {
+                    let zero = LLVMConstInt(left.ty, 0, 0);
+                    let nonzero = LLVMBuildICmp(
+                        self.builder,
+                        IP::LLVMIntNE,
+                        right.value,
+                        zero,
+                        c"div.nonzero".as_ptr(),
+                    );
+                    self.guard(nonzero, 1)?;
+                    if signed {
+                        let minimum = LLVMBuildICmp(
+                            self.builder,
+                            IP::LLVMIntEQ,
+                            left.value,
+                            LLVMConstInt(left.ty, 1u64 << (bits - 1), 0),
+                            c"div.minimum".as_ptr(),
+                        );
+                        let negative_one = LLVMBuildICmp(
+                            self.builder,
+                            IP::LLVMIntEQ,
+                            right.value,
+                            LLVMConstAllOnes(right.ty),
+                            c"div.negative_one".as_ptr(),
+                        );
+                        let overflow = LLVMBuildAnd(
+                            self.builder,
+                            minimum,
+                            negative_one,
+                            c"div.overflow".as_ptr(),
+                        );
+                        right.value = LLVMBuildSelect(
+                            self.builder,
+                            overflow,
+                            LLVMConstInt(right.ty, 1, 0),
+                            right.value,
+                            c"div.safe".as_ptr(),
+                        );
+                    }
+                    let value = match (op, signed) {
+                        (B::Div, true) => {
+                            LLVMBuildSDiv(self.builder, left.value, right.value, c"div".as_ptr())
+                        }
+                        (B::Div, false) => {
+                            LLVMBuildUDiv(self.builder, left.value, right.value, c"div".as_ptr())
+                        }
+                        (B::Rem, true) => {
+                            LLVMBuildSRem(self.builder, left.value, right.value, c"rem".as_ptr())
+                        }
+                        _ => LLVMBuildURem(self.builder, left.value, right.value, c"rem".as_ptr()),
+                    };
+                    return Ok(Value { value, ty });
+                }
+            }
+        }
+        if matches!(op, B::Div | B::Rem) && !floating && integer.is_none() {
             unsafe {
                 let nonzero = LLVMBuildICmp(
                     self.builder,
@@ -909,18 +1100,50 @@ impl Compiler {
                 (B::NotEq, false) => {
                     LLVMBuildICmp(self.builder, IP::LLVMIntNE, left.value, right.value, name)
                 }
-                (B::Lt, false) => {
-                    LLVMBuildICmp(self.builder, IP::LLVMIntSLT, left.value, right.value, name)
-                }
-                (B::LtEq, false) => {
-                    LLVMBuildICmp(self.builder, IP::LLVMIntSLE, left.value, right.value, name)
-                }
-                (B::Gt, false) => {
-                    LLVMBuildICmp(self.builder, IP::LLVMIntSGT, left.value, right.value, name)
-                }
-                (B::GtEq, false) => {
-                    LLVMBuildICmp(self.builder, IP::LLVMIntSGE, left.value, right.value, name)
-                }
+                (B::Lt, false) => LLVMBuildICmp(
+                    self.builder,
+                    if integer.is_some_and(|(_, signed)| !signed) {
+                        IP::LLVMIntULT
+                    } else {
+                        IP::LLVMIntSLT
+                    },
+                    left.value,
+                    right.value,
+                    name,
+                ),
+                (B::LtEq, false) => LLVMBuildICmp(
+                    self.builder,
+                    if integer.is_some_and(|(_, signed)| !signed) {
+                        IP::LLVMIntULE
+                    } else {
+                        IP::LLVMIntSLE
+                    },
+                    left.value,
+                    right.value,
+                    name,
+                ),
+                (B::Gt, false) => LLVMBuildICmp(
+                    self.builder,
+                    if integer.is_some_and(|(_, signed)| !signed) {
+                        IP::LLVMIntUGT
+                    } else {
+                        IP::LLVMIntSGT
+                    },
+                    left.value,
+                    right.value,
+                    name,
+                ),
+                (B::GtEq, false) => LLVMBuildICmp(
+                    self.builder,
+                    if integer.is_some_and(|(_, signed)| !signed) {
+                        IP::LLVMIntUGE
+                    } else {
+                        IP::LLVMIntSGE
+                    },
+                    left.value,
+                    right.value,
+                    name,
+                ),
                 (B::Eq, true) => {
                     LLVMBuildFCmp(self.builder, FP::LLVMRealOEQ, left.value, right.value, name)
                 }
@@ -1296,6 +1519,28 @@ impl Compiler {
         }
     }
 
+    fn new_array(&mut self, length: Value, element: LLVMTypeRef) -> Result<Value, Error> {
+        if element == self.int_ty() {
+            return self.external(
+                "nerv_array_i64_new",
+                self.pointer_ty(),
+                &[length, self.integer(0)],
+            );
+        }
+        let size = unsafe { LLVMSizeOf(element) };
+        self.external(
+            "nerv_array_new",
+            self.pointer_ty(),
+            &[
+                length,
+                Value {
+                    value: size,
+                    ty: self.int_ty(),
+                },
+            ],
+        )
+    }
+
     fn array_length(&self, expression: &ir::Expr) -> Option<i64> {
         match &expression.kind {
             E::Local(id) => self.array_lengths.get(id).copied(),
@@ -1316,8 +1561,13 @@ impl Compiler {
             .is_some_and(|(length, (lo, hi))| lo >= 0 && hi < length)
     }
 
-    fn array_element(&mut self, array: Value, index: Value) -> Result<LLVMValueRef, Error> {
-        self.array_element_checked(array, index, false)
+    fn array_element(
+        &mut self,
+        array: Value,
+        index: Value,
+        element: LLVMTypeRef,
+    ) -> Result<LLVMValueRef, Error> {
+        self.array_element_checked(array, index, false, element)
     }
 
     fn array_element_checked(
@@ -1325,6 +1575,7 @@ impl Compiler {
         array: Value,
         index: Value,
         proven: bool,
+        element: LLVMTypeRef,
     ) -> Result<LLVMValueRef, Error> {
         unsafe {
             let valid = LLVMBuildIsNotNull(self.builder, array.value, c"array.valid".as_ptr());
@@ -1366,7 +1617,7 @@ impl Compiler {
             let data = self.invariant_load(self.pointer_ty(), data_ptr, c"array.data");
             Ok(LLVMBuildInBoundsGEP2(
                 self.builder,
-                self.int_ty(),
+                element,
                 data,
                 [index.value].as_mut_ptr(),
                 1,
@@ -1385,7 +1636,7 @@ impl Compiler {
         }
     }
     fn array_store(&mut self, array: Value, index: Value, value: Value) -> Result<(), Error> {
-        let pointer = self.array_element(array, index)?;
+        let pointer = self.array_element(array, index, value.ty)?;
         unsafe { LLVMBuildStore(self.builder, value.value, pointer) };
         Ok(())
     }

@@ -158,24 +158,51 @@ fn module_resolution_visibility_and_cycles() {
 }
 
 #[test]
-fn numeric_aliases_have_the_documented_representation() {
+fn numeric_widths_and_signedness() {
     let project = Project::new();
-    for name in [
-        "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize",
+    for (name, expected) in [
+        ("i8", -1),
+        ("u8", 255),
+        ("i16", 255),
+        ("u16", 255),
+        ("i32", 255),
+        ("u32", 255),
+        ("i64", 255),
+        ("u64", 255),
+        ("isize", 255),
+        ("usize", 255),
     ] {
         verify(
             &project,
-            "run:-256",
-            &format!("fn main() -> i64\n    let value: {name} = -256\n    value\n"),
+            &format!("run:{expected}"),
+            &format!("fn main() -> i64 => i64({name}(255))\n"),
         );
     }
-    for name in ["f32", "f64"] {
+    for (name, expected) in [("f32", 0), ("f64", 1)] {
         verify(
             &project,
-            "run:1",
-            &format!(
-                "fn main() -> i64\n    let value: {name} = 16777217.0\n    i64(value - 16777216.0)\n"
-            ),
+            &format!("run:{expected}"),
+            &format!("fn main() -> i64 => i64({name}(16777217.0) - {name}(16777216.0))\n"),
         );
     }
+    verify(
+        &project,
+        "reject:invalid binary operation",
+        "fn main() -> i64 => i64(u8(1) + i8(2))\n",
+    );
+    verify(
+        &project,
+        "fail:target integer range",
+        "fn main() -> i64 => i64(u8(256.0))\n",
+    );
+    verify(
+        &project,
+        "fail:target integer range",
+        "fn main() -> i64 => i64(i8(0.0 / 0.0))\n",
+    );
+    verify(
+        &project,
+        "fail:integer division by zero",
+        "fn main() -> i64 => i64(u8(1) / u8(0))\n",
+    );
 }
