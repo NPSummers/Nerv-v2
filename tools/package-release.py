@@ -37,13 +37,36 @@ def licenses(destination):
             shutil.copy2(notice, destination / notice.name)
 
 
+def resolve_library(dependency, original, llvm):
+    if dependency.startswith("@loader_path/"):
+        candidates = [original.parent / dependency.removeprefix("@loader_path/")]
+    elif dependency.startswith("@rpath/"):
+        name = dependency.removeprefix("@rpath/")
+        candidates = [original.parent / name, llvm / "lib" / name]
+        paths = run("otool", "-l", str(original)).splitlines()
+        for index, line in enumerate(paths):
+            if line.strip() == "cmd LC_RPATH":
+                for value in paths[index + 1:index + 4]:
+                    if value.strip().startswith("path "):
+                        base = value.strip()[5:].split(" (offset", 1)[0]
+                        base = base.replace("@loader_path", str(original.parent))
+                        candidates.append(Path(base) / name)
+        candidates.extend(sorted(llvm.rglob(Path(name).name)))
+    else:
+        candidates = [Path(dependency)]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"cannot bundle dependency {dependency} from {original}")
+
+
 def mac_libraries(binary, llvm, destination):
     library = llvm / "lib/libLLVM-23.dylib"
     shutil.copy2(library, destination / library.name)
-    queue = [binary, destination / library.name]
+    queue = [(binary, ROOT / "target/release/nerv"), (destination / library.name, library)]
     visited = set()
     while queue:
-        item = queue.pop()
+        item, original = queue.pop()
         if item in visited:
             continue
         visited.add(item)
@@ -53,13 +76,13 @@ def mac_libraries(binary, llvm, destination):
             if dependency.startswith(("/usr/lib/", "/System/Library/", "@executable_path/")):
                 continue
             name = Path(dependency).name
+            if name == item.name:
+                continue
             target = destination / name
             if not target.exists():
-                origin = Path(dependency)
-                if not origin.is_file():
-                    raise RuntimeError(f"cannot bundle dependency {dependency}")
+                origin = resolve_library(dependency, original, llvm)
                 shutil.copy2(origin, target)
-                queue.append(target)
+                queue.append((target, origin))
             subprocess.run(["install_name_tool", "-change", dependency, f"@executable_path/{name}", str(item)], check=True)
         subprocess.run(["codesign", "--force", "--sign", "-", str(item)], check=True)
 
