@@ -17,6 +17,8 @@ The [language specification](./docs/language-spec.md) defines the supported alph
 
 The [small standard library](docs/standard-library.md) provides generic collections, optional/result values, UTF-8 file I/O, directories, process inputs, and time utilities through `import nerv.std`.
 
+The current source tree also provides [JSON, HTTPS, and WebSocket client APIs](docs/networking.md) through `import nerv.json` and `import nerv.net`. These additions require rebuilding the compiler; older release archives do not include them.
+
 ## Projects and installation
 
 Download a checksummed alpha compiler archive from [Releases](https://github.com/NPSummers/Nerv-v2/releases), or follow the [installation instructions](docs/installation.md) to build from source. Installed compilers need native build tools for linking applications; Rust and Cargo are needed only to build the compiler.

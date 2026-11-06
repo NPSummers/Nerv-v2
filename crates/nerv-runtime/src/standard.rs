@@ -5,7 +5,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-fn strings(values: Vec<String>) -> *mut std::ffi::c_void {
+pub(super) fn strings(values: Vec<String>) -> *mut std::ffi::c_void {
     let length = values.len();
     let array = nerv_array_new(length as i64, std::mem::size_of::<*mut NervString>() as i64);
     let data = unsafe { (*array.cast::<TypedArray>()).data.cast::<*mut NervString>() };
@@ -17,7 +17,7 @@ fn strings(values: Vec<String>) -> *mut std::ffi::c_void {
     array
 }
 
-unsafe fn text<'a>(value: *const NervString) -> &'a str {
+pub(super) unsafe fn text<'a>(value: *const NervString) -> &'a str {
     unsafe { value.as_ref() }
         .map(|s| s.0.as_str())
         .unwrap_or("")
@@ -125,8 +125,22 @@ pub extern "C" fn nerv_io_sleep_ms(duration: i64) {
     std::thread::sleep(Duration::from_millis(duration as u64));
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_io_monotonic_ms() -> i64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 pub(super) fn symbols() -> Vec<RuntimeSymbol> {
     vec![
+        RuntimeSymbol {
+            name: "nerv_io_monotonic_ms",
+            address: nerv_io_monotonic_ms as *const (),
+        },
         RuntimeSymbol {
             name: "nerv_array_length",
             address: nerv_array_length as *const (),

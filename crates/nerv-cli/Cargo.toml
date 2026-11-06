@@ -15,3 +15,8 @@ toml = "=0.8.23"
 
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "=0.1.13"
+
+[dev-dependencies]
+rcgen = "=0.14.5"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

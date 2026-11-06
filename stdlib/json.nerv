@@ -1,0 +1,38 @@
+import nerv.std
+
+struct Json
+    text: string
+
+struct JsonError
+    message: string
+
+fn json_result(raw: []string) -> Result<Json, JsonError>
+    if nerv.string.len(raw[1]) == 0
+        Ok(Json { text: raw[0] })
+    else
+        Err(JsonError { message: raw[1] })
+
+fn json_parse(text: string) -> Result<Json, JsonError> => json_result(nerv.json.parse(text))
+fn json_get(value: Json, key: string) -> Result<Json, JsonError> => json_result(nerv.json.get(value.text, key))
+fn json_index(value: Json, index: i64) -> Result<Json, JsonError> => json_result(nerv.json.index(value.text, index))
+fn json_kind(value: Json) -> string => nerv.json.kind(value.text)
+fn json_text(value: Json, fallback: string) -> string => nerv.json.text(value.text, fallback)
+fn json_i64(value: Json, fallback: i64) -> i64 => nerv.json.i64(value.text, fallback)
+fn json_f64(value: Json, fallback: f64) -> f64 => nerv.json.f64(value.text, fallback)
+fn json_bool(value: Json, fallback: bool) -> bool => nerv.json.bool(value.text, fallback)
+fn json_len(value: Json) -> i64 => nerv.json.len(value.text)
+fn json_string(value: string) -> Json => Json { text: nerv.json.string(value) }
+fn json_integer(value: i64) -> Json => Json { text: nerv.json.integer(value) }
+fn json_number(value: f64) -> Result<Json, JsonError> => json_result(nerv.json.number(value))
+fn json_object() -> Json => Json { text: "{}" }
+fn json_array() -> Json => Json { text: "[]" }
+fn json_null() -> Json => Json { text: "null" }
+fn json_boolean(value: bool) -> Json
+    if value
+        Json { text: "true" }
+    else
+        Json { text: "false" }
+
+fn json_set(value: Json, key: string, member: Json) -> Result<Json, JsonError> => json_result(nerv.json.set(value.text, key, member.text))
+fn json_push(value: Json, member: Json) -> Result<Json, JsonError> => json_result(nerv.json.push(value.text, member.text))
+fn json_serialize(value: Json) -> string => value.text

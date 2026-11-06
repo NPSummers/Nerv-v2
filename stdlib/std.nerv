@@ -127,3 +127,5 @@ fn sleep(duration: Duration) -> void => sleep_ms(duration.milliseconds)
 
 fn assert_equal<T>(actual: T, expected: T) -> void => assert(actual == expected)
 fn assert_string_equal(actual: string, expected: string) -> void => assert(string_equal(actual, expected))
+
+fn monotonic_ms() -> i64 => nerv.io.monotonic_ms()

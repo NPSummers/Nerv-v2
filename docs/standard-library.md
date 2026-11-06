@@ -48,3 +48,7 @@ Paths are relative to the process working directory. Directory names and process
 ## Runnable examples
 
 Run `./nerv.ps1 example/standard-library.nerv` on Windows, or `./nerv.sh example/standard-library.nerv` on macOS. It exercises vector, map, set, time, and arguments and returns 42. Compile `example/file-processing.nerv` with `nerv build` and pass an input and output path to trim a UTF-8 file into another file. `example/generics.nerv`, `example/numeric-types.nerv`, and `example/enum-payloads.nerv` exercise the core language additions. Compiler tests execute these features through JIT and debug/release standalone binaries; I/O tests use temporary directories and piped standard input.
+
+## JSON and network clients
+
+`import nerv.json` and `import nerv.net` add typed JSON helpers, HTTP/HTTPS clients, and WebSocket event callbacks. They include the ordinary standard library transitively. See [networking](networking.md) for signatures, timeouts, TLS verification, callback state, and allocation lifetimes. These are source-tree additions requiring a rebuilt compiler.

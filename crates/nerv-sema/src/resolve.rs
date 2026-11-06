@@ -692,6 +692,12 @@ fn runtime_symbol(name: &str, args: &[ir::Expr]) -> String {
             format!("nerv_{name}_{suffix}")
         }
         "nerv.arrays.len" => "nerv_array_length".into(),
+        name if name.starts_with("nerv.json.") => {
+            format!("nerv_json_{}", name.trim_start_matches("nerv.json."))
+        }
+        name if name.starts_with("nerv.net.") => {
+            format!("nerv_net_{}", name.trim_start_matches("nerv.net."))
+        }
         name if name.starts_with("nerv.io.") => {
             format!("nerv_io_{}", name.trim_start_matches("nerv.io."))
         }

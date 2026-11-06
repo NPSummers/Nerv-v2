@@ -1,0 +1,53 @@
+import nerv.json
+
+struct NetError
+    operation: string
+    message: string
+
+struct HttpResponse
+    status: i64
+    headers: Json
+    body: string
+
+struct WebSocketOutcome
+    state: string
+    error: string
+
+fn http_request_with_ca(method: string, url: string, headers: []string, body: string, timeout_ms: i64, ca_file: string) -> Result<HttpResponse, NetError>
+    let raw = nerv.net.http_request(method, url, headers, body, timeout_ms, ca_file)
+    if nerv.string.len(raw[3]) == 0
+        Ok(HttpResponse { status: nerv.json.i64(raw[0], 0), headers: Json { text: raw[1] }, body: raw[2] })
+    else
+        Err(NetError { operation: "HTTP", message: raw[3] })
+
+fn http_request(method: string, url: string, headers: []string, body: string, timeout_ms: i64) -> Result<HttpResponse, NetError> => http_request_with_ca(method, url, headers, body, timeout_ms, "")
+
+fn http_header(response: HttpResponse, name: string) -> Option<string>
+    let mut found: Option<string> = None()
+    for i in 0..json_len(response.headers) / 2
+        let key = result_or(json_index(response.headers, i * 2), json_null())
+        if string_equal(nerv.string.to_lower(json_text(key, "")), nerv.string.to_lower(name))
+            found = Some(json_text(result_or(json_index(response.headers, i * 2 + 1), json_null()), ""))
+        else
+            assert(true)
+    found
+
+fn websocket_run(url: string, state: string, timeout_ms: i64, handler: fn(i64, string, string, []u8, string) -> []string) -> WebSocketOutcome
+    let raw = nerv.net.websocket_run(url, [""] * 0, state, timeout_ms, "", handler)
+    WebSocketOutcome { state: raw[0], error: raw[1] }
+
+fn websocket_run_with_options(url: string, headers: []string, state: string, timeout_ms: i64, ca_file: string, handler: fn(i64, string, string, []u8, string) -> []string) -> WebSocketOutcome
+    let raw = nerv.net.websocket_run(url, headers, state, timeout_ms, ca_file, handler)
+    WebSocketOutcome { state: raw[0], error: raw[1] }
+
+fn websocket_result(error: string, operation: string) -> Result<bool, NetError>
+    if nerv.string.len(error) == 0
+        Ok(true)
+    else
+        Err(NetError { operation: operation, message: error })
+
+fn websocket_send(handle: i64, message: string) -> Result<bool, NetError> => websocket_result(nerv.net.websocket_send(handle, message), "WebSocket send")
+fn websocket_send_binary(handle: i64, bytes: []u8) -> Result<bool, NetError> => websocket_result(nerv.net.websocket_send_binary(handle, bytes), "WebSocket binary send")
+fn websocket_close(handle: i64) -> Result<bool, NetError> => websocket_result(nerv.net.websocket_close(handle), "WebSocket close")
+
+fn websocket_close_with_code(handle: i64, code: i64, reason: string) -> Result<bool, NetError> => websocket_result(nerv.net.websocket_close_with_code(handle, code, reason), "WebSocket close")

@@ -1,0 +1,33 @@
+import nerv.json
+
+fn main() -> i64
+    let value = result_or(json_parse("{\"items\":[1,true,null],\"id\":\"18446744073709551615\"}"), json_null())
+    let items = result_or(json_get(value, "items"), json_null())
+    assert(json_len(items) == 3)
+    assert(json_i64(result_or(json_index(items, 0), json_null()), -1) == 1)
+    assert(json_bool(result_or(json_index(items, 1), json_null()), false))
+    assert_string_equal(json_kind(result_or(json_index(items, 2), json_object())), "null")
+    assert_string_equal(json_text(result_or(json_get(value, "id"), json_null()), ""), "18446744073709551615")
+    let encoded = result_or(json_set(json_object(), "text", json_string("hello\nworld")), json_null())
+    let round_trip = result_or(json_parse(json_serialize(encoded)), json_null())
+    assert_string_equal(json_text(result_or(json_get(round_trip, "text"), json_null()), ""), "hello\nworld")
+    let invalid = match json_parse("{invalid}")
+        Ok(value) => false
+        Err(error) => nerv.string.len(error.message) > 0
+    assert(invalid)
+    let missing = match json_get(value, "missing")
+        Ok(item) => false
+        Err(error) => true
+    assert(missing)
+    let out_of_bounds = match json_index(items, -1)
+        Ok(item) => false
+        Err(error) => true
+    assert(out_of_bounds)
+    let nonfinite = match json_number(0.0 / 0.0)
+        Ok(item) => false
+        Err(error) => true
+    assert(nonfinite)
+    assert_string_equal(json_serialize(json_boolean(true)), "true")
+    assert_string_equal(json_kind(json_string("")), "string")
+    let numbers = result_or(json_push(json_array(), json_integer(42)), json_array())
+    json_i64(result_or(json_index(numbers, 0), json_null()), 0)

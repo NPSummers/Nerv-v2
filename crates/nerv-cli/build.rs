@@ -1,40 +1,43 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
-    let source = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-        .join("../nerv-runtime/src/lib.rs");
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../..");
     println!("cargo:rerun-if-changed=../nerv-runtime/src");
+    println!("cargo:rerun-if-changed=../nerv-runtime/Cargo.toml");
+    println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     let target = env::var("TARGET").unwrap();
     println!("cargo:rustc-env=NERV_BUILD_TARGET={target}");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    // The runtime has no third-party dependencies. Embed its target-native
-    // static archive, so the installed compiler needs no Rust/Cargo at build time.
-    let mut command = Command::new(env::var_os("RUSTC").unwrap());
+    let runtime_target = out.join("native-runtime");
+    let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     command
-        .arg(&source)
         .args([
-            "--crate-name",
-            "nerv_runtime",
-            "--crate-type",
-            "staticlib",
-            "--edition=2024",
-            "--target",
-            &target,
-            "-Copt-level=2",
-            "-Cdebuginfo=0",
-            "-Cpanic=abort",
-            "--print",
-            "native-static-libs",
-            "--out-dir",
+            "rustc",
+            "--locked",
+            "--offline",
+            "--release",
+            "--lib",
+            "-p",
+            "nerv-runtime",
+            "--manifest-path",
         ])
-        .arg(&out);
-    if target.contains("windows-msvc") {
-        command.arg("-Ctarget-feature=+crt-static");
-    }
+        .arg(root.join("Cargo.toml"))
+        .args(["--target", &target, "--target-dir"])
+        .arg(&runtime_target)
+        .args(["--", "-Cpanic=abort", "--print", "native-static-libs"])
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env(
+            "RUSTFLAGS",
+            if target.contains("windows-msvc") {
+                "-Ctarget-feature=+crt-static"
+            } else {
+                ""
+            },
+        );
     let output = command
         .output()
-        .expect("could not invoke rustc to build standalone runtime");
+        .expect("could not build the standalone runtime with Cargo");
     assert!(
         output.status.success(),
         "standalone runtime build failed:\n{}",
@@ -47,7 +50,7 @@ fn main() {
             line.split_once("native-static-libs: ")
                 .map(|(_, libs)| libs)
         })
-        .expect("rustc did not report the standalone runtime's native link libraries");
+        .expect("rustc did not report standalone native link libraries");
     fs::write(
         out.join("runtime-link-libs.txt"),
         libs.split_whitespace().collect::<Vec<_>>().join("\n"),
@@ -58,5 +61,9 @@ fn main() {
     } else {
         "libnerv_runtime.a"
     };
-    fs::rename(out.join(archive), out.join("runtime.archive")).unwrap();
+    fs::copy(
+        runtime_target.join(&target).join("release").join(archive),
+        out.join("runtime.archive"),
+    )
+    .unwrap();
 }

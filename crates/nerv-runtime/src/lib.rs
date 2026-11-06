@@ -1,3 +1,6 @@
+mod json;
+#[cfg(feature = "networking")]
+mod network;
 mod standard;
 
 use std::{
@@ -598,6 +601,9 @@ pub fn symbols() -> Vec<RuntimeSymbol> {
         },
     ];
     symbols.extend(standard::symbols());
+    symbols.extend(json::symbols());
+    #[cfg(feature = "networking")]
+    symbols.extend(network::symbols());
     symbols
 }
 

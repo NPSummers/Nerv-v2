@@ -214,7 +214,9 @@ fn load(
         syntax::parse_source(&source, id).map_err(|error| frontend_error(&path, id, error))?;
     for import in &module.imports {
         if import.path.first().is_some_and(|part| part == "nerv") {
-            if import.path.len() == 2 && matches!(import.path[1].as_str(), "core" | "std") {
+            if import.path.len() == 2
+                && matches!(import.path[1].as_str(), "core" | "std" | "json" | "net")
+            {
                 load_standard(&import.path[1], modules, visited, sources)?;
             }
             continue;
@@ -290,13 +292,18 @@ fn load_standard(
     if !visited.insert(path.clone()) {
         return Ok(());
     }
-    if name == "std" {
-        load_standard("core", modules, visited, sources)?;
+    match name {
+        "std" => load_standard("core", modules, visited, sources)?,
+        "json" => load_standard("std", modules, visited, sources)?,
+        "net" => load_standard("json", modules, visited, sources)?,
+        _ => {}
     }
-    let text = if name == "core" {
-        include_str!("../../../stdlib/core.nerv")
-    } else {
-        include_str!("../../../stdlib/std.nerv")
+    let text = match name {
+        "core" => include_str!("../../../stdlib/core.nerv"),
+        "std" => include_str!("../../../stdlib/std.nerv"),
+        "json" => include_str!("../../../stdlib/json.nerv"),
+        "net" => include_str!("../../../stdlib/net.nerv"),
+        _ => unreachable!("known standard module"),
     };
     let source = sources.add(path.clone(), text.to_owned());
     let module =
@@ -1185,6 +1192,62 @@ fn runtime_type(name: &str, args: &[Type]) -> Option<Option<Type>> {
         }
         ("nerv.io.now_ms", []) | ("nerv.arrays.len", [Type::Array(_)]) => {
             return Some(Some(Type::Int));
+        }
+        _ => {}
+    }
+    let bytes = Type::Array(Box::new(Type::Integer {
+        bits: 8,
+        signed: false,
+    }));
+    let string_array = Type::Array(Box::new(Type::String));
+    match (name, args) {
+        ("nerv.json.parse", [Type::String])
+        | ("nerv.json.get", [Type::String, Type::String])
+        | ("nerv.json.index", [Type::String, Type::Int])
+        | ("nerv.json.set", [Type::String, Type::String, Type::String])
+        | ("nerv.json.push", [Type::String, Type::String])
+        | ("nerv.json.number", [Type::Float]) => return Some(Some(strings())),
+        ("nerv.json.kind" | "nerv.json.string", [Type::String])
+        | ("nerv.json.text", [Type::String, Type::String])
+        | ("nerv.json.integer", [Type::Int]) => return Some(Some(Type::String)),
+        ("nerv.json.len", [Type::String]) | ("nerv.json.i64", [Type::String, Type::Int]) => {
+            return Some(Some(Type::Int));
+        }
+        ("nerv.json.f64", [Type::String, Type::Float]) => return Some(Some(Type::Float)),
+        ("nerv.json.bool", [Type::String, Type::Bool]) => return Some(Some(Type::Bool)),
+        ("nerv.io.monotonic_ms", []) => return Some(Some(Type::Int)),
+        (
+            "nerv.net.http_request",
+            [
+                Type::String,
+                Type::String,
+                headers,
+                Type::String,
+                Type::Int,
+                Type::String,
+            ],
+        ) if *headers == string_array => return Some(Some(strings())),
+        ("nerv.net.websocket_close_with_code", [Type::Int, Type::Int, Type::String])
+        | ("nerv.net.websocket_send", [Type::Int, Type::String])
+        | ("nerv.net.websocket_close", [Type::Int]) => return Some(Some(Type::String)),
+        ("nerv.net.websocket_send_binary", [Type::Int, values]) if *values == bytes => {
+            return Some(Some(Type::String));
+        }
+        (
+            "nerv.net.websocket_run",
+            [
+                Type::String,
+                headers,
+                Type::String,
+                Type::Int,
+                Type::String,
+                Type::Function { params, result },
+            ],
+        ) if *headers == string_array
+            && *params == [Type::Int, Type::String, Type::String, bytes, Type::String]
+            && **result == string_array =>
+        {
+            return Some(Some(strings()));
         }
         _ => {}
     }

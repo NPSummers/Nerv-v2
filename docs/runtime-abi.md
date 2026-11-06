@@ -11,7 +11,7 @@ Each JIT invocation or standalone entry owns a thread-local execution region. A 
 
 Core string buffers, array buffers, object boxes, and ownership bookkeeping use checked sizing and fallible allocation. Overflow/failed reservation exits 1 with an allocation diagnostic. Legacy scalar output failures are fatal runtime errors. Standard-library file and stdin operations return ordinary `Result` values with `IoError` context instead of panicking. Capacity-overflow tests exercise failure handling deterministically without exhausting machine memory. Unicode case conversion maps scalar values (a scalar can expand to several scalars); locale/context-dependent casing is not provided.
 
-This covers runtime-controlled reservations, not every allocation inside LLVM, the compiler, or host standard-library initialization. An OS-level out-of-memory kill after a successful virtual-memory reservation cannot be converted into a language diagnostic.
+This covers runtime-controlled reservations, not every allocation inside LLVM, the compiler, JSON/TLS/networking dependencies, or host standard-library initialization. An OS-level out-of-memory kill after a successful virtual-memory reservation cannot be converted into a language diagnostic.
 
 The experimental `nerv.collections` integer handles and raw-pointer/free exports are **not** part of the safe language core. Foreign callers must provide live, correctly typed, aligned handles, valid buffer lengths, and C-compatible callbacks; they must not free an iterated array during callbacks. Array map/reduce copy each element before calling native code, so callbacks may mutate shared storage without keeping overlapping Rust borrows alive. Forged handles and use-after-free remain invalid native operations.
 
@@ -35,3 +35,5 @@ Miri checks the safe core under strict provenance, including shared handles, rep
 On macOS, a compiled example can also be checked with `leaks --atExit -- ./hello`. The local nested/shared-value example reports zero leaked bytes. This is a separate native-tool check, not part of the normal test percentage.
 
 Project process-entry adapters use the same execution region but return the integer main result modulo 256 as an exit status; void returns zero. They do not print an implicit result. Historical standalone/JIT adapters retain result printing.
+
+JSON primitives exchange serialized UTF-8 text and error results; the source `Json` wrapper is an ordinary Nerv struct. HTTP clients and WebSocket drivers are native runtime services. WebSocket IDs are validated registry keys, not pointer casts. Each event callback receives a nested execution region; its returned state is copied before the region is destroyed. The socket and owned state remain in the native driver, and callbacks must not retain their argument pointers through foreign embedding APIs. Ordinary outer-region allocations still retain their original lifetime semantics. See [networking](networking.md).
