@@ -1,0 +1,129 @@
+import nerv.core
+
+struct Vector<T>
+    values: []T
+    length: i64
+    fn len(self) -> i64 => self.length
+    fn get(self, index: i64) -> T
+        assert(index >= 0 and index < self.length)
+        self.values[index]
+    fn push(self, value: T) -> Vector<T>
+        let mut values = [value] * (self.length + 1)
+        for i in 0..self.length
+            values[i] = self.values[i]
+        Vector { values: values, length: self.length + 1 }
+    fn each(self, callback: fn(T) -> void) -> void
+        for i in 0..self.length
+            callback(self.values[i])
+
+fn vector<T>(seed: T) -> Vector<T> => Vector { values: [seed] * 0, length: 0 }
+
+fn string_equal(left: string, right: string) -> bool
+    nerv.string.len(left) == nerv.string.len(right) and nerv.string.contains(left, right) == 1
+
+struct Map<T>
+    keys: Vector<string>
+    values: Vector<T>
+    fn len(self) -> i64 => self.keys.length
+    fn get(self, key: string) -> Option<T>
+        let mut found: Option<T> = None()
+        for i in 0..self.keys.length
+            if string_equal(self.keys:get(i), key)
+                found = Some(self.values:get(i))
+            else
+                assert(true)
+        found
+    fn insert(self, key: string, value: T) -> Map<T>
+        let mut keys = [key] * (self.keys.length + 1)
+        let mut values = [value] * (self.keys.length + 1)
+        let mut replaced = false
+        for i in 0..self.keys.length
+            keys[i] = self.keys:get(i)
+            if string_equal(keys[i], key)
+                values[i] = value
+                replaced = true
+            else
+                values[i] = self.values:get(i)
+        let length = if replaced
+            self.keys.length
+        else
+            self.keys.length + 1
+        Map { keys: Vector { values: keys, length: length }, values: Vector { values: values, length: length } }
+
+fn map<T>(seed: T) -> Map<T> => Map { keys: vector(""), values: vector(seed) }
+
+struct Set
+    entries: Map<bool>
+    fn len(self) -> i64 => self.entries:len()
+    fn contains(self, key: string) -> bool => option_or(self.entries:get(key), false)
+    fn insert(self, key: string) -> Set => Set { entries: self.entries:insert(key, true) }
+
+fn set() -> Set => Set { entries: map(false) }
+
+struct IoError
+    operation: string
+    path: string
+    message: string
+
+fn read_text(path: string) -> Result<string, IoError>
+    let response = nerv.io.read_text(path)
+    if nerv.string.len(response[1]) == 0
+        Ok(response[0])
+    else
+        Err(IoError { operation: "read", path: path, message: response[1] })
+
+fn write_text(path: string, contents: string) -> Result<i64, IoError>
+    let error = nerv.io.write_text(path, contents)
+    if nerv.string.len(error) == 0
+        Ok(nerv.string.len(contents))
+    else
+        Err(IoError { operation: "write", path: path, message: error })
+
+fn create_directory(path: string) -> Result<i64, IoError>
+    let error = nerv.io.create_directory(path)
+    if nerv.string.len(error) == 0
+        Ok(0)
+    else
+        Err(IoError { operation: "mkdir", path: path, message: error })
+
+fn list_directory(path: string) -> Result<[]string, IoError>
+    let response = nerv.io.list_directory(path)
+    if nerv.string.len(response[0]) == 0
+        let mut values = [""] * (nerv.arrays.len(response) - 1)
+        for i in 0..nerv.arrays.len(values)
+            values[i] = response[i + 1]
+        Ok(values)
+    else
+        Err(IoError { operation: "list", path: path, message: response[0] })
+
+fn read_stdin() -> Result<string, IoError>
+    let response = nerv.io.read_stdin()
+    if nerv.string.len(response[1]) == 0
+        Ok(response[0])
+    else
+        Err(IoError { operation: "stdin", path: "", message: response[1] })
+
+fn environment(name: string) -> Option<string>
+    let response = nerv.io.environment(name)
+    if nerv.string.len(response[1]) == 0
+        Some(response[0])
+    else
+        None()
+
+fn arguments() -> []string => nerv.io.arguments()
+fn stderr(message: string) -> void => nerv.io.stderr(message)
+fn now_ms() -> i64 => nerv.io.now_ms()
+fn sleep_ms(duration: i64) -> void => nerv.io.sleep_ms(duration)
+fn random_below(limit: i64) -> i64 => nerv.random(limit)
+
+struct Duration
+    milliseconds: i64
+
+fn duration_ms(milliseconds: i64) -> Duration
+    assert(milliseconds >= 0)
+    Duration { milliseconds: milliseconds }
+
+fn sleep(duration: Duration) -> void => sleep_ms(duration.milliseconds)
+
+fn assert_equal<T>(actual: T, expected: T) -> void => assert(actual == expected)
+fn assert_string_equal(actual: string, expected: string) -> void => assert(string_equal(actual, expected))

@@ -1,0 +1,85 @@
+name: Compiler release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tools -p test_package_release.py
+      - run: cargo fetch --locked
+      - name: Build and test Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          . .\tools\setup-llvm.ps1
+          cargo test --locked --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo build --locked --release -p nerv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and test macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install zstd
+          source tools/setup-llvm.sh
+          setup_llvm
+          cargo test --locked --workspace
+          cargo build --locked --release -p nerv
+      - name: Package
+        shell: bash
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("crates/nerv-cli/Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo 'Release tag must match the compiler package version' >&2
+            exit 1
+          fi
+          python tools/package-release.py --version "$version" --target '${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compiler-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: compiler-*
+          merge-multiple: true
+          path: dist
+      - name: Publish compiler archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --prerelease --title "Nerv $TAG" --notes 'Alpha compiler. See the bundled installation instructions, project tooling documentation, and checksums. Native build tools are required to compile applications.'
+          fi
+          gh release upload "$TAG" dist/* --clobber

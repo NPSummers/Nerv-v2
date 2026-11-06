@@ -36,3 +36,5 @@ See the [benchmark methodology](../time-release/README.md) for executable paths,
 python3 -m unittest discover -s tools -p 'test_compare_binaries.py'
 cargo test --locked --manifest-path time-release/Cargo.toml
 ```
+
+Project commands (`new`, `run`, `build`, `check`, `test`, `fmt`) are forwarded by the root launchers from the caller's working directory. See [project tooling](../docs/projects.md). `tools/package-release.py` builds a redistributable archive from an already-built release compiler, and `tools/install.ps1` / `tools/install.sh` verify and install a downloaded archive without editing PATH. See [installation](../docs/installation.md).

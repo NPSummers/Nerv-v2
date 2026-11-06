@@ -1,0 +1,17 @@
+import nerv.std
+
+fn main() -> i64
+    let values = vector(0):push(20):push(22)
+    assert(values:len() == 2)
+    let lookup = map(0):insert("answer", 42)
+    assert(option_or(lookup:get("answer"), 0) == 42)
+    assert(option_or(lookup:get("missing"), 7) == 7)
+    let names = set():insert("Nerv"):insert("Nerv"):insert("Rust")
+    assert(names:len() == 2)
+    assert(names:contains("Nerv"))
+    assert(not names:contains("missing"))
+    assert(now_ms() > 0)
+    sleep_ms(0)
+    assert(random_below(1) == 0)
+    assert(nerv.arrays.len(arguments()) > 0)
+    values:get(0) + values:get(1)

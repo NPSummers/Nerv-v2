@@ -36,7 +36,7 @@ See [integer ranges and loop optimization](optimization.md) for proven bounds-ch
 
 The CLI build script compiles the dependency-free Rust runtime into a native static archive and embeds it in the compiler. It also records the native link libraries reported by that Rust toolchain. A later `nerv build` extracts that archive temporarily and links it with the generated object. No Cargo, Rust compiler, source checkout, runtime archive installation, or LLVM is needed **to run the resulting application**. Native system libraries and a compatible OS/architecture are still required.
 
-The shared [runtime ABI](runtime-abi.md) enters an execution region, runs the entry function, prints its result (zero for void), and cleans up. An integer main result is output, not a process exit status: `fn main() -> i64 => 7` prints `7` and exits 0. Runtime failures match JIT stderr and exit 1.
+The historical file-based build path uses the shared [runtime ABI](runtime-abi.md) to enter an execution region, run the entry function, print its result (zero for void), and clean up. An integer main result is output, not a process exit status: `fn main() -> i64 => 7` prints `7` and exits 0. Runtime failures match JIT stderr and exit 1. Project builds and `nerv run` instead return the integer main result modulo 256 as the process exit status (void returns 0), with no implicit printed result. See [project commands](projects.md).
 
 ## Host build prerequisites
 

@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14-arm64, windows-2022]
+        os: [macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14-arm64, windows-2022]
+        os: [macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/download-artifact@v4
@@ -78,6 +78,7 @@ jobs:
       - name: Test benchmark tooling without running the large workload
         run: |
           python3 -m unittest discover -s tools -p 'test_compare_binaries.py'
+          python3 -m unittest discover -s tools -p 'test_package_release.py'
           cargo test --locked --manifest-path time-release/Cargo.toml
 
   memory:

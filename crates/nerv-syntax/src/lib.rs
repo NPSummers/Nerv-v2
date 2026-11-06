@@ -32,6 +32,7 @@ pub struct Import {
 pub struct Function {
     pub span: Span,
     pub name: String,
+    pub generics: Vec<GenericParameter>,
     pub params: Vec<Parameter>,
     pub result: Type,
     pub body: Vec<Statement>,
@@ -43,6 +44,7 @@ pub struct Function {
 pub struct Struct {
     pub span: Span,
     pub name: String,
+    pub generics: Vec<GenericParameter>,
     pub implements: Option<String>,
     pub fields: Vec<StructField>,
     pub methods: Vec<Function>,
@@ -63,6 +65,7 @@ pub struct StructField {
 pub struct Enum {
     pub span: Span,
     pub name: String,
+    pub generics: Vec<GenericParameter>,
     pub variants: Vec<EnumVariant>,
     pub line: usize,
     pub column: usize,
@@ -106,11 +109,22 @@ pub struct Parameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericParameter {
+    pub name: String,
+    pub constraint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Void,
     Bool,
     Int,
+    Integer {
+        bits: u32,
+        signed: bool,
+    },
     Float,
+    Float32,
     String,
     Array(Box<Type>),
     Function {
@@ -118,6 +132,31 @@ pub enum Type {
         result: Box<Type>,
     },
     Named(String),
+    Applied {
+        name: String,
+        args: Vec<Type>,
+    },
+}
+
+pub fn numeric_type(name: &str) -> Option<Type> {
+    Some(match name {
+        "i64" => Type::Int,
+        "f64" => Type::Float,
+        "f32" => Type::Float32,
+        "isize" => Type::Integer {
+            bits: usize::BITS,
+            signed: true,
+        },
+        "usize" => Type::Integer {
+            bits: usize::BITS,
+            signed: false,
+        },
+        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "u64" => Type::Integer {
+            bits: name[1..].parse().unwrap(),
+            signed: name.starts_with('i'),
+        },
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,9 +443,34 @@ impl<'source> Parser<'source> {
         Ok(module)
     }
 
+    fn generic_parameters(&mut self) -> Result<Vec<GenericParameter>, ParseError> {
+        let mut params = Vec::new();
+        if !self.consume(TokenKind::Lt) {
+            return Ok(params);
+        }
+        loop {
+            let name = self.ident()?;
+            if params.iter().any(|p: &GenericParameter| p.name == name) {
+                return Err(self.error("duplicate generic parameter"));
+            }
+            let constraint = if self.consume(TokenKind::Colon) {
+                Some(self.ident()?)
+            } else {
+                None
+            };
+            params.push(GenericParameter { name, constraint });
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::Gt)?;
+        Ok(params)
+    }
+
     fn struct_decl(&mut self) -> Result<Struct, ParseError> {
         let start = self.expect(TokenKind::Struct)?;
         let name = self.ident()?;
+        let generics = self.generic_parameters()?;
         let implements = if self.consume(TokenKind::Implements) {
             Some(self.ident()?)
         } else {
@@ -443,6 +507,7 @@ impl<'source> Parser<'source> {
         Ok(Struct {
             span: self.span_from(start.span.start),
             name,
+            generics,
             implements,
             fields,
             methods,
@@ -510,6 +575,7 @@ impl<'source> Parser<'source> {
     fn enum_decl(&mut self) -> Result<Enum, ParseError> {
         let start = self.expect(TokenKind::Enum)?;
         let name = self.ident()?;
+        let generics = self.generic_parameters()?;
         self.expect(TokenKind::Newline)?;
         self.expect(TokenKind::Indent)?;
         let mut variants = Vec::new();
@@ -543,6 +609,7 @@ impl<'source> Parser<'source> {
         Ok(Enum {
             span: self.span_from(start.span.start),
             name,
+            generics,
             variants,
             line: start.line,
             column: start.column,
@@ -556,6 +623,11 @@ impl<'source> Parser<'source> {
     ) -> Result<Function, ParseError> {
         let start = self.expect(TokenKind::Fn)?;
         let name = self.ident()?;
+        let generics = self.generic_parameters()?;
+        if receiver.is_some() && !generics.is_empty() {
+            return Err(self.error("generic method declarations are not supported"));
+        }
+
         self.expect(TokenKind::LParen)?;
         let mut params = Vec::new();
         if !self.at(TokenKind::RParen) {
@@ -608,6 +680,7 @@ impl<'source> Parser<'source> {
         Ok(Function {
             span: self.span_from(start.span.start),
             name,
+            generics,
             params,
             result,
             body,
@@ -627,6 +700,7 @@ impl<'source> Parser<'source> {
         Ok(Function {
             span: self.span_from(token.span.start),
             name: format!("{prefix}_{}_{}", token.line, token.column),
+            generics: Vec::new(),
             params: Vec::new(),
             result: Type::Void,
             body,
@@ -1053,13 +1127,27 @@ impl<'source> Parser<'source> {
             return Ok(Type::Array(Box::new(element)));
         }
         let name = self.ident()?;
+        if self.consume(TokenKind::Lt) {
+            let mut args = Vec::new();
+            loop {
+                args.push(self.ty()?);
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Gt)?;
+            return Ok(Type::Applied { name, args });
+        }
+
         Ok(match name.as_str() {
             "void" => Type::Void,
             "bool" => Type::Bool,
-            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
-                Type::Int
+            "i64" => Type::Int,
+            "f64" => Type::Float,
+            "f32" => Type::Float32,
+            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
+                numeric_type(&name).unwrap()
             }
-            "f32" | "f64" => Type::Float,
             "string" => Type::String,
             _ => Type::Named(name),
         })

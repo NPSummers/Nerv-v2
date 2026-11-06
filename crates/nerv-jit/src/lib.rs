@@ -125,6 +125,30 @@ fn initialize_native() -> Result<(), Error> {
     Ok(())
 }
 
+pub fn host_cpu_identity() -> Result<String, String> {
+    unsafe {
+        let name = llvm_sys::target_machine::LLVMGetHostCPUName();
+        let features = llvm_sys::target_machine::LLVMGetHostCPUFeatures();
+        if name.is_null() || features.is_null() {
+            if !name.is_null() {
+                llvm_sys::core::LLVMDisposeMessage(name);
+            }
+            if !features.is_null() {
+                llvm_sys::core::LLVMDisposeMessage(features);
+            }
+            return Err("could not identify host CPU".into());
+        }
+        let identity = format!(
+            "{}|{}",
+            CStr::from_ptr(name).to_string_lossy(),
+            CStr::from_ptr(features).to_string_lossy()
+        );
+        llvm_sys::core::LLVMDisposeMessage(name);
+        llvm_sys::core::LLVMDisposeMessage(features);
+        Ok(identity)
+    }
+}
+
 pub fn run_main(program: &CheckedProgram) -> Result<i64, Error> {
     let _lock = JIT_LOCK
         .lock()
@@ -140,6 +164,19 @@ pub fn run_main(program: &CheckedProgram) -> Result<i64, Error> {
 
 pub fn run_tests(program: &CheckedProgram) -> Result<usize, Error> {
     run_group(program, program.tests())
+}
+
+pub fn run_tests_in_source(
+    program: &CheckedProgram,
+    source: nerv_sema::ir::SourceId,
+) -> Result<usize, Error> {
+    let functions = program
+        .tests()
+        .iter()
+        .copied()
+        .filter(|id| program.function(*id).span.source == source)
+        .collect::<Vec<_>>();
+    run_group(program, &functions)
 }
 
 pub fn run_benches(program: &CheckedProgram) -> Result<usize, Error> {

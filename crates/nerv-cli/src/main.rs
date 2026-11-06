@@ -6,6 +6,8 @@ use nerv_sema::check_path;
 use nerv_syntax::{SourceFile, SourceId, SourceMap, Span, parse};
 
 mod build;
+mod format;
+mod project;
 
 fn report_backend_error(error: nerv_jit::Error, sources: &SourceMap) {
     if let Some(span) = error.span {
@@ -29,9 +31,39 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    if path == "build" {
-        return build::command(args);
+    let remaining: Vec<_> = args.collect();
+    if path == "--help" || path == "-h" {
+        println!(
+            "nerv new [--lib] PATH\nnerv run|build|check|test|fmt [file.nerv] [options]\nnerv <file.nerv> [--lex|--parse|--check|--run|--test|--bench]\nRun nerv COMMAND --help for command options."
+        );
+        return ExitCode::SUCCESS;
     }
+    if path == "--version" || path == "-V" {
+        println!(
+            "nerv {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("NERV_BUILD_TARGET")
+        );
+        return ExitCode::SUCCESS;
+    }
+    if path == "build"
+        && remaining.iter().any(|p| {
+            std::path::Path::new(p)
+                .extension()
+                .is_some_and(|e| e == "nerv")
+        })
+    {
+        return build::command(remaining);
+    }
+    if let Some(command @ ("new" | "run" | "build" | "check" | "test" | "fmt" | "__test")) =
+        path.to_str()
+    {
+        return project::command(command, remaining);
+    }
+    if remaining.is_empty() {
+        return project::command("run", vec![path]);
+    }
+    let mut args = remaining.into_iter();
     let mode = args.next().map(|arg| arg.to_string_lossy().into_owned());
     if args.next().is_some() {
         eprintln!(

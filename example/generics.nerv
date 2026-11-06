@@ -1,0 +1,49 @@
+trait Read
+    fn read(self) -> i64
+
+struct Value implements Read
+    number: i64
+    fn read(self) -> i64 => self.number
+
+fn read_value<T: Read>(value: T) -> i64 => value:read()
+
+struct Box<T>
+    value: T
+    fn get(self) -> T => self.value
+
+enum Option<T>
+    Some(T)
+    None
+
+enum Result<T, E>
+    Ok(T)
+    Err(E)
+
+fn identity<T>(value: T) -> T => value
+fn wrap<T>(value: T) -> Box<T> => Box { value: value }
+fn present<T>(value: T) -> Option<T> => Some(value)
+fn absent() -> Option<i64> => None()
+fn success(value: i64) -> Result<i64, string> => Ok(value)
+
+fn unwrap<T>(option: Option<T>, fallback: T) -> T
+    match option
+        Some(value) => value
+        None => fallback
+
+fn main() -> i64
+    let text = wrap("hello")
+    assert(nerv.string.len(text:get()) == 5)
+    assert(identity(true))
+    assert(read_value(wrap(Value { number: 42 }):get()) == 42)
+    let mut boxes = [wrap("hello"), wrap("world")]
+    boxes[1] = wrap("there")
+    assert(nerv.string.len(boxes[1]:get()) == 5)
+    let repeated = [wrap("hello")] * 3
+    assert(nerv.string.len(repeated[2]:get()) == 5)
+    let nested = [[true, false], [false, true]]
+    assert(nested[1][1])
+    let value = unwrap(present(40), 0)
+    let fallback = unwrap(absent(), 2)
+    match success(value + fallback)
+        Ok(answer) => answer
+        Err(message) => 0

@@ -515,3 +515,18 @@ fn rejected_duplicate_modules_do_not_double_free_llvm_owned_memory() {
     assert!(jit.add_module(duplicate).is_err());
     assert_eq!(jit.run(&symbol(program.main().unwrap()), true).unwrap(), 42);
 }
+
+#[test]
+fn matches_compound_enum_payloads() {
+    assert_eq!(run(include_str!("../../../example/enum-payloads.nerv")), 42);
+}
+
+#[test]
+fn specializes_generic_functions_structs_and_enums() {
+    assert_eq!(run(include_str!("../../../example/generics.nerv")), 42);
+}
+
+#[test]
+fn runs_distinct_numeric_types_and_conversions() {
+    assert_eq!(run(include_str!("../../../example/numeric-types.nerv")), 42);
+}

@@ -1,4 +1,4 @@
 enum Payload
-    Text(string)
+    Text(void)
 
 fn main() -> i64 => 0

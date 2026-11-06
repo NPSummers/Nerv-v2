@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
 };
@@ -10,6 +10,7 @@ use nerv_syntax::{
     Struct as StructDecl, Type, UnaryOp,
 };
 
+mod generics;
 pub mod ir;
 mod resolve;
 
@@ -20,7 +21,7 @@ pub struct Program {
     pub sources: SourceMap,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LoadedModule {
     pub source: SourceId,
     pub path: PathBuf,
@@ -138,6 +139,15 @@ impl Errors {
 }
 
 pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Errors> {
+    check_path_with_imports(path, &ImportPaths::new())
+}
+
+pub type ImportPaths = BTreeMap<PathBuf, BTreeMap<String, PathBuf>>;
+
+pub fn check_path_with_imports(
+    path: impl AsRef<Path>,
+    imports: &ImportPaths,
+) -> Result<Program, Errors> {
     let mut modules = Vec::new();
     let mut visited = HashSet::new();
     let mut loading = HashSet::new();
@@ -148,6 +158,7 @@ pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Errors> {
         &mut visited,
         &mut loading,
         &mut sources,
+        imports,
     )
     .map_err(|error| Errors::from(error).with_sources(&sources))?;
     let ir = check_loaded(&modules).map_err(|errors| errors.with_sources(&sources))?;
@@ -159,8 +170,9 @@ pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Errors> {
 }
 
 fn check_loaded(modules: &[LoadedModule]) -> Result<ir::CheckedProgram, Errors> {
-    check(modules)?;
-    resolve::resolve(modules).map_err(Into::into)
+    let modules = generics::expand(modules)?;
+    check(&modules)?;
+    resolve::resolve(&modules).map_err(Into::into)
 }
 
 /// Check already-loaded syntax modules for embedding and compiler unit tests.
@@ -184,6 +196,7 @@ fn load(
     visited: &mut HashSet<PathBuf>,
     loading: &mut HashSet<PathBuf>,
     sources: &mut SourceMap,
+    imports: &ImportPaths,
 ) -> Result<(), Error> {
     let path = path
         .canonicalize()
@@ -201,17 +214,48 @@ fn load(
         syntax::parse_source(&source, id).map_err(|error| frontend_error(&path, id, error))?;
     for import in &module.imports {
         if import.path.first().is_some_and(|part| part == "nerv") {
+            if import.path.len() == 2 && matches!(import.path[1].as_str(), "core" | "std") {
+                load_standard(&import.path[1], modules, visited, sources)?;
+            }
             continue;
         }
-        let mut target = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        for part in &import.path {
-            target.push(part);
+        let package = imports
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count());
+        let dependency = package.and_then(|(_, aliases)| aliases.get(&import.path[0]));
+        let mut target = if let Some(entry) = dependency {
+            if import.path.len() == 1 {
+                entry.clone()
+            } else {
+                let mut target = entry.parent().unwrap().to_path_buf();
+                for part in &import.path[1..] {
+                    target.push(part);
+                }
+                target.set_extension("nerv");
+                target
+            }
+        } else {
+            let mut target = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            for part in &import.path {
+                target.push(part);
+            }
+            target.set_extension("nerv");
+            target
+        };
+        if !target.exists() && dependency.is_none() {
+            if let Some((root, _)) = package {
+                target = root.join("src");
+                for part in &import.path {
+                    target.push(part);
+                }
+                target.set_extension("nerv");
+            }
         }
-        target.set_extension("nerv");
-        load(&target, modules, visited, loading, sources).map_err(|mut error| {
+        load(&target, modules, visited, loading, sources, imports).map_err(|mut error| {
             if error.span.is_none() && !sources.files.iter().any(|file| file.path == error.path) {
                 error.path = path.clone();
                 error = error
@@ -230,6 +274,35 @@ fn load(
     visited.insert(path.clone());
     modules.push(LoadedModule {
         source: id,
+        path,
+        module,
+    });
+    Ok(())
+}
+
+fn load_standard(
+    name: &str,
+    modules: &mut Vec<LoadedModule>,
+    visited: &mut HashSet<PathBuf>,
+    sources: &mut SourceMap,
+) -> Result<(), Error> {
+    let path = PathBuf::from(format!("<stdlib>/{name}.nerv"));
+    if !visited.insert(path.clone()) {
+        return Ok(());
+    }
+    if name == "std" {
+        load_standard("core", modules, visited, sources)?;
+    }
+    let text = if name == "core" {
+        include_str!("../../../stdlib/core.nerv")
+    } else {
+        include_str!("../../../stdlib/std.nerv")
+    };
+    let source = sources.add(path.clone(), text.to_owned());
+    let module =
+        syntax::parse_source(text, source).map_err(|error| frontend_error(&path, source, error))?;
+    modules.push(LoadedModule {
+        source,
         path,
         module,
     });
@@ -256,6 +329,17 @@ fn check(modules: &[LoadedModule]) -> Result<(), Errors> {
             }
         }
         for enumeration in &loaded.module.enums {
+            if enumeration.variants.is_empty() {
+                return Err(error_at(
+                    &loaded.path,
+                    enumeration.line,
+                    enumeration.column,
+                    "enum needs at least one variant",
+                )
+                .at(enumeration.span)
+                .into());
+            }
+
             let names: Vec<String> = enumeration
                 .variants
                 .iter()
@@ -624,27 +708,28 @@ fn expr_type_inner(
         Expr::String(_) => Ok(Type::String),
         Expr::Bool(_) => Ok(Type::Bool),
         Expr::Array(elements) => {
+            let element = elements
+                .first()
+                .map(|e| expr_type(path, e, values, functions, structs, variants))
+                .transpose()?
+                .unwrap_or(Type::Int);
             for value in elements {
-                if expr_type(path, value, values, functions, structs, variants)? != Type::Int {
+                if expr_type(path, value, values, functions, structs, variants)? != element {
                     return Err(
-                        error_at(path, 0, 0, "arrays currently require i64 values").at(value.span)
+                        error_at(path, 0, 0, "array elements must have the same type")
+                            .at(value.span),
                     );
                 }
             }
-            Ok(Type::Array(Box::new(Type::Int)))
+            Ok(Type::Array(Box::new(element)))
         }
         Expr::ArrayRepeat { value, length } => {
-            if expr_type(path, value, values, functions, structs, variants)? != Type::Int
-                || expr_type(path, length, values, functions, structs, variants)? != Type::Int
-            {
-                return Err(error_at(
-                    path,
-                    0,
-                    0,
-                    "array values and lengths must be integers",
-                ));
+            if expr_type(path, length, values, functions, structs, variants)? != Type::Int {
+                return Err(error_at(path, 0, 0, "array length must be i64").at(length.span));
             }
-            Ok(Type::Array(Box::new(Type::Int)))
+            Ok(Type::Array(Box::new(expr_type(
+                path, value, values, functions, structs, variants,
+            )?)))
         }
         Expr::Name(name) => values
             .get(name.as_str())
@@ -830,7 +915,8 @@ fn expr_type_inner(
         Expr::Unary { op, value } => {
             let ty = expr_type(path, value, values, functions, structs, variants)?;
             match (op, &ty) {
-                (UnaryOp::Neg, Type::Int | Type::Float) | (UnaryOp::Not, Type::Bool) => Ok(ty),
+                (UnaryOp::Neg, Type::Int | Type::Integer { .. } | Type::Float | Type::Float32)
+                | (UnaryOp::Not, Type::Bool) => Ok(ty),
                 _ => Err(error_at(path, 0, 0, "invalid unary operation")),
             }
         }
@@ -844,9 +930,13 @@ fn expr_type_inner(
                 }
                 BinaryOp::Eq | BinaryOp::NotEq if left == right => {
                     let supported = match &left {
-                        Type::Int | Type::Float | Type::Bool | Type::String | Type::Array(_) => {
-                            true
-                        }
+                        Type::Int
+                        | Type::Integer { .. }
+                        | Type::Float
+                        | Type::Float32
+                        | Type::Bool
+                        | Type::String
+                        | Type::Array(_) => true,
                         Type::Named(name) => {
                             let members = variants
                                 .values()
@@ -1074,10 +1164,42 @@ fn callee_name(expr: &SpannedExpr) -> Option<String> {
 }
 
 fn runtime_type(name: &str, args: &[Type]) -> Option<Option<Type>> {
-    Some(match (name, args) {
-        ("print" | "println", [Type::Int | Type::Float | Type::Bool | Type::String]) => {
-            Some(Type::Void)
+    if let Some(ty) = syntax::numeric_type(name) {
+        return Some(if args.len() == 1 && numeric(&args[0]) {
+            Some(ty)
+        } else {
+            None
+        });
+    }
+    let strings = || Type::Array(Box::new(Type::String));
+    match (name, args) {
+        (
+            "nerv.io.read_text" | "nerv.io.list_directory" | "nerv.io.environment",
+            [Type::String],
+        ) => return Some(Some(strings())),
+        ("nerv.io.arguments" | "nerv.io.read_stdin", []) => return Some(Some(strings())),
+        ("nerv.io.write_text", [Type::String, Type::String])
+        | ("nerv.io.create_directory", [Type::String]) => return Some(Some(Type::String)),
+        ("nerv.io.stderr", [Type::String]) | ("nerv.io.sleep_ms", [Type::Int]) => {
+            return Some(Some(Type::Void));
         }
+        ("nerv.io.now_ms", []) | ("nerv.arrays.len", [Type::Array(_)]) => {
+            return Some(Some(Type::Int));
+        }
+        _ => {}
+    }
+    Some(match (name, args) {
+        (
+            "print" | "println",
+            [
+                Type::Int
+                | Type::Integer { .. }
+                | Type::Float
+                | Type::Float32
+                | Type::Bool
+                | Type::String,
+            ],
+        ) => Some(Type::Void),
         ("assert", [Type::Bool]) => Some(Type::Void),
         ("i64", [Type::Int | Type::Float]) => Some(Type::Int),
         ("f64", [Type::Int | Type::Float]) => Some(Type::Float),
@@ -1375,7 +1497,10 @@ fn block_type(
 }
 
 fn numeric(ty: &Type) -> bool {
-    matches!(ty, Type::Int | Type::Float)
+    matches!(
+        ty,
+        Type::Int | Type::Integer { .. } | Type::Float | Type::Float32
+    )
 }
 
 fn implements(actual: &Type, expected: &Type, implementations: &HashSet<(&str, &str)>) -> bool {

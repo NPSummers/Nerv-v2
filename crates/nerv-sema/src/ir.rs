@@ -1,6 +1,6 @@
 //! Checked, resolved operations shared by compiler backends. No syntax expressions
 //! or unresolved source names occur in this representation.
-pub use nerv_syntax::{BinaryOp, Span, UnaryOp};
+pub use nerv_syntax::{BinaryOp, SourceId, Span, UnaryOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolId(pub u32);
@@ -10,7 +10,12 @@ pub enum Type {
     Void,
     Bool,
     Int,
+    Integer {
+        bits: u32,
+        signed: bool,
+    },
     Float,
+    Float32,
     String,
     Array(Box<Type>),
     Function {
@@ -28,11 +33,20 @@ pub struct CheckedProgram {
     pub(crate) structs: Vec<Struct>,
     pub(crate) enums: Vec<Enum>,
     pub(crate) main: Option<SymbolId>,
+    pub(crate) process_entry: bool,
     pub(crate) tests: Vec<SymbolId>,
     pub(crate) benches: Vec<SymbolId>,
 }
 
 impl CheckedProgram {
+    pub fn set_process_entry(&mut self, enabled: bool) {
+        self.process_entry = enabled;
+    }
+
+    pub fn process_entry(&self) -> bool {
+        self.process_entry
+    }
+
     pub fn functions(&self) -> &[Function] {
         &self.functions
     }
@@ -234,6 +248,7 @@ pub enum CallTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conversion {
+    Numeric,
     Identity,
     IntToFloat,
     FloatToInt,
@@ -478,10 +493,18 @@ mod tests {
                 "fn bad(callback: fn(void) -> i64) -> void\n    println(1)\n",
                 "parameter cannot have type void",
             ),
-            ("enum Bad\n    Text(string)\n", "at most one i64"),
             (
-                "fn bad(values: []f64) -> void\n    println(1)\n",
-                "only i64 arrays",
+                "enum Bad\n    Text(void)\n",
+                "payload cannot have type void",
+            ),
+            ("enum Bad\n    Next(Bad)\n", "infinite size"),
+            (
+                "struct A\n    next: B\nenum B\n    Next(A)\n",
+                "infinite size",
+            ),
+            (
+                "fn bad(values: []void) -> void\n    println(1)\n",
+                "array element cannot have type void",
             ),
             (
                 "fn main(value: i64) -> i64 => value\n",

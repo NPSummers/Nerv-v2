@@ -1,4 +1,4 @@
-backend.nerv:2:5: error: enum payloads currently require at most one i64 value
+backend.nerv:2:5: error: enum payload cannot have type void
   |
-2 |     Text(string)
-  |     ^^^^^^^^^^^^
+2 |     Text(void)
+  |     ^^^^^^^^^^

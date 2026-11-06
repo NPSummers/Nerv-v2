@@ -130,6 +130,27 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     });
     let output = env::current_dir().map_err(|e| e.to_string())?.join(output);
     let program = check_path(&source).map_err(|error| error.to_string())?;
+    compile_program(program, &output, mode, cpu, object_only)
+}
+
+pub(crate) fn compile_program(
+    program: nerv_sema::Program,
+    output: &Path,
+    mode: BuildMode,
+    cpu: CpuTarget,
+    object_only: bool,
+) -> Result<(), String> {
+    compile_cached(program, output, mode, cpu, object_only, None)
+}
+
+pub(crate) fn compile_cached(
+    program: nerv_sema::Program,
+    output: &Path,
+    mode: BuildMode,
+    cpu: CpuTarget,
+    object_only: bool,
+    cache: Option<(&Path, bool)>,
+) -> Result<(), String> {
     if program
         .sources
         .files
@@ -150,16 +171,23 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     } else {
         "program.o"
     });
-    emit_object_for_cpu(&program.ir, &object, mode, cpu).map_err(|error| {
-        if let Some(span) = error.span {
-            program
-                .sources
-                .get(span.source)
-                .render(span, &error.message, &[])
-        } else {
-            error.to_string()
+    if let Some((cached, true)) = cache {
+        fs::copy(cached, &object).map_err(|e| e.to_string())?;
+    } else {
+        emit_object_for_cpu(&program.ir, &object, mode, cpu).map_err(|error| {
+            if let Some(span) = error.span {
+                program
+                    .sources
+                    .get(span.source)
+                    .render(span, &error.message, &[])
+            } else {
+                error.to_string()
+            }
+        })?;
+        if let Some((cached, _)) = cache {
+            crate::project::write_atomic(cached, &fs::read(&object).map_err(|e| e.to_string())?)?;
         }
-    })?;
+    }
     if object_only {
         fs::rename(&object, &output).map_err(|error| format!("could not save object: {error}"))?;
     } else {
@@ -195,7 +223,7 @@ fn build(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         fs::rename(&executable, &output)
             .map_err(|error| format!("could not save executable: {error}"))?;
     }
-    println!(
+    eprintln!(
         "Built {} ({}, CPU {})",
         output.display(),
         if mode == BuildMode::Debug {
@@ -220,7 +248,7 @@ fn parse_cpu(value: &std::ffi::OsStr) -> Result<CpuTarget, String> {
     }
 }
 
-fn linker() -> Result<Command, String> {
+pub(crate) fn linker() -> Result<Command, String> {
     if let Some(path) = env::var_os("NERV_LINKER") {
         return Ok(Command::new(path));
     }

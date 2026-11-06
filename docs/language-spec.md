@@ -45,11 +45,11 @@ fn main() -> i64
 
 ## 2. Integers and overflow
 
-The alpha core has **one integer representation: signed, two's-complement, 64-bit `i64`**, ranging from -9,223,372,036,854,775,808 through 9,223,372,036,854,775,807. Decimal integer literals use that representation; underscores are ignored within numeric tokens. Out-of-range literals are compile errors, including positive 9,223,372,036,854,775,808. The negative minimum is accepted directly.
+Integers have distinct widths and signedness: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, and `u64`. `isize` and `usize` use the host pointer width. Unsuffixed integer literals have type `i64`; use explicit conversions to construct other widths. Out-of-range i64 literals are rejected, except that the negative minimum is accepted directly.
 
-For compatibility with existing programs, `i8`, `i16`, `i32`, `u8`, `u16`, `u32`, `u64`, `isize`, and `usize` are currently aliases for `i64`. **They do not provide smaller widths, unsigned arithmetic, or pointer-sized semantics.** Do not use their spelling to infer a layout or range. Distinct widths and signedness require a future language revision and compiler implementation, not just new documentation.
+Addition, subtraction, multiplication, and unary negation wrap at the operand width in every build mode. Signed division truncates toward zero and signed remainder has the dividend's sign. Unsigned division and comparisons interpret the bit pattern as nonnegative. Signed `MIN / -1` wraps to `MIN`; `MIN % -1` is zero. Division or remainder by zero fails at runtime.
 
-Addition, subtraction, multiplication, and unary negation wrap modulo 2^64 in all build modes. Division truncates toward zero; the remainder has the dividend's sign. `MIN / -1` wraps to `MIN`, and `MIN % -1` is zero. Integer division or remainder by zero is a runtime failure.
+Integer conversions truncate high bits when narrowing and sign-extend or zero-extend according to the source type when widening. Same-width conversions preserve bits. Mixed numeric types require explicit conversion in arithmetic, bindings, arguments, and returns.
 
 Example (`run:-9223372036854775808`):
 
@@ -98,9 +98,9 @@ fn main() -> i64 => 9223372036854775808
 
 ## 3. Floating-point values and conversions
 
-`f64` is IEEE 754 binary64; `f32` is currently an alias for it, not binary32. Floating-point literals may contain a decimal point or exponent. A literal that overflows binary64 is rejected. Arithmetic uses IEEE behavior without fast-math: division by zero can produce infinity or NaN. Comparisons with NaN are false except `!=`, which is true. No implicit integer/float conversion occurs in bindings, arithmetic, arguments, or return values.
+`f64` is IEEE 754 binary64 and `f32` is binary32. Unsuffixed floating literals have type `f64`; `f32(value)` rounds to binary32. Arithmetic uses IEEE behavior without fast-math. NaN comparisons are false except `!=`. Integer-to-float conversions respect signedness and round to the destination precision. Float widening preserves the value; narrowing rounds to binary32.
 
-`f64(integer)` explicitly converts an integer, rounding to the nearest representable binary64 value. `i64(float)` truncates toward zero and fails at runtime for NaN, infinity, or a value outside [-2^63, 2^63). Converting a value to its existing canonical type is an identity operation. Boolean and string conversions are not supported.
+Every numeric type name is an explicit conversion function. Float-to-integer conversions truncate toward zero and fail for NaN, infinity, or inputs outside the destination range (inclusive lower bound, exclusive upper bound). `i64(float)` retains the diagnostic `float is outside the i64 range`. Boolean and string conversions are unsupported.
 
 Example (`run:42`):
 
@@ -550,7 +550,7 @@ Strings contain UTF-8. Double-quoted literals accept Unicode text and escapes `\
 
 `nerv.string.len` counts UTF-8 bytes; `nerv.string.char_count` counts Unicode scalar values, not grapheme clusters. `nerv.string.char_at` uses a scalar-value index and returns its Unicode code point, or zero when absent. String slicing uses byte offsets and returns an empty string for invalid UTF-8 boundaries or reversed bounds, with offsets clamped to the string length. String-producing operations allocate a new immutable string in the execution region.
 
-Core arrays contain only `i64` elements. `[a, b]` allocates elements in source order; `[value] * length` evaluates the initializer once and fills the array. `[]i64` is an array-handle type; the legacy `[i64; N]` annotation currently denotes the same type and does not enforce a static length. Arrays have fixed length after construction. Generic, nested, floating-point, and string arrays are not supported.
+Core arrays contain elements of any single non-void type, including structs, enums, function values, and nested arrays. `[a, b]` allocates elements in source order; `[value] * length` evaluates the initializer once and fills the array. `[]T` is an array-handle type; the legacy `[i64; N]` annotation currently denotes the same type and does not enforce a static length. Arrays have fixed length after construction. Empty array literals default to `[]i64`.
 
 For strings and arrays, `==` and `!=` currently compare handle identity, not content. Equal contents in separately created allocations do not imply equality. Scalar comparisons compare values. Fieldless enums support equality within the same enum type. Struct, payload-enum, function, and void equality are rejected; aggregate structural equality is not part of this alpha core.
 
@@ -615,7 +615,7 @@ fn main() -> void
     let text = "\q"
 ```
 
-Example (`reject:arrays currently require i64 values`):
+Example (`run:0`):
 
 ```nerv
 fn main() -> void
@@ -624,4 +624,32 @@ fn main() -> void
 
 ## Compatibility boundary
 
-This specification deliberately records alpha limitations instead of presenting unimplemented features as complete. True width-specific numeric types, private modules, nested explicit returns, capturing closures, generic arrays, structural aggregate equality, and earlier reclamation of unreachable allocations are separate changes. Any revision must update the examples and conformance tests along with the compiler.
+This specification deliberately records alpha limitations instead of presenting unimplemented features as complete. Private modules, nested explicit returns, capturing closures, structural aggregate equality, and earlier reclamation of unreachable allocations are separate changes. Any revision must update the examples and conformance tests along with the compiler.
+
+## 12. Generics and recoverable errors
+
+Functions, structs, and enums declare parameters with `<T, E>`. Type arguments in annotations use `Box<i64>` or `Result<i64, string>`. Calls infer arguments from values and the immediate binding or return annotation. Inference does not search through arbitrary surrounding calls: bind an otherwise ambiguous fieldless constructor to an annotated variable first. Conflicting arguments and uninferred parameters are errors. Each concrete instantiation is compiled separately, with a limit of 256 specializations per program to diagnose expanding recursion.
+
+A parameter may require one trait, as in `fn read<T: Read>(value: T) -> i64 => value:read()`. The concrete type must declare that implementation. Generic struct methods inherit the struct's parameters. Unused generic bodies are checked when instantiated. Generic method declarations and generic trait declarations are not supported.
+
+Optional and result values are ordinary enums; use exhaustive `match` to supply defaults or propagate errors. Propagation is an explicit match whose error arm constructs the enclosing function's error variant. There is no implicit propagation or `?` operator. Runtime violations and allocation failure remain unrecoverable; recoverable application errors are values.
+
+Example (`run:42`):
+
+```nerv
+enum Option<T>
+    Some(T)
+    None
+fn fallback<T>(value: Option<T>, other: T) -> T
+    match value
+        Some(item) => item
+        None => other
+fn main() -> i64 => fallback(Some(42), 0)
+```
+
+Example (`reject:conflicting types`):
+
+```nerv
+fn first<T>(a: T, b: T) -> T => a
+fn main() -> i64 => first(1, true)
+```
