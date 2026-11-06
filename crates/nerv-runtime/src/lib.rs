@@ -249,6 +249,19 @@ pub extern "C" fn nerv_start_void(entry: extern "C" fn()) -> i32 {
     0
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_process_i64(entry: extern "C" fn() -> i64) -> i32 {
+    let _execution = Execution::new();
+    entry().rem_euclid(256) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nerv_process_void(entry: extern "C" fn()) -> i32 {
+    let _execution = Execution::new();
+    entry();
+    0
+}
+
 pub fn symbols() -> Vec<RuntimeSymbol> {
     let mut symbols = vec![
         RuntimeSymbol {

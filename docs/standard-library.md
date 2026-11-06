@@ -37,7 +37,7 @@ Assign the returned collection to retain updates, for example `values = values:p
 | `arguments()` | Argument strings including executable name. |
 | `environment(name)` | `Option<string>`; missing and non-Unicode values produce `None`. |
 
-Paths are relative to the process working directory. Directory names and process arguments that cannot be represented as Unicode use replacement characters. Standalone programs receive their own process arguments; JIT execution currently exposes the compiler process arguments. Dedicated program-argument parsing belongs to the project-tooling milestone.
+Paths are relative to the process working directory. Directory names and process arguments that cannot be represented as Unicode use replacement characters. Project applications and `nerv run` receive their own process arguments, with options after `--` forwarded unchanged. Historical JIT `--run` execution exposes the compiler process arguments. See [project tooling](projects.md).
 
 ## Strings, time, random values, and tests
 

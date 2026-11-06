@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
 };
@@ -139,6 +139,15 @@ impl Errors {
 }
 
 pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Errors> {
+    check_path_with_imports(path, &ImportPaths::new())
+}
+
+pub type ImportPaths = BTreeMap<PathBuf, BTreeMap<String, PathBuf>>;
+
+pub fn check_path_with_imports(
+    path: impl AsRef<Path>,
+    imports: &ImportPaths,
+) -> Result<Program, Errors> {
     let mut modules = Vec::new();
     let mut visited = HashSet::new();
     let mut loading = HashSet::new();
@@ -149,6 +158,7 @@ pub fn check_path(path: impl AsRef<Path>) -> Result<Program, Errors> {
         &mut visited,
         &mut loading,
         &mut sources,
+        imports,
     )
     .map_err(|error| Errors::from(error).with_sources(&sources))?;
     let ir = check_loaded(&modules).map_err(|errors| errors.with_sources(&sources))?;
@@ -186,6 +196,7 @@ fn load(
     visited: &mut HashSet<PathBuf>,
     loading: &mut HashSet<PathBuf>,
     sources: &mut SourceMap,
+    imports: &ImportPaths,
 ) -> Result<(), Error> {
     let path = path
         .canonicalize()
@@ -208,15 +219,43 @@ fn load(
             }
             continue;
         }
-        let mut target = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        for part in &import.path {
-            target.push(part);
+        let package = imports
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count());
+        let dependency = package.and_then(|(_, aliases)| aliases.get(&import.path[0]));
+        let mut target = if let Some(entry) = dependency {
+            if import.path.len() == 1 {
+                entry.clone()
+            } else {
+                let mut target = entry.parent().unwrap().to_path_buf();
+                for part in &import.path[1..] {
+                    target.push(part);
+                }
+                target.set_extension("nerv");
+                target
+            }
+        } else {
+            let mut target = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            for part in &import.path {
+                target.push(part);
+            }
+            target.set_extension("nerv");
+            target
+        };
+        if !target.exists() && dependency.is_none() {
+            if let Some((root, _)) = package {
+                target = root.join("src");
+                for part in &import.path {
+                    target.push(part);
+                }
+                target.set_extension("nerv");
+            }
         }
-        target.set_extension("nerv");
-        load(&target, modules, visited, loading, sources).map_err(|mut error| {
+        load(&target, modules, visited, loading, sources, imports).map_err(|mut error| {
             if error.span.is_none() && !sources.files.iter().any(|file| file.path == error.path) {
                 error.path = path.clone();
                 error = error

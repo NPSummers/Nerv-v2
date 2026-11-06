@@ -1,6 +1,6 @@
 //! Checked, resolved operations shared by compiler backends. No syntax expressions
 //! or unresolved source names occur in this representation.
-pub use nerv_syntax::{BinaryOp, Span, UnaryOp};
+pub use nerv_syntax::{BinaryOp, SourceId, Span, UnaryOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolId(pub u32);
@@ -33,11 +33,20 @@ pub struct CheckedProgram {
     pub(crate) structs: Vec<Struct>,
     pub(crate) enums: Vec<Enum>,
     pub(crate) main: Option<SymbolId>,
+    pub(crate) process_entry: bool,
     pub(crate) tests: Vec<SymbolId>,
     pub(crate) benches: Vec<SymbolId>,
 }
 
 impl CheckedProgram {
+    pub fn set_process_entry(&mut self, enabled: bool) {
+        self.process_entry = enabled;
+    }
+
+    pub fn process_entry(&self) -> bool {
+        self.process_entry
+    }
+
     pub fn functions(&self) -> &[Function] {
         &self.functions
     }

@@ -122,15 +122,17 @@ Implemented in the [small standard library](../docs/standard-library.md), embedd
 
 ## 9. Add project tooling
 
-- [ ] Introduce a project manifest and define the project layout.
-- [ ] Add `nerv new`, `nerv run`, `nerv build`, `nerv check`, and `nerv test`.
-- [ ] Preserve a simple way to run standalone source files.
-- [ ] Define program arguments and exit-code behavior.
-- [ ] Add deterministic dependency resolution and a lockfile.
-- [ ] Support local dependencies before adding remote packages or a registry.
-- [ ] Add build caching with correct invalidation.
-- [ ] Build a formatter and expose it through `nerv fmt`.
-- [ ] Publish installation instructions and compiler releases.
+- [x] Introduce a project manifest and define the project layout.
+- [x] Add `nerv new`, `nerv run`, `nerv build`, `nerv check`, and `nerv test`.
+- [x] Preserve a simple way to run standalone source files.
+- [x] Define program arguments and exit-code behavior.
+- [x] Add deterministic dependency resolution and a lockfile.
+- [x] Support local dependencies before adding remote packages or a registry.
+- [x] Add build caching with correct invalidation.
+- [x] Build a formatter and expose it through `nerv fmt`.
+- [x] Publish installation instructions and compiler releases.
+
+Implemented in [project tooling](../docs/projects.md) and [installation](../docs/installation.md): `Nerv.toml`, deterministic local `Nerv.lock`, project commands, object caching with fresh native linking, and a token-preserving formatter. Project applications use argument forwarding and process exit codes; historical file/JIT behavior remains available. The Windows x64 alpha compiler is packaged with LLVM and checksums; tag-based CI additionally packages Apple Silicon releases. Linux binary packaging and remote package registries remain deferred.
 
 **Done when:** another developer can create, build, test, and share a Nerv project without editing repository scripts.
 

@@ -33,3 +33,5 @@ bash ./tools/check-memory.sh
 Miri checks the safe core under strict provenance, including shared handles, repeated region cleanup, parent-region explicit release, and reentrant callbacks. Miri checks for invalid access and leaks; subprocess-only fatal-exit tests run in the normal Rust suite instead. The experimental integer-handle collection test is excluded from strict-provenance checking; it is still covered by normal tests. Miri does not execute JIT machine code. JIT tests separately validate compound returns, nested structs, shared arrays/strings, arithmetic failures, and repeated invocation cleanup.
 
 On macOS, a compiled example can also be checked with `leaks --atExit -- ./hello`. The local nested/shared-value example reports zero leaked bytes. This is a separate native-tool check, not part of the normal test percentage.
+
+Project process-entry adapters use the same execution region but return the integer main result modulo 256 as an exit status; void returns zero. They do not print an implicit result. Historical standalone/JIT adapters retain result printing.

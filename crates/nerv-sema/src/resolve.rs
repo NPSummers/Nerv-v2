@@ -80,6 +80,7 @@ pub(super) fn resolve(modules: &[LoadedModule]) -> Result<ir::CheckedProgram, Er
         structs: Vec::new(),
         enums: Vec::new(),
         main: None,
+        process_entry: false,
         tests: Vec::new(),
         benches: Vec::new(),
     };

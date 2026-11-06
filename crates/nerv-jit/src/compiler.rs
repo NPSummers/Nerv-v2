@@ -209,7 +209,13 @@ impl Compiler {
             unsafe { LLVMAppendBasicBlockInContext(self.context, function, c"entry".as_ptr()) };
         unsafe { LLVMPositionBuilderAtEnd(self.builder, block) };
         self.external("nerv_runtime_abi_v2", self.void_ty(), &[])?;
-        let runtime = if program.function(main).result == Type::Int {
+        let runtime = if program.process_entry() {
+            if program.function(main).result == Type::Int {
+                "nerv_process_i64"
+            } else {
+                "nerv_process_void"
+            }
+        } else if program.function(main).result == Type::Int {
             "nerv_start_i64"
         } else {
             "nerv_start_void"

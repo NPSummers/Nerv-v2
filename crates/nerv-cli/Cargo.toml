@@ -1,6 +1,6 @@
 [package]
 name = "nerv"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,6 +10,8 @@ nerv-jit = { path = "../nerv-jit" }
 nerv-lexer = { path = "../nerv-lexer" }
 nerv-sema = { path = "../nerv-sema" }
 nerv-syntax = { path = "../nerv-syntax" }
+sha2 = "=0.10.9"
+toml = "=0.8.23"
 
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "=0.1.13"

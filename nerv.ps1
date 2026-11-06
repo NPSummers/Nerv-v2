@@ -1,29 +1,24 @@
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $arguments = @($args)
-# Preserve the original named invocation as well as positional source paths.
 if ($arguments.Count -gt 0 -and $arguments[0] -eq '-Path') {
     $arguments = @($arguments | Select-Object -Skip 1)
 }
-if ($arguments.Count -eq 0) {
-    throw 'Usage: nerv.ps1 <file.nerv> | build <file.nerv> [-o output] [--debug|--release] [--cpu generic|native] [--emit-object]'
-}
-
-$isBuild = $arguments[0] -eq 'build'
-if (-not $isBuild) {
-    if ($arguments.Count -ne 1) { throw 'Running a source file accepts one path' }
+if ($arguments.Count -eq 0) { $arguments = @('--help') }
+$commands = @('new', 'run', 'build', 'check', 'test', 'fmt', '--help', '-h', '--version', '-V')
+if ($arguments[0] -notin $commands) {
     $path = [string]$arguments[0]
-    $target = if ([System.IO.Path]::IsPathRooted($path)) { $path } else { Join-Path $root $path }
-    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Nerv source file not found: $path" }
-    if ([System.IO.Path]::GetExtension($target) -ne '.nerv') { throw 'Nerv source files must use the .nerv extension' }
+    if (-not (Test-Path -LiteralPath $path) -and -not [System.IO.Path]::IsPathRooted($path)) { $path = Join-Path $root $path }
+    $arguments[0] = $path
+    if ($arguments.Count -eq 1) { $arguments += '--run' }
 }
-
-Push-Location $root
-try {
-    . (Join-Path $root 'tools\setup-llvm.ps1')
-    if ($isBuild) { & cargo run --quiet -p nerv -- @arguments }
-    else { & cargo run --quiet -p nerv -- $target --run }
-    exit $LASTEXITCODE
-} finally {
-    Pop-Location
+if ($arguments[0] -eq 'build' -and $arguments.Count -gt 1) {
+    $source = [string]$arguments[1]
+    if ([System.IO.Path]::GetExtension($source) -eq '.nerv' -and -not (Test-Path -LiteralPath $source) -and -not [System.IO.Path]::IsPathRooted($source)) {
+        $candidate = Join-Path $root $source
+        if (Test-Path -LiteralPath $candidate) { $arguments[1] = $candidate }
+    }
 }
+. (Join-Path $root 'tools\setup-llvm.ps1')
+& cargo run --quiet --locked --manifest-path (Join-Path $root 'Cargo.toml') -p nerv -- @arguments
+exit $LASTEXITCODE
