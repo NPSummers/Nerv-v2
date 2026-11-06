@@ -272,3 +272,28 @@ fn each_source_files_tests_run_once() {
     let output = workspace.ok("app", &["test"]);
     assert_eq!(text(&output.stdout).matches("helper marker").count(), 1);
 }
+
+#[test]
+fn legacy_file_build_behavior_does_not_depend_on_option_order() {
+    let workspace = Workspace::new();
+    workspace.write("main.nerv", "fn main() -> i64 => 7\n");
+    workspace.ok(
+        "",
+        &[
+            "build",
+            "--release",
+            "main.nerv",
+            "-o",
+            if cfg!(windows) { "app.exe" } else { "app" },
+        ],
+    );
+    let output = Command::new(
+        workspace
+            .0
+            .join(if cfg!(windows) { "app.exe" } else { "app" }),
+    )
+    .output()
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(text(&output.stdout), "7\n");
+}

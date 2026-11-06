@@ -47,7 +47,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if path == "build"
-        && remaining.first().is_some_and(|p| {
+        && remaining.iter().any(|p| {
             std::path::Path::new(p)
                 .extension()
                 .is_some_and(|e| e == "nerv")

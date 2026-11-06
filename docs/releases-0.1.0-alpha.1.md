@@ -9,6 +9,6 @@ Project tooling is now available through `nerv new`, `run`, `build`, `check`, `t
 - The formatter preserves comments and token structure and supports `--check`.
 - Compiler archives bundle LLVM, runtime/standard library support, documentation, and notices. The native linker/build tools are still required to build applications.
 
-Windows x64 was validated locally with 176 passing workspace tests and an extracted-package project smoke test. Apple Silicon packages are produced by the release workflow; inspect its status before treating that artifact as validated. Linux and Intel macOS have no prebuilt packages in this release.
+Windows x64 was validated locally with 177 passing workspace tests and an extracted-package project smoke test. Apple Silicon packages are produced by the release workflow; inspect its status before treating that artifact as validated. Linux and Intel macOS have no prebuilt packages in this release.
 
 Existing `nerv file.nerv --run` and `nerv build file.nerv` retain their historical printed-result behavior. Use project commands or `nerv run file.nerv -- args` for process semantics. Dependency imports currently share the language's global symbol namespace. Test isolation is per source file. Collections, generics, runtime ownership, and other alpha language limits are documented in the bundled guides.
