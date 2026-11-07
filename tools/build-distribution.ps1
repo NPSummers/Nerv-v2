@@ -16,7 +16,7 @@ function Invoke-Checked {
 $target = 'x86_64-pc-windows-gnullvm'
 $version = (python tools/release_version.py | ConvertFrom-Json).version
 if ($LASTEXITCODE -ne 0) { throw 'Release version validation failed' }
-. "$PSScriptRoot\setup-llvm.ps1"
+. "$PSScriptRoot\setup-llvm.ps1" -Minimal
 Invoke-Checked python @('tools/setup-toolchain.py', 'windows')
 $mingwRoot = (Resolve-Path 'target/toolchains/llvm-mingw').Path
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = Join-Path $mingwRoot 'bin/x86_64-w64-mingw32-clang.exe'

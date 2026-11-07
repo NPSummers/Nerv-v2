@@ -1,3 +1,4 @@
+param([switch]$Minimal)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
@@ -48,13 +49,25 @@ function Initialize-LLVM {
     try {
         Write-Host "Downloading LLVM $version into $destination..."
         $download = Join-Path $staging $archive
-        Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$archive" -OutFile $download
+        $previousProgressPreference = $ProgressPreference
+        try {
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$archive" -OutFile $download
+        } finally {
+            $ProgressPreference = $previousProgressPreference
+        }
         if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ne $checksum) {
             throw 'LLVM archive checksum mismatch.'
         }
         $install = Join-Path $staging 'install'
         New-Item -ItemType Directory -Path $install | Out-Null
-        & tar -xf $download -C $install --strip-components=1
+        $tarArguments = @('-xf', $download, '-C', $install, '--strip-components=1')
+        if ($Minimal) {
+            foreach ($pattern in @('*/include/*', '*/bin/llvm-config.exe', '*/bin/LLVM-C.dll', '*/lib/LLVM-C.lib', '*/bin/lld.exe', '*/bin/ld.lld.exe', '*/bin/llvm-readobj.exe', '*/bin/llvm-readelf.exe', '*/bin/llvm-objdump.exe', '*/bin/llvm-otool.exe')) {
+                $tarArguments += "--include=$pattern"
+            }
+        }
+        & tar @tarArguments
         if ($LASTEXITCODE -ne 0) { throw 'Could not extract the LLVM archive.' }
         foreach ($file in @('bin\llvm-config.exe', 'bin\LLVM-C.dll', 'lib\LLVM-C.lib')) {
             if (-not (Test-Path -LiteralPath (Join-Path $install $file))) {
