@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -48,6 +49,13 @@ class Versions(unittest.TestCase):
             self.assertEqual(version.installer_version("1.2.3" + suffix), "1.2.3.0")
         with self.assertRaises(ValueError):
             version.installer_version("65536.0.0")
+
+    def test_manual_target_selection_cannot_reduce_a_tag_release_matrix(self):
+        command = [sys.executable, str(Path(__file__).with_name("release_version.py")), "--platform", "linux-x64"]
+        manual = json.loads(subprocess.check_output(command, text=True))
+        self.assertEqual([item["label"] for item in manual["matrix"]["include"]], ["linux-x64"])
+        tagged = json.loads(subprocess.check_output([*command, "--tag", "v" + version.validate()["version"]], text=True))
+        self.assertEqual({item["label"] for item in tagged["matrix"]["include"]}, {"linux-x64", "macos-arm64", "windows-x64"})
 
 
 class Publication(unittest.TestCase):

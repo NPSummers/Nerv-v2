@@ -137,6 +137,7 @@ def windows_toolchain(root, source, llvm, target):
         if item.suffix in (".a", ".o"):
             shutil.copy2(item, destination / item.name)
     shutil.copy2(source / "LICENSE.TXT", root / "LICENSE-LLVM-MinGW.txt")
+    shutil.copytree(source / "x86_64-w64-mingw32/share/mingw32", root / "licenses/MinGW-w64")
     shutil.copy2(source / ".nerv-source.json", root / "SOURCE.json")
     with tempfile.TemporaryDirectory(prefix="nerv-link-plan-") as temporary:
         inputs = [Path(temporary) / name for name in ["program.obj", "runtime.a", "app.exe"]]
