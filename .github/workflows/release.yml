@@ -64,6 +64,10 @@ jobs:
         with:
           python-version: '3.12'
       - run: cargo fetch --locked
+      - name: Provision Windows LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: . ./tools/setup-llvm.ps1 -Minimal
       - name: Build and package Windows
         if: runner.os == 'Windows'
         shell: pwsh

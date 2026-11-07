@@ -366,6 +366,8 @@ def main():
         licenses(bundle / "licenses")
         (bundle / "VERSION").write_text(f"{args.version}\n{args.target}\n{run('git', 'rev-parse', 'HEAD')}\n", encoding="utf-8")
         manifest = {"version": args.version, "source_commit": run("git", "rev-parse", "HEAD"), "source_dirty": bool(run("git", "status", "--porcelain")), "target": args.target, "platform": label, "minimum_system": baseline, "llvm": llvm_version, "rust": run("rustc", "--version"), "signing": "unsigned", "toolchain": "LLVM-MinGW 20261006" if windows else "Zig 0.15.2 Darwin stubs" if host == "Darwin" else "Ubuntu 24.04 glibc 2.39 link files"}
+        if (args.llvm / "LLVM-source.json").is_file():
+            manifest["llvm_source"] = json.loads((args.llvm / "LLVM-source.json").read_text(encoding="utf-8-sig"))
         (bundle / "release-info.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         if host == "Darwin":
             files = [path.relative_to(bundle).as_posix() for path in sorted(bundle.rglob("*")) if path.is_file()]
