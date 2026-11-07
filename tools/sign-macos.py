@@ -11,11 +11,17 @@ import tempfile
 
 
 def run(*arguments):
-    subprocess.run(arguments, check=True)
+    try:
+        subprocess.run(arguments, check=True)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"{arguments[0]} failed with exit code {error.returncode}") from None
 
 
 def notarize(path, authentication):
-    result = subprocess.check_output(["xcrun", "notarytool", "submit", str(path), *authentication, "--wait", "--timeout", "30m", "--output-format", "json"], text=True)
+    try:
+        result = subprocess.check_output(["xcrun", "notarytool", "submit", str(path), *authentication, "--wait", "--timeout", "30m", "--output-format", "json"], text=True)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"notarization request failed with exit code {error.returncode}") from None
     response = json.loads(result)
     if response.get("status") != "Accepted":
         raise RuntimeError(f"notarization failed: {response.get('id')}: {response.get('status')}")
