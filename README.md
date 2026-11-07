@@ -23,7 +23,7 @@ The current source tree also provides [JSON, HTTPS, and WebSocket client APIs](d
 
 ## Projects and installation
 
-Download a checksummed alpha compiler archive from [Releases](https://github.com/NPSummers/Nerv-v2/releases), or follow the [installation instructions](docs/installation.md) to build from source. Installed compilers need native build tools for linking applications; Rust and Cargo are needed only to build the compiler.
+See [installation instructions](docs/installation.md) for downloads and source builds. The new distribution pipeline bundles the linker and target libraries, with Windows/macOS installers and portable downloads for Windows, macOS, and Linux. Native macOS/Linux validation is still pending. Older [alpha releases](https://github.com/NPSummers/Nerv-v2/releases) may require separately installed native build tools. Rust and Cargo are needed only to build the compiler.
 
 ```sh
 nerv new hello

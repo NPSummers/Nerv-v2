@@ -37,6 +37,10 @@ python3 -m unittest discover -s tools -p 'test_compare_binaries.py'
 cargo test --locked --manifest-path time-release/Cargo.toml
 ```
 
-Project commands (`new`, `run`, `build`, `check`, `test`, `fmt`) are forwarded by the root launchers from the caller's working directory. See [project tooling](../docs/projects.md). `tools/package-release.py` builds a redistributable archive from an already-built release compiler, and `tools/install.ps1` / `tools/install.sh` verify and install a downloaded archive without editing PATH. See [installation](../docs/installation.md).
+Project commands (`new`, `run`, `build`, `check`, `test`, `fmt`) are forwarded by the root launchers from the caller's working directory. See [project tooling](../docs/projects.md).
+
+`build-distribution.ps1` and `build-distribution.sh` build/test native compiler distributions. `package-release.py` assembles the private toolchain and portable archive; `build-installer.py` uses that same staged payload for Windows setup or macOS PKG. `verify-distribution.py` tests an extracted/moved portable with developer discovery disabled. `release_version.py`, `finalize-release.py`, and `publish-release.py` enforce version, checksum, complete-platform, and immutable-publication rules. Only a validated matching tag push can publish. See [installation and release configuration](../docs/installation.md) for prerequisites, baselines, signing, and validation still required.
+
+`install.ps1` / `install.sh` remain optional ZIP extraction helpers. They accept an adjacent legacy `.sha256` or the release's `SHA256SUMS` and do not edit PATH. Linux portable tarballs can be extracted directly.
 
 The native networking/JSON integration suite is `cargo test --locked -p nerv --test networking` after LLVM setup. It uses loopback peers and generated TLS certificates, without Discord credentials.

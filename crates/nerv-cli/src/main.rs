@@ -8,6 +8,7 @@ use nerv_syntax::{SourceFile, SourceId, SourceMap, Span, parse};
 mod build;
 mod format;
 mod project;
+mod toolchain;
 
 fn report_backend_error(error: nerv_jit::Error, sources: &SourceMap) {
     if let Some(span) = error.span {
@@ -36,6 +37,10 @@ fn main() -> ExitCode {
         println!(
             "nerv new [--lib] PATH\nnerv run|build|check|test|fmt [file.nerv] [options]\nnerv <file.nerv> [--lex|--parse|--check|--run|--test|--bench]\nRun nerv COMMAND --help for command options."
         );
+        return ExitCode::SUCCESS;
+    }
+    if path == "--print-link-info" {
+        println!("{}", build::link_info());
         return ExitCode::SUCCESS;
     }
     if path == "--version" || path == "-V" {

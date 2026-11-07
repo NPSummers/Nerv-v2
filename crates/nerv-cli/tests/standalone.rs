@@ -368,13 +368,22 @@ fn standalone_program_has_no_llvm_dynamic_dependency() {
         .arg(project.executable())
         .output()
         .unwrap();
-    #[cfg(windows)]
+    #[cfg(all(windows, target_env = "msvc"))]
     let output = find_msvc_tools::find(env!("NERV_BUILD_TARGET"), "dumpbin.exe")
         .unwrap()
         .arg("/DEPENDENTS")
         .arg(project.executable())
         .output()
         .unwrap();
+    #[cfg(all(windows, target_env = "gnu"))]
+    let output = Command::new(
+        PathBuf::from(env::var_os("LLVM_SYS_231_PREFIX").expect("LLVM tool directory"))
+            .join("bin/llvm-readobj.exe"),
+    )
+    .arg("--coff-imports")
+    .arg(project.executable())
+    .output()
+    .unwrap();
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     {
         assert!(output.status.success(), "{output:?}");
