@@ -9,6 +9,11 @@ ROOT = Path(__file__).resolve().parent.parent
 NUMBER = r"(?:0|[1-9][0-9]*)"
 IDENTIFIER = rf"(?:{NUMBER}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER = re.compile(rf"({NUMBER})\.({NUMBER})\.({NUMBER})(?:-({IDENTIFIER}(?:\.{IDENTIFIER})*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?", re.ASCII)
+PLATFORMS = [
+    {"os": "windows-2022", "target": "x86_64-pc-windows-gnullvm", "label": "windows-x64"},
+    {"os": "macos-15", "target": "aarch64-apple-darwin", "label": "macos-arm64"},
+    {"os": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu", "label": "linux-x64"},
+]
 
 
 def parse(version):
@@ -50,12 +55,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag")
     parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--platform", choices=["all", *(item["label"] for item in PLATFORMS)], default="all")
     args = parser.parse_args()
     result = validate(tag=args.tag)
+    selected = PLATFORMS if args.tag or args.platform == "all" else [item for item in PLATFORMS if item["label"] == args.platform]
+    result["matrix"] = {"include": selected}
     if args.github_output:
         with args.github_output.open("a", encoding="utf-8") as output:
             for key, value in result.items():
-                output.write(f"{key}={str(value).lower()}\n")
+                output.write(f"{key}={json.dumps(value) if isinstance(value, dict) else str(value).lower()}\n")
     print(json.dumps(result))
 
 

@@ -53,6 +53,19 @@ def inventory(directory, version, commit):
     return assets + [sums]
 
 
+def verify_tag(repo, tag, commit):
+    reference = json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/git/ref/tags/{tag}"], text=True))["object"]
+    for _ in range(8):
+        if reference["type"] == "commit":
+            if reference["sha"] != commit:
+                raise ValueError("remote release tag moved away from the tested commit")
+            return
+        if reference["type"] != "tag":
+            break
+        reference = json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/git/tags/{reference['sha']}"], text=True))["object"]
+    raise ValueError("release tag does not resolve to a commit")
+
+
 def publish(directory, tag, commit):
     if os.environ.get("GITHUB_EVENT_NAME") != "push" or os.environ.get("GITHUB_REF") != f"refs/tags/{tag}":
         raise ValueError("publication requires a tag push event")
@@ -61,6 +74,7 @@ def publish(directory, tag, commit):
     match = parse(tag[1:])
     assets = inventory(directory, tag[1:], commit)
     repo = os.environ["GH_REPO"]
+    verify_tag(repo, tag, commit)
     result = subprocess.run(["gh", "api", f"repos/{repo}/releases/tags/{tag}"], capture_output=True, text=True)
     release = None
     if result.returncode:

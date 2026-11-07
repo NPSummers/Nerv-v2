@@ -52,6 +52,9 @@ class Versions(unittest.TestCase):
 
 class Publication(unittest.TestCase):
     def setUp(self):
+        tag_verifier = patch.object(publisher, "verify_tag")
+        tag_verifier.start()
+        self.addCleanup(tag_verifier.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -145,6 +148,44 @@ class Publication(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/tags/v" + self.version, "GH_REPO": "owner/repo"}), patch.object(publisher.subprocess, "run", side_effect=run):
             publisher.publish(self.root, "v" + self.version, self.commit)
         self.assertEqual(len(calls), 8)
+
+    def test_stable_latest_uses_semver_instead_of_release_creation_order(self):
+        previous_version = self.version
+        self.version = "1.2.3"
+        for path in self.root.glob("manifest-*.json"):
+            manifest = json.loads(path.read_text())
+            manifest["version"] = self.version
+            for artifact in manifest["artifacts"]:
+                name = artifact["name"].replace(previous_version, self.version)
+                (self.root / artifact["name"]).rename(self.root / name)
+                artifact["name"] = name
+            path.write_text(json.dumps(manifest))
+        for previous, expected in [("v1.2.2", "true"), ("v1.2.10", "false")]:
+            calls = []
+            def run(arguments, **kwargs):
+                calls.append(arguments)
+                if arguments[1] == "api":
+                    if arguments[2].endswith("/releases/latest"):
+                        return subprocess.CompletedProcess(arguments, 0, json.dumps({"tag_name": previous}), "")
+                    return subprocess.CompletedProcess(arguments, 1, "", "HTTP 404")
+                return subprocess.CompletedProcess(arguments, 0)
+            with self.subTest(previous=previous), patch.dict(os.environ, {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/tags/v" + self.version, "GH_REPO": "owner/repo"}), patch.object(publisher.subprocess, "run", side_effect=run):
+                publisher.publish(self.root, "v" + self.version, self.commit)
+            self.assertIn("--prerelease=false", calls[-1])
+            self.assertIn(f"--latest={expected}", calls[-1])
+
+
+class TagIdentity(unittest.TestCase):
+    def test_annotated_tag_is_peeled_and_moving_tags_are_rejected(self):
+        commit = "a" * 40
+        reference = json.dumps({"object": {"type": "tag", "sha": "b" * 40}})
+        target = json.dumps({"object": {"type": "commit", "sha": commit}})
+        with patch.object(publisher.subprocess, "check_output", side_effect=[reference, target]) as api:
+            publisher.verify_tag("owner/repo", "v1.2.3", commit)
+            self.assertEqual(api.call_count, 2)
+        with patch.object(publisher.subprocess, "check_output", return_value=target):
+            with self.assertRaisesRegex(ValueError, "tag moved"):
+                publisher.verify_tag("owner/repo", "v1.2.3", "c" * 40)
 
 
 if __name__ == "__main__":

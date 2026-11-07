@@ -113,7 +113,14 @@ setup_linux_llvm() {
         local libraries=() system_libs=()
         read -r -a libraries <<< "$("$config" --link-static --libnames core orcjit native passes)"
         read -r -a system_libs <<< "$("$config" --link-static --system-libs)"
-        local paths=() library
+        local index library
+        for index in "${!system_libs[@]}"; do
+            library=${system_libs[$index]}
+            if [[ "$library" == /*.a && -f "${library%.a}.so" ]]; then
+                system_libs[$index]="${library%.a}.so"
+            fi
+        done
+        local paths=()
         for library in "${libraries[@]}"; do paths+=("$prefix/lib/$library"); done
         "$prefix/bin/clang++" -shared -fuse-ld=lld -Wl,-soname,libLLVM-23.so -Wl,--no-undefined \
             -Wl,--whole-archive "${paths[@]}" -Wl,--no-whole-archive "${system_libs[@]}" -o "$prefix/lib/libLLVM-23.so" || return 1
