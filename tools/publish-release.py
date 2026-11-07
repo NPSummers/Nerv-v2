@@ -86,6 +86,10 @@ def publish(directory, tag, commit):
         root = Path(temporary)
         notes = root / "notes.md"
         notes.write_text(f"Nerv {tag[1:]}\n\n| Platform | Downloads | Minimum system |\n| --- | --- | --- |\n| Windows x64 | Setup EXE (unsigned), portable ZIP | Windows 10 / UCRT |\n| macOS arm64 | Notarized PKG, portable ZIP | macOS 15 |\n| Linux x64 | Portable tar.gz | glibc 2.39 |\n\nVerify downloads using SHA256SUMS. Extract portable downloads or run the installer, then use `nerv new hello` and `nerv run`. No separate compiler toolchain is needed. Windows development artifacts are unsigned; inspect the signing status in release-manifest.json.\n\nThe language/API remains experimental during 0.x. Source commit: {commit}.\n", encoding="utf-8")
+        release_notes = Path(__file__).resolve().parent.parent / "docs" / f"releases-{tag[1:]}.md"
+        if release_notes.is_file():
+            body = release_notes.read_text(encoding="utf-8").replace("](installation.md)", f"](https://github.com/{repo}/blob/{commit}/docs/installation.md)")
+            notes.write_text(body + f"\nSource commit: {commit}.\n", encoding="utf-8")
         if release is None:
             subprocess.run(["gh", "release", "create", tag, "--verify-tag", "--draft", "--title", f"Nerv {tag[1:]}", "--notes-file", str(notes)], check=True)
             release = {"draft": True, "assets": []}

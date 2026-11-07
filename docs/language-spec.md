@@ -1,4 +1,4 @@
-# Nerv alpha language specification
+# Nerv 1.0 language specification
 
 This document specifies the current supported core, not a promise that every reserved keyword is implemented. Examples marked `run`, `reject`, or `fail` are executable conformance tests in `crates/nerv-cli/tests/language_rules.rs`. `run` is the exact output, `reject` is a compile-time diagnostic substring, and `fail` is a runtime diagnostic substring with exit status 1.
 
