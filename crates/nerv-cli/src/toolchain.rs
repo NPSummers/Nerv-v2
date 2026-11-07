@@ -15,7 +15,9 @@ pub(crate) fn link_command(
     let root = if let Some(root) = env::var_os("NERV_TOOLCHAIN") {
         PathBuf::from(root)
     } else {
-        let executable = env::current_exe().map_err(|error| error.to_string())?;
+        let executable = env::current_exe()
+            .and_then(|path| path.canonicalize())
+            .map_err(|error| format!("cannot resolve compiler executable: {error}"))?;
         let root = executable
             .parent()
             .ok_or("compiler path has no parent")?
