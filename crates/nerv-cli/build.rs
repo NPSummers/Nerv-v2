@@ -16,6 +16,8 @@ fn main() {
             "rustc",
             "--locked",
             "--offline",
+            "--color",
+            "never",
             "--release",
             "--lib",
             "-p",
@@ -27,6 +29,7 @@ fn main() {
         .arg(&runtime_target)
         .args(["--", "-Cpanic=abort", "--print", "native-static-libs"])
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("CARGO_TERM_COLOR", "never")
         .env(
             "RUSTFLAGS",
             if target.contains("windows-msvc") {

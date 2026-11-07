@@ -180,7 +180,7 @@ def windows_toolchain(root, source, llvm, target):
 
 
 def mac_toolchain(root, source, llvm, target, libraries):
-    allowed = {"-lSystem", "-lc", "-lm", "-lpthread", "-ldl", "-lutil", "-lresolv"}
+    allowed = {"-lSystem", "-lc", "-lm", "-lpthread", "-ldl", "-lutil", "-lresolv", "-liconv"}
     unsupported = set(libraries) - allowed
     if unsupported:
         raise RuntimeError(f"macOS runtime requires additional link stubs: {sorted(unsupported)}")
