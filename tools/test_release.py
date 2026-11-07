@@ -167,9 +167,9 @@ class Publication(unittest.TestCase):
             publisher.publish(self.root, "v" + self.version, self.commit)
         self.assertEqual(len(calls), 8)
 
-    def test_stable_latest_uses_semver_instead_of_release_creation_order(self):
+    def test_stable_latest_ignores_build_metadata_and_creation_order(self):
         previous_version = self.version
-        self.version = "1.2.3"
+        self.version = "1.2.3+Build.2"
         for path in self.root.glob("manifest-*.json"):
             manifest = json.loads(path.read_text())
             manifest["version"] = self.version
@@ -178,7 +178,7 @@ class Publication(unittest.TestCase):
                 (self.root / artifact["name"]).rename(self.root / name)
                 artifact["name"] = name
             path.write_text(json.dumps(manifest))
-        for previous, expected in [("v1.2.2", "true"), ("v1.2.10", "false")]:
+        for previous, expected in [("v1.2.2", "true"), ("v1.2.10", "false"), ("v1.2.3+Build.1", "false")]:
             calls = []
             def run(arguments, **kwargs):
                 calls.append(arguments)

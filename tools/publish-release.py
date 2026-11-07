@@ -103,7 +103,7 @@ def publish(directory, tag, commit):
             else:
                 raise ValueError(f"published release is missing {asset.name}; publish a new version")
         if release["draft"]:
-            latest = not match[4] and not match[5]
+            latest = not match[4]
             if latest:
                 current = subprocess.run(["gh", "api", f"repos/{repo}/releases/latest"], capture_output=True, text=True)
                 if current.returncode == 0:
