@@ -3,6 +3,7 @@ import base64
 import importlib.util
 import json
 import os
+import plistlib
 from pathlib import Path
 import secrets
 import subprocess
@@ -39,7 +40,7 @@ def sign(payload, directory, version):
             run("security", "import", str(certificate), "-k", str(keychain), "-P", os.environ["MACOS_CERTIFICATE_PASSWORD"], "-T", "/usr/bin/codesign", "-T", "/usr/bin/productsign")
             run("security", "set-key-partition-list", "-S", "apple-tool:,apple:,codesign:", "-s", "-k", password, str(keychain))
             entitlements = root / "entitlements.plist"
-            entitlements.write_text('<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/></dict></plist>', encoding="utf-8")
+            entitlements.write_bytes(plistlib.dumps({"com.apple.security.cs.allow-jit": True, "com.apple.security.cs.allow-unsigned-executable-memory": True}))
             for path in sorted(payload.rglob("*")):
                 if not path.is_file():
                     continue
