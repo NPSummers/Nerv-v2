@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import stat
 import tempfile
 import tomllib
 import unittest
@@ -44,6 +46,22 @@ class LibraryResolution(unittest.TestCase):
 
 
 class Toolchains(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "requires Unix permission bits")
+    def test_payload_files_stay_readable_after_installer_changes_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "payload"
+            bundle.mkdir(mode=0o700)
+            data = bundle / "link-stub.tbd"
+            data.write_bytes(b"stub")
+            data.chmod(0o600)
+            executable = bundle / "nerv"
+            executable.write_bytes(b"executable")
+            executable.chmod(0o700)
+            package_release.normalize_permissions(bundle)
+            self.assertEqual(stat.S_IMODE(data.stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(executable.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(bundle.stat().st_mode), 0o755)
+
     def test_compiler_identity_rejects_a_stale_or_wrong_target_binary(self):
         with patch.object(package_release.subprocess, "check_output", return_value="nerv 0.1.0 (test)"):
             with self.assertRaisesRegex(RuntimeError, "compiler identity"):

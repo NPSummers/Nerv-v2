@@ -305,6 +305,15 @@ def compiler_info(binary, version, target, environment=None):
     return info
 
 
+def normalize_permissions(bundle):
+    bundle.chmod(0o755)
+    for path in bundle.rglob("*"):
+        if path.is_symlink():
+            continue
+        executable = path.is_dir() or path.stat().st_mode & 0o111
+        path.chmod(0o755 if executable else 0o644)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
@@ -361,6 +370,8 @@ def main():
         if host == "Darwin":
             files = [path.relative_to(bundle).as_posix() for path in sorted(bundle.rglob("*")) if path.is_file()]
             (bundle / ".nerv-files").write_text("\n".join(files + [".nerv-files"]) + "\n", encoding="utf-8")
+        if not windows:
+            normalize_permissions(bundle)
         environment = clean_environment()
         smoke(binary, Path(temporary), environment)
         relocated = Path(temporary) / "relocated space \u00e9"
