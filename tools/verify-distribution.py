@@ -45,6 +45,8 @@ def verify(archive):
         work = root / "work"
         work.mkdir()
         environment = package.clean_environment()
+        identity = (moved / "VERSION").read_text(encoding="utf-8").splitlines()
+        package.compiler_info(binary, identity[0], identity[1], environment)
         package.smoke(binary, work, environment)
         project = work / "smoke"
         application = project / "target/nerv/release" / ("smoke.exe" if os.name == "nt" else "smoke")

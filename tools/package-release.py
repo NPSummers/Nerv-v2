@@ -295,6 +295,16 @@ def archive_payload(bundle, archive):
                     output.write(path, path.relative_to(bundle.parent))
 
 
+def compiler_info(binary, version, target, environment=None):
+    identity = subprocess.check_output([str(binary.resolve()), "--version"], text=True, env=environment).strip()
+    if identity != f"nerv {version} ({target})":
+        raise RuntimeError(f"compiler identity does not match release: {identity}")
+    info = tomllib.loads(subprocess.check_output([str(binary.resolve()), "--print-link-info"], text=True, env=environment))
+    if info["target"] != target:
+        raise RuntimeError("compiler target does not match release target")
+    return info
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", required=True)
@@ -326,9 +336,7 @@ def main():
         binary = bundle / binary_name
         original = args.binary or ROOT / "target" / args.target / "release" / binary_name
         shutil.copy2(original, binary)
-        info = tomllib.loads(subprocess.check_output([str(original.resolve()), "--print-link-info"], text=True))
-        if info["target"] != args.target:
-            raise RuntimeError("compiler target does not match release target")
+        info = compiler_info(original, args.version, args.target)
         toolchain = bundle / "toolchain"
         if windows:
             shutil.copy2(args.llvm / "bin/LLVM-C.dll", bundle / "LLVM-C.dll")

@@ -44,6 +44,16 @@ class LibraryResolution(unittest.TestCase):
 
 
 class Toolchains(unittest.TestCase):
+    def test_compiler_identity_rejects_a_stale_or_wrong_target_binary(self):
+        with patch.object(package_release.subprocess, "check_output", return_value="nerv 0.1.0 (test)"):
+            with self.assertRaisesRegex(RuntimeError, "compiler identity"):
+                package_release.compiler_info(Path("nerv"), "0.2.0", "test")
+        with patch.object(package_release.subprocess, "check_output", side_effect=["nerv 0.1.0 (test)", 'target="wrong"\nlibraries=[]\n']):
+            with self.assertRaisesRegex(RuntimeError, "compiler target"):
+                package_release.compiler_info(Path("nerv"), "0.1.0", "test")
+        with patch.object(package_release.subprocess, "check_output", side_effect=["nerv 0.1.0 (test)", 'target="test"\nlibraries=[]\n']):
+            self.assertEqual(package_release.compiler_info(Path("nerv"), "0.1.0", "test")["libraries"], [])
+
     def test_linux_link_plan_is_relocatable_and_has_exactly_one_input_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
