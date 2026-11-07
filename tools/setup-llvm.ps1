@@ -14,6 +14,7 @@ function Initialize-LLVM {
         if (-not $config -or -not (Test-Path -LiteralPath $config -PathType Leaf)) { continue }
         $version = & $config --version
         if ($LASTEXITCODE -ne 0 -or $version -notlike '23.1.*') { continue }
+        if ($Minimal -and $version -ne '23.1.3') { continue }
         $prefix = Split-Path -Parent (Split-Path -Parent $config)
         if (-not (Test-Path -LiteralPath (Join-Path $prefix 'bin\LLVM-C.dll'))) { continue }
         if (-not (Test-Path -LiteralPath (Join-Path $prefix 'lib\LLVM-C.lib'))) { continue }

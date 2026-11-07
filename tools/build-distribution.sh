@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source tools/setup-llvm.sh
-setup_llvm
+setup_llvm 23.1.3
 version=$(python3 tools/release_version.py | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
 if [[ $(uname -s) == Darwin ]]; then
     target=aarch64-apple-darwin
