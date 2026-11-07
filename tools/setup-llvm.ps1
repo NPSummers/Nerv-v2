@@ -74,7 +74,12 @@ function Initialize-LLVM {
         }
         Move-Item -LiteralPath $install -Destination $destination
     } finally {
-        Remove-Item -LiteralPath $staging -Recurse -Force
+        $resolvedStaging = [System.IO.Path]::GetFullPath($staging)
+        $expectedPrefix = Join-Path ([System.IO.Path]::GetFullPath($root)) '.llvm-setup.'
+        if (-not $resolvedStaging.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Invalid LLVM staging cleanup path.'
+        }
+        Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
     }
     Initialize-LLVM
 }
