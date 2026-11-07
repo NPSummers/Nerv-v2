@@ -3,83 +3,172 @@ name: Compiler release
 on:
   push:
     tags: ['v*']
+  pull_request:
+    paths: ['tools/**', '.github/workflows/release.yml', 'crates/nerv-cli/**', 'crates/nerv-jit/**', 'Cargo.lock']
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to validate (tag releases always build all)
+        type: choice
+        default: all
+        options: [all, windows-x64, macos-arm64, linux-x64]
 
 permissions:
   contents: read
 
+concurrency:
+  group: nerv-release-${{ github.ref }}-${{ inputs.platform || 'all' }}
+  cancel-in-progress: false
+
 jobs:
-  package:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-          - os: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      matrix: ${{ steps.version.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
+      - run: python -m unittest discover -s tools -p 'test_release*.py'
       - run: python -m unittest discover -s tools -p test_package_release.py
+      - id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          PLATFORM: ${{ inputs.platform || 'all' }}
+        run: |
+          args=()
+          if [[ "$REF_TYPE" == tag ]]; then args+=(--tag "$REF_NAME"); fi
+          python tools/release_version.py "${args[@]}" --platform "$PLATFORM" --github-output "$GITHUB_OUTPUT"
+
+  package:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      RELEASE_LABEL: ${{ matrix.label }}
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      MACOS_SIGNING_ENABLED: ${{ vars.NERV_MACOS_SIGNING_ENABLED || 'false' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@dc08e2af391d489dff6d14cf743e574f7d1229c5
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
       - run: cargo fetch --locked
-      - name: Build and test Windows
+      - name: Provision Windows LLVM
         if: runner.os == 'Windows'
         shell: pwsh
+        run: . ./tools/setup-llvm.ps1 -Minimal
+      - name: Build and package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tools/build-distribution.ps1
+      - name: Install macOS build dependency
+        if: runner.os == 'macOS'
+        run: brew install zstd
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf libzstd-dev zlib1g-dev libxml2-dev libedit-dev libncurses-dev
+      - name: Build and package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash tools/build-distribution.sh
+      - name: Sign and notarize macOS tag release
+        if: runner.os == 'macOS' && github.event_name == 'push' && github.ref_type == 'tag' && env.MACOS_SIGNING_ENABLED == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_APPLICATION_IDENTITY: ${{ secrets.MACOS_APPLICATION_IDENTITY }}
+          MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python tools/sign-macos.py --payload "target/payload/nerv-$RELEASE_VERSION-$RELEASE_LABEL" --directory dist/release --version "$RELEASE_VERSION"
+      - name: Verify final portable
+        shell: bash
         run: |
-          . .\tools\setup-llvm.ps1
-          cargo test --locked --workspace
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:RUSTFLAGS = '-C target-feature=+crt-static'
-          cargo build --locked --release -p nerv
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build and test macOS
+          extension=zip
+          if [[ "$RUNNER_OS" == Linux ]]; then extension=tar.gz; fi
+          python tools/verify-distribution.py "dist/release/nerv-$RELEASE_VERSION-$RELEASE_LABEL-portable.$extension"
+      - name: Test Windows setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python tools/test-installer-windows.py --installer "dist/release/nerv-$env:RELEASE_VERSION-windows-x64-setup-unsigned.exe" --payload "target/payload/nerv-$env:RELEASE_VERSION-windows-x64"
+      - name: Test macOS package
         if: runner.os == 'macOS'
         shell: bash
-        run: |
-          brew install zstd
-          source tools/setup-llvm.sh
-          setup_llvm
-          cargo test --locked --workspace
-          cargo build --locked --release -p nerv
-      - name: Package
+        run: bash tools/test-installer-macos.sh
+      - name: Final hashes and manifest
         shell: bash
-        run: |
-          version=$(python -c 'import tomllib; print(tomllib.load(open("crates/nerv-cli/Cargo.toml", "rb"))["package"]["version"])')
-          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo 'Release tag must match the compiler package version' >&2
-            exit 1
-          fi
-          python tools/package-release.py --version "$version" --target '${{ matrix.target }}'
-      - uses: actions/upload-artifact@v4
+        run: python tools/finalize-release.py --directory dist/release --payload "target/payload/nerv-$RELEASE_VERSION-$RELEASE_LABEL"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: compiler-${{ matrix.target }}
-          path: dist/*
+          name: compiler-${{ matrix.label }}
+          path: dist/release/*
           if-no-files-found: error
 
-  publish:
-    if: github.ref_type == 'tag'
+  verify-linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux-x64'
     needs: package
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        image: ['ubuntu:24.04', 'debian:trixie-slim', 'fedora:43']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: compiler-linux-x64
+          path: dist
+      - name: Compile on minimal distributions without development tools
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --network none -v "$PWD/dist:/input:ro" "$IMAGE" sh -eu -c '
+            for tool in cargo rustc clang gcc cc; do
+              if command -v "$tool" >/dev/null 2>&1; then echo "Unexpected development tool: $tool" >&2; exit 1; fi
+            done
+            mkdir /nerv
+            tar -xzf /input/*-portable.tar.gz -C /nerv --strip-components=1
+            mkdir /work
+            cd /work
+            /nerv/nerv new hello
+            cd hello
+            PATH= /nerv/nerv run --release --locked
+            PATH= ./target/nerv/release/hello
+          '
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [validate, package, verify-linux]
+    environment: release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: compiler-*
           merge-multiple: true
           path: dist
-      - name: Publish compiler archives
+      - name: Publish complete immutable release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: |
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --prerelease --title "Nerv $TAG" --notes 'Alpha compiler. See the bundled installation instructions, project tooling documentation, and checksums. Native build tools are required to compile applications.'
-          fi
-          gh release upload "$TAG" dist/* --clobber
+          COMMIT: ${{ github.sha }}
+        run: python tools/publish-release.py --directory dist --tag "$TAG" --commit "$COMMIT"

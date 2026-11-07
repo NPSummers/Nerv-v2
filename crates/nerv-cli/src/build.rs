@@ -201,16 +201,24 @@ pub(crate) fn compile_cached(
         let executable = staging
             .0
             .join(if cfg!(windows) { "app.exe" } else { "app" });
-        let mut linker = linker()?;
-        #[cfg(windows)]
-        linker.args([
-            OsString::from("/NOLOGO"),
-            OsString::from("/SUBSYSTEM:CONSOLE"),
-            OsString::from(format!("/OUT:{}", executable.display())),
-        ]);
-        #[cfg(not(windows))]
-        linker.arg("-o").arg(&executable);
-        linker.arg(&object).arg(&archive).args(NATIVE_LIBS.lines());
+        let mut linker = if let Some(command) =
+            crate::toolchain::link_command(&object, &archive, &executable, NATIVE_LIBS)?
+        {
+            command
+        } else {
+            let mut linker = linker()?;
+            if cfg!(windows) && env!("NERV_BUILD_TARGET").contains("windows-msvc") {
+                linker.args([
+                    OsString::from("/NOLOGO"),
+                    OsString::from("/SUBSYSTEM:CONSOLE"),
+                    OsString::from(format!("/OUT:{}", executable.display())),
+                ]);
+            } else {
+                linker.arg("-o").arg(&executable);
+            }
+            linker.arg(&object).arg(&archive).args(NATIVE_LIBS.lines());
+            linker
+        };
         let result = linker.output().map_err(|error| format!("could not run native linker (install native build tools or set NERV_LINKER): {error}"))?;
         if !result.status.success() {
             return Err(format!(
@@ -254,6 +262,12 @@ pub(crate) fn linker() -> Result<Command, String> {
     }
     #[cfg(windows)]
     {
+        if !env!("NERV_BUILD_TARGET").contains("windows-msvc") {
+            return Err(
+                "this compiler requires its bundled toolchain; set NERV_TOOLCHAIN to its directory"
+                    .into(),
+            );
+        }
         find_msvc_tools::find(env!("NERV_BUILD_TARGET"), "link.exe").ok_or_else(|| "could not find MSVC link.exe; install Visual Studio C++ Build Tools or set NERV_LINKER".into())
     }
     #[cfg(not(windows))]
@@ -262,4 +276,22 @@ pub(crate) fn linker() -> Result<Command, String> {
             env::var_os("CC").unwrap_or_else(|| "cc".into()),
         ))
     }
+}
+
+pub(crate) fn link_info() -> String {
+    let mut info = toml::map::Map::new();
+    info.insert(
+        "target".into(),
+        toml::Value::String(env!("NERV_BUILD_TARGET").into()),
+    );
+    info.insert(
+        "libraries".into(),
+        toml::Value::Array(
+            NATIVE_LIBS
+                .lines()
+                .map(|line| toml::Value::String(line.into()))
+                .collect(),
+        ),
+    );
+    toml::to_string(&toml::Value::Table(info)).expect("link information is serializable")
 }

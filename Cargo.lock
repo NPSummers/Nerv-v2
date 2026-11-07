@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "nerv"
-version = "0.1.0-alpha.1"
+version = "1.0.0"
 dependencies = [
  "find-msvc-tools",
  "nerv-jit",

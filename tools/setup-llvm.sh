@@ -35,8 +35,12 @@ prepare_llvm() {
 }
 
 setup_llvm() {
-    local root config prefix version archive checksum staging
+    local root config prefix version archive checksum staging required=${1:-}
     root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+    if [[ $(uname -s) == Linux ]]; then
+        setup_linux_llvm "$root" "$required"
+        return
+    fi
     if [[ $(uname -s) != Darwin ]]; then
         echo 'This script requires macOS.' >&2
         return 1
@@ -48,6 +52,7 @@ setup_llvm() {
         [[ -x "$config" ]] || continue
         version=$("$config" --version) || continue
         [[ "$version" == 23.1.* ]] || continue
+        [[ -z "$required" || "$version" == "$required" ]] || continue
         prefix=$("$config" --prefix) || continue
         [[ -f "$prefix/lib/libLLVM.dylib" || -f "$prefix/lib/libLLVM-23.dylib" || -f "$prefix/lib/libLLVMCore.a" ]] || continue
         prepare_llvm "$config" "$prefix" || return 1
@@ -83,7 +88,50 @@ setup_llvm() {
         [[ -x "$staging/install/bin/llvm-config" && -f "$staging/install/lib/libLLVMCore.a" ]] || exit 1
         mv "$staging/install" "$root/llvm" || exit 1
     ) || return 1
-    setup_llvm
+    setup_llvm "$required"
+}
+
+setup_linux_llvm() {
+    local root=$1 config prefix staging version=23.1.3 required=${2:-}
+    [[ $(uname -m) == x86_64 ]] || { echo 'Linux releases currently require x86-64.' >&2; return 1; }
+    prefix=${LLVM_SYS_231_PREFIX:-$root/llvm}
+    config="$prefix/bin/llvm-config"
+    if [[ ! -x "$config" ]]; then
+        [[ ! -e "$prefix" ]] || { echo 'Unusable LLVM installation already exists.' >&2; return 1; }
+        (
+            set -e
+            staging=$(mktemp -d "$root/.llvm-setup.XXXXXX")
+            trap 'rm -rf "$staging"' EXIT
+            curl --fail --location --retry 3 -o "$staging/llvm.tar.xz" "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-Linux-X64.tar.xz"
+            printf '%s  %s\n' ca9fe385a5d9e2d88132dc0e23a00e9f87f38fa75f67207b5e457d208e71d013 "$staging/llvm.tar.xz" | sha256sum -c -
+            mkdir "$staging/install"
+            tar -xf "$staging/llvm.tar.xz" -C "$staging/install" --strip-components=1
+            mv "$staging/install" "$prefix"
+        ) || return 1
+    fi
+    [[ $("$config" --version) == 23.1.* ]] || { echo 'LLVM 23.1 is required.' >&2; return 1; }
+    [[ -z "$required" || $("$config" --version) == "$required" ]] || { echo "LLVM $required is required for distribution builds." >&2; return 1; }
+    if [[ ! -f "$prefix/lib/libLLVM-23.so" ]] && ! "$config" --link-shared --libnames >/dev/null 2>&1; then
+        local libraries=() system_libs=()
+        read -r -a libraries <<< "$("$config" --link-static --libnames core orcjit native passes)"
+        read -r -a system_libs <<< "$("$config" --link-static --system-libs)"
+        local index library
+        for index in "${!system_libs[@]}"; do
+            library=${system_libs[$index]}
+            if [[ "$library" == /*.a && -f "${library%.a}.so" ]]; then
+                system_libs[$index]="${library%.a}.so"
+            fi
+        done
+        local paths=()
+        for library in "${libraries[@]}"; do paths+=("$prefix/lib/$library"); done
+        "$prefix/bin/clang++" -shared -fuse-ld=lld -Wl,-soname,libLLVM-23.so -Wl,--no-undefined \
+            -Wl,--whole-archive "${paths[@]}" -Wl,--no-whole-archive "${system_libs[@]}" -o "$prefix/lib/libLLVM-23.so" || return 1
+        ln -sf libLLVM-23.so "$prefix/lib/libLLVM.so"
+    fi
+    export LLVM_CONFIG_PATH="$config"
+    export LLVM_SYS_231_PREFIX="$prefix"
+    export PATH="$prefix/bin:$PATH"
+    export LD_LIBRARY_PATH="$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

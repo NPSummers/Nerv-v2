@@ -1,6 +1,6 @@
 use super::*;
 use llvm_sys::{
-    core::{LLVMDisposeMessage, LLVMSetDataLayout, LLVMSetTarget},
+    core::{LLVMCreateMessage, LLVMDisposeMessage, LLVMSetDataLayout, LLVMSetTarget},
     target::{LLVMCopyStringRepOfTargetData, LLVMDisposeTargetData},
     target_machine::*,
     transforms::pass_builder::*,
@@ -23,7 +23,9 @@ impl Machine {
         standalone: bool,
     ) -> Result<Self, Error> {
         unsafe {
-            let triple = LLVMGetDefaultTargetTriple();
+            let triple_text = CString::new(env!("NERV_CODEGEN_TARGET"))
+                .map_err(|_| Error::new("invalid compiler target triple"))?;
+            let triple = LLVMCreateMessage(triple_text.as_ptr());
             if triple.is_null() {
                 return Err(Error::new("could not get the native LLVM target triple"));
             }

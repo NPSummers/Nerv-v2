@@ -6,7 +6,12 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
 fi
 archive=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 destination=${2:-"$HOME/.local/share/nerv"}
-expected=$(awk 'NR == 1 { print $1 }' "$archive.sha256")
+if [[ -f "$archive.sha256" ]]; then
+    expected=$(awk 'NR == 1 { print $1 }' "$archive.sha256")
+else
+    expected=$(awk -v name="$(basename "$archive")" '$2 == name { print $1 }' "$(dirname "$archive")/SHA256SUMS")
+fi
+[[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || { echo 'No unique valid archive checksum' >&2; exit 1; }
 actual=$(shasum -a 256 "$archive" | awk '{ print $1 }')
 if [[ "$expected" != "$actual" ]]; then echo 'Compiler archive checksum mismatch' >&2; exit 1; fi
 if [[ -e "$destination" ]]; then echo 'Destination exists; choose a new directory' >&2; exit 1; fi

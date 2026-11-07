@@ -16,6 +16,8 @@ fn main() {
             "rustc",
             "--locked",
             "--offline",
+            "--color",
+            "never",
             "--release",
             "--lib",
             "-p",
@@ -27,6 +29,7 @@ fn main() {
         .arg(&runtime_target)
         .args(["--", "-Cpanic=abort", "--print", "native-static-libs"])
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("CARGO_TERM_COLOR", "never")
         .env(
             "RUSTFLAGS",
             if target.contains("windows-msvc") {
@@ -53,7 +56,16 @@ fn main() {
         .expect("rustc did not report standalone native link libraries");
     fs::write(
         out.join("runtime-link-libs.txt"),
-        libs.split_whitespace().collect::<Vec<_>>().join("\n"),
+        libs.split_whitespace()
+            .map(|library| {
+                if target == "x86_64-unknown-linux-gnu" && library == "-lgcc_s" {
+                    "-lgcc_eh"
+                } else {
+                    library
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     )
     .unwrap();
     let archive = if target.contains("windows-msvc") {

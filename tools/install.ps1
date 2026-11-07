@@ -5,7 +5,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $archivePath = (Resolve-Path -LiteralPath $Archive).Path
 $checksumPath = "$archivePath.sha256"
-$expected = ((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split '\s+')[0]
+if (Test-Path -LiteralPath $checksumPath) {
+    $expected = ((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split '\s+')[0]
+} else {
+    $name = [System.IO.Path]::GetFileName($archivePath)
+    $sums = Join-Path (Split-Path -Parent $archivePath) 'SHA256SUMS'
+    $checksumLines = @(Get-Content -LiteralPath $sums | Where-Object { $_ -match ('^[0-9a-fA-F]{64}\s+\*?' + [regex]::Escape($name) + '$') })
+    if ($checksumLines.Count -ne 1) { throw 'No unique checksum for this archive in SHA256SUMS' }
+    $expected = ($checksumLines[0] -split '\s+')[0]
+}
 if ($expected -notmatch '^[0-9a-fA-F]{64}$') { throw 'Invalid SHA-256 checksum file' }
 if ((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash -ne $expected) { throw 'Compiler archive checksum mismatch' }
 $destinationPath = [System.IO.Path]::GetFullPath($Destination)

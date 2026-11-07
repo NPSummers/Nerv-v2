@@ -8,6 +8,12 @@ fn main() {
         .to_path_buf();
     println!("cargo:rerun-if-env-changed=LLVM_SYS_231_PREFIX");
     println!("cargo:rerun-if-env-changed=LLVM_CONFIG_PATH");
+    println!(
+        "cargo:rustc-env=NERV_CODEGEN_TARGET={}",
+        env::var("TARGET")
+            .unwrap()
+            .replace("windows-gnullvm", "windows-gnu")
+    );
     let llvm = env::var_os("LLVM_SYS_231_PREFIX")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("llvm"));
@@ -20,11 +26,15 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=LLVM-23");
             return;
         }
+        if llvm.join("lib/libLLVM-23.so").is_file() {
+            println!("cargo:rustc-link-lib=dylib=LLVM-23");
+            return;
+        }
         let config = env::var_os("LLVM_CONFIG_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| llvm.join("bin/llvm-config"));
         let output = Command::new(config)
-            .args(["--link-shared", "--libnames"])
+            .args(["--link-shared", "--libs"])
             .output()
             .expect("could not run llvm-config");
         assert!(
@@ -33,11 +43,9 @@ fn main() {
             String::from_utf8_lossy(&output.stderr)
         );
         for library in String::from_utf8(output.stdout).unwrap().split_whitespace() {
-            let name = library.strip_prefix("lib").unwrap_or(library);
-            let name = name
-                .strip_suffix(".dylib")
-                .or_else(|| name.strip_suffix(".so"))
-                .unwrap_or(name);
+            let name = library
+                .strip_prefix("-l")
+                .expect("llvm-config must report -l libraries");
             println!("cargo:rustc-link-lib=dylib={name}");
         }
         return;
