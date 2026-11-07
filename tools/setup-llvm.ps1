@@ -49,18 +49,15 @@ function Initialize-LLVM {
     try {
         Write-Host "Downloading LLVM $version into $destination..."
         $download = Join-Path $staging $archive
-        $previousProgressPreference = $ProgressPreference
-        try {
-            $ProgressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$archive" -OutFile $download
-        } finally {
-            $ProgressPreference = $previousProgressPreference
-        }
+        & curl.exe --fail --location --silent --show-error --retry 3 --connect-timeout 30 --max-time 900 --speed-time 60 --speed-limit 1024 --output $download "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$archive"
+        if ($LASTEXITCODE -ne 0) { throw "LLVM download failed: $LASTEXITCODE" }
+        Write-Host 'LLVM download finished; verifying SHA-256...'
         if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ne $checksum) {
             throw 'LLVM archive checksum mismatch.'
         }
         $install = Join-Path $staging 'install'
         New-Item -ItemType Directory -Path $install | Out-Null
+        Write-Host 'Extracting LLVM...'
         $tarArguments = @('-xf', $download, '-C', $install, '--strip-components=1')
         if ($Minimal) {
             foreach ($pattern in @('*/include/*', '*/bin/llvm-config.exe', '*/bin/LLVM-C.dll', '*/lib/LLVM-C.lib', '*/bin/lld.exe', '*/bin/ld.lld.exe', '*/bin/llvm-readobj.exe', '*/bin/llvm-readelf.exe', '*/bin/llvm-objdump.exe', '*/bin/llvm-otool.exe')) {
@@ -69,6 +66,7 @@ function Initialize-LLVM {
         }
         & tar @tarArguments
         if ($LASTEXITCODE -ne 0) { throw 'Could not extract the LLVM archive.' }
+        Write-Host 'LLVM extraction finished.'
         foreach ($file in @('bin\llvm-config.exe', 'bin\LLVM-C.dll', 'lib\LLVM-C.lib')) {
             if (-not (Test-Path -LiteralPath (Join-Path $install $file))) {
                 throw "LLVM archive is missing $file."
