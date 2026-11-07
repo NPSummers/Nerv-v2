@@ -8,7 +8,7 @@ A complete download includes Nerv, LLVM, a private linker, and the target link l
 
 ## Windows x64
 
-Use `nerv-VERSION-windows-x64-setup-unsigned.exe` for a per-user installation. It defaults to `%LOCALAPPDATA%\Programs\Nerv`, offers optional user PATH integration, and registers an uninstaller. Open a new terminal after installation. Development installers are unsigned; Windows signing is not configured yet.
+Use `nerv-VERSION-windows-x64-setup-unsigned.exe` for a per-user installation. It defaults to `%LOCALAPPDATA%\Programs\Nerv`, offers optional user PATH integration, and registers an uninstaller. Open a new terminal after installation. Windows installers are unsigned; Windows signing is not configured yet.
 
 For a portable installation, extract `nerv-VERSION-windows-x64-portable.zip`. Run `nerv.exe` directly or add its directory to PATH yourself. Extraction changes no system settings. Windows 10 with UCRT is the proposed baseline; a clean-machine validation remains required before claiming support.
 
@@ -16,7 +16,7 @@ The installer supports `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, `/DIR="C:\pat
 
 ## Apple Silicon macOS
 
-Use `nerv-VERSION-macos-arm64-installer.pkg`, or extract `nerv-VERSION-macos-arm64-portable.zip` and run its `nerv` executable. The initial minimum is macOS 15: the LLVM shared library declares macOS 15.0 in its Mach-O load commands. Packaging rejects components declaring a newer minimum. Native portable, symlink, PKG installation/reinstallation, and uninstall checks passed in [macOS validation](https://github.com/NPSummers/Nerv-v2/actions/runs/42324316910).
+Use `nerv-VERSION-macos-arm64-installer-unsigned.pkg`, or extract `nerv-VERSION-macos-arm64-portable.zip` and run its `nerv` executable. The initial minimum is macOS 15: the LLVM shared library declares macOS 15.0 in its Mach-O load commands. Packaging rejects components declaring a newer minimum. Native portable, symlink, PKG installation/reinstallation, and uninstall checks passed in [macOS validation](https://github.com/NPSummers/Nerv-v2/actions/runs/42324316910).
 
 The package installs under `/Library/Nerv/VERSION` and manages `/usr/local/bin/nerv`. Versions have separate payload directories and receipts. Installation refuses to replace an unrelated command. To remove a specific installed version:
 
@@ -26,7 +26,7 @@ sudo sh /Library/Nerv/VERSION/uninstall-macos.sh VERSION
 
 The removal script deletes listed installer-owned files, preserves additional files, and removes the public symlink only if it points to that version. Other installed versions remain available at their full paths. It does not automatically select an older version.
 
-Tag release jobs require Developer ID signing and notarization. Manual/PR artifacts are explicitly unsigned development builds, not public notarized releases. The notarized PKG is stapled. ZIP notarization is checked online; ZIP archives cannot themselves receive a stapled ticket. Gatekeeper and offline first-run behavior still need clean-Mac testing. No instruction to disable Gatekeeper is part of installation.
+Public macOS releases are unsigned by default, including v1.0.0, and their installer filenames explicitly include `unsigned`. They are not Apple-notarized. Normal macOS checks for downloaded software still apply. When optional Developer ID signing/notarization is enabled, the signed PKG is stapled and ZIP notarization is checked online. Gatekeeper and offline first-run behavior still need clean-Mac testing; no instruction to disable Gatekeeper is part of installation.
 
 ## Linux x64
 
@@ -78,6 +78,6 @@ Installer numeric fields map `MAJOR.MINOR.PATCH` to `MAJOR.MINOR.PATCH.0`, with 
 
 `alpha.10` follows `alpha.2` under SemVer. Build metadata has no precedence. Prereleases never become the stable latest release; an older stable tag does not displace a newer stable release. Published assets are immutable. Unpublished draft retries compare existing hashes, upload only missing assets, and refuse changed bytes. Fix a published problem through a new version/tag.
 
-Configure the `release` GitHub environment for publication review. Public macOS signing needs repository secrets `MACOS_CERTIFICATE_P12` (base64 P12 containing both signing identities), `MACOS_CERTIFICATE_PASSWORD`, `MACOS_APPLICATION_IDENTITY`, `MACOS_INSTALLER_IDENTITY`, `APPLE_ID`, `APPLE_APP_PASSWORD`, and `APPLE_TEAM_ID`. They are used only by trusted tag builds. No signing credentials are used by local or PR validation. Missing signing inputs fail the tagged macOS job and block the whole release.
+Configure the `release` GitHub environment for publication review. To enable optional macOS signing, set the repository variable `NERV_MACOS_SIGNING_ENABLED=true` and configure repository secrets `MACOS_CERTIFICATE_P12` (base64 P12 containing both signing identities), `MACOS_CERTIFICATE_PASSWORD`, `MACOS_APPLICATION_IDENTITY`, `MACOS_INSTALLER_IDENTITY`, `APPLE_ID`, `APPLE_APP_PASSWORD`, and `APPLE_TEAM_ID`. They are used only by trusted tag builds. No signing credentials are used by local or PR validation. When signing is enabled, missing signing inputs fail the tagged macOS job and block the whole release. With signing disabled, explicitly labeled unsigned macOS assets are accepted for publication.
 
 Before the first public tag, run manual Actions validation, complete native macOS/Linux checks, audit third-party license/source obligations, and test on Windows/macOS machines without developer tools. GitHub hosted Windows/macOS runners contain developer tools; an empty PATH test alone does not replace those clean-machine checks. Publication and certificate purchases are separate from implementing these scripts.

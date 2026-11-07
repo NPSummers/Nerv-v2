@@ -6,11 +6,13 @@ Nerv 1.0.0 adds self-contained compiler distributions and native installers. Ins
 
 | Platform | Downloads | Minimum system |
 | --- | --- | --- |
-| Windows x64 | Per-user setup EXE and portable ZIP | Windows 10 with UCRT |
-| macOS arm64 | Installer PKG and portable ZIP | macOS 15 |
+| Windows x64 | Unsigned per-user setup EXE and portable ZIP | Windows 10 with UCRT |
+| macOS arm64 | Unsigned installer PKG and portable ZIP | macOS 15 |
 | Linux x64 | Portable tar.gz | glibc 2.39 |
 
 The release manifest records final artifact hashes, source commit, producer versions, and signing status. Verify downloads against SHA256SUMS and read the [installation instructions](installation.md).
+
+Windows and macOS builds are unsigned. The macOS package is not Apple-notarized; normal operating-system checks for downloaded software still apply. Installer filenames explicitly include `unsigned`.
 
 Windows setup offers user PATH integration and an uninstaller. macOS installs versioned payloads and a managed public symlink; its bundled uninstall script preserves files outside the installed-file inventory. Linux downloads require extraction only.
 

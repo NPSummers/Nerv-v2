@@ -55,6 +55,7 @@ jobs:
       RELEASE_TARGET: ${{ matrix.target }}
       RELEASE_LABEL: ${{ matrix.label }}
       MACOSX_DEPLOYMENT_TARGET: '15.0'
+      MACOS_SIGNING_ENABLED: ${{ vars.NERV_MACOS_SIGNING_ENABLED || 'false' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@dc08e2af391d489dff6d14cf743e574f7d1229c5
@@ -83,7 +84,7 @@ jobs:
         shell: bash
         run: bash tools/build-distribution.sh
       - name: Sign and notarize macOS tag release
-        if: runner.os == 'macOS' && github.event_name == 'push' && github.ref_type == 'tag'
+        if: runner.os == 'macOS' && github.event_name == 'push' && github.ref_type == 'tag' && env.MACOS_SIGNING_ENABLED == 'true'
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}

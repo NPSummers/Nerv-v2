@@ -98,16 +98,31 @@ class Publication(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mismatch"):
             publisher.inventory(self.root, self.version, self.commit)
 
-    def test_missing_platform_or_unsigned_macos_blocks_publication(self):
+    def test_missing_platform_or_unknown_macos_signing_state_blocks_publication(self):
         path = self.root / "manifest-macos-arm64.json"
         manifest = json.loads(path.read_text())
-        manifest["signing"] = "unsigned"
+        manifest["signing"] = "unknown"
         path.write_text(json.dumps(manifest))
-        with self.assertRaisesRegex(ValueError, "notarized"):
+        with self.assertRaisesRegex(ValueError, "signing status"):
             publisher.inventory(self.root, self.version, self.commit)
         path.unlink()
         with self.assertRaisesRegex(ValueError, "three required"):
             publisher.inventory(self.root, self.version, self.commit)
+
+    def test_unsigned_macos_requires_explicit_unsigned_installer_filename(self):
+        path = self.root / "manifest-macos-arm64.json"
+        manifest = json.loads(path.read_text())
+        manifest["signing"] = "unsigned"
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "expected installer"):
+            publisher.inventory(self.root, self.version, self.commit)
+        for artifact in manifest["artifacts"]:
+            if artifact["name"].endswith("installer.pkg"):
+                name = artifact["name"].replace("installer.pkg", "installer-unsigned.pkg")
+                (self.root / artifact["name"]).rename(self.root / name)
+                artifact["name"] = name
+        path.write_text(json.dumps(manifest))
+        self.assertEqual(len(publisher.inventory(self.root, self.version, self.commit)), 7)
 
     def test_non_tag_events_never_call_github(self):
         for event, ref in [("workflow_dispatch", "refs/tags/v1.2.3-rc.1"), ("push", "refs/heads/main"), ("pull_request", "refs/pull/1/merge")]:

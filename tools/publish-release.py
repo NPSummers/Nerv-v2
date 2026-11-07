@@ -27,12 +27,14 @@ def inventory(directory, version, commit):
             raise ValueError("release manifests disagree on version or source commit")
         if item.get("source_dirty", True):
             raise ValueError("release payload must come from an unmodified tagged checkout")
-        if item["platform"] == "macos-arm64" and item["signing"] != "Developer ID, notarized":
-            raise ValueError("public macOS releases must be signed and notarized")
+        if item["platform"] == "macos-arm64" and item["signing"] not in {"unsigned", "Developer ID, notarized"}:
+            raise ValueError("unrecognized macOS signing status")
         expected = 1 if item["platform"] == "linux-x64" else 2
         if len(item["artifacts"]) != expected:
             raise ValueError("incomplete platform artifact set")
         suffixes = {"windows-x64": ["portable.zip", "setup-unsigned.exe"], "macos-arm64": ["portable.zip", "installer.pkg"], "linux-x64": ["portable.tar.gz"]}[item["platform"]]
+        if item["platform"] == "macos-arm64" and item["signing"] == "unsigned":
+            suffixes = ["portable.zip", "installer-unsigned.pkg"]
         if {artifact["name"] for artifact in item["artifacts"]} != {f"nerv-{version}-{item['platform']}-{suffix}" for suffix in suffixes}:
             raise ValueError("platform is missing an expected installer/portable download")
         for artifact in item["artifacts"]:
@@ -85,11 +87,16 @@ def publish(directory, tag, commit):
     with tempfile.TemporaryDirectory(prefix="nerv-release-") as temporary:
         root = Path(temporary)
         notes = root / "notes.md"
-        notes.write_text(f"Nerv {tag[1:]}\n\n| Platform | Downloads | Minimum system |\n| --- | --- | --- |\n| Windows x64 | Setup EXE (unsigned), portable ZIP | Windows 10 / UCRT |\n| macOS arm64 | Notarized PKG, portable ZIP | macOS 15 |\n| Linux x64 | Portable tar.gz | glibc 2.39 |\n\nVerify downloads using SHA256SUMS. Extract portable downloads or run the installer, then use `nerv new hello` and `nerv run`. No separate compiler toolchain is needed. Windows development artifacts are unsigned; inspect the signing status in release-manifest.json.\n\nThe language/API remains experimental during 0.x. Source commit: {commit}.\n", encoding="utf-8")
+        notes.write_text(f"Nerv {tag[1:]}\n\n| Platform | Downloads | Minimum system |\n| --- | --- | --- |\n| Windows x64 | Setup EXE (unsigned), portable ZIP | Windows 10 / UCRT |\n| macOS arm64 | Installer PKG, portable ZIP | macOS 15 |\n| Linux x64 | Portable tar.gz | glibc 2.39 |\n\nVerify downloads using SHA256SUMS. Extract portable downloads or run the installer, then use `nerv new hello` and `nerv run`. No separate compiler toolchain is needed. Windows installers are unsigned; inspect the signing status in release-manifest.json.\n\nSee the documented language and release compatibility policy. Source commit: {commit}.\n", encoding="utf-8")
         release_notes = Path(__file__).resolve().parent.parent / "docs" / f"releases-{tag[1:]}.md"
         if release_notes.is_file():
             body = release_notes.read_text(encoding="utf-8").replace("](installation.md)", f"](https://github.com/{repo}/blob/{commit}/docs/installation.md)")
             notes.write_text(body + f"\nSource commit: {commit}.\n", encoding="utf-8")
+        manifests = [json.loads(path.read_text(encoding="utf-8")) for path in directory.glob("manifest-*.json")]
+        unsigned = [item["platform"] for item in manifests if item["signing"] == "unsigned" and item["platform"] in {"windows-x64", "macos-arm64"}]
+        if unsigned:
+            with notes.open("a", encoding="utf-8") as output:
+                output.write("\nSigning status: " + ", ".join(sorted(unsigned)) + " builds are unsigned. The macOS package is not Apple-notarized. Installer filenames include `unsigned`; full signing details are in release-manifest.json.\n")
         if release is None:
             subprocess.run(["gh", "release", "create", tag, "--verify-tag", "--draft", "--title", f"Nerv {tag[1:]}", "--notes-file", str(notes)], check=True)
             release = {"draft": True, "assets": []}
