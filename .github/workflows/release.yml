@@ -129,7 +129,10 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
         run: |
-          docker run --rm -v "$PWD/dist:/input:ro" "$IMAGE" sh -eu -c '
+          docker run --rm --network none -v "$PWD/dist:/input:ro" "$IMAGE" sh -eu -c '
+            for tool in cargo rustc clang gcc cc; do
+              if command -v "$tool" >/dev/null 2>&1; then echo "Unexpected development tool: $tool" >&2; exit 1; fi
+            done
             mkdir /nerv
             tar -xzf /input/*-portable.tar.gz -C /nerv --strip-components=1
             mkdir /work
