@@ -57,6 +57,16 @@ class Versions(unittest.TestCase):
         tagged = json.loads(subprocess.check_output([*command, "--tag", "v" + version.validate()["version"]], text=True))
         self.assertEqual({item["label"] for item in tagged["matrix"]["include"]}, {"linux-x64", "macos-arm64", "windows-x64"})
 
+    def test_github_outputs_preserve_case_sensitive_semver_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "github-output"
+            result = {"version": "1.2.3-RC.1+BuildID", "prerelease": True, "installer_version": "1.2.3.0"}
+            with patch.object(version, "validate", return_value=result), patch.object(sys, "argv", ["release_version.py", "--github-output", str(output)]), patch("builtins.print"):
+                version.main()
+            lines = output.read_text(encoding="utf-8").splitlines()
+            self.assertIn("version=1.2.3-RC.1+BuildID", lines)
+            self.assertIn("prerelease=true", lines)
+
 
 class Publication(unittest.TestCase):
     def setUp(self):

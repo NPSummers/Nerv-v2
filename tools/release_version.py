@@ -63,7 +63,8 @@ def main():
     if args.github_output:
         with args.github_output.open("a", encoding="utf-8") as output:
             for key, value in result.items():
-                output.write(f"{key}={json.dumps(value) if isinstance(value, dict) else str(value).lower()}\n")
+                formatted = json.dumps(value) if isinstance(value, (dict, bool)) else str(value)
+                output.write(f"{key}={formatted}\n")
     print(json.dumps(result))
 
 
