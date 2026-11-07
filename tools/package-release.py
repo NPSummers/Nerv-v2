@@ -377,12 +377,10 @@ def main():
         environment = clean_environment()
         smoke(binary, Path(temporary), environment)
         relocated = Path(temporary) / "relocated space \u00e9"
-        bundle.rename(relocated)
-        bundle = relocated
+        shutil.copytree(bundle, relocated, symlinks=True)
         relocation = Path(temporary) / "relocation"
         relocation.mkdir()
-        smoke(bundle / binary_name, relocation, environment)
-        bundle = bundle.rename(Path(temporary) / name)
+        smoke(relocated / binary_name, relocation, environment)
         archive = args.output / f"{name}-portable.{extension}"
         archive_payload(bundle, archive)
         if args.payload:
