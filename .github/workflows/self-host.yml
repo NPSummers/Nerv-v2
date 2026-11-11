@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: self-hosted-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   bootstrap:
     strategy:
@@ -25,6 +29,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             label: linux-x64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     env:
       MACOSX_DEPLOYMENT_TARGET: '15.0'
     steps:
@@ -46,6 +51,15 @@ jobs:
         run: |
           if [ -f bootstrap/Cargo.toml ]; then echo 'path=.' >> "$GITHUB_OUTPUT"; else echo 'path=nerv' >> "$GITHUB_OUTPUT"; fi
           echo "NERV_REFERENCE=$GITHUB_WORKSPACE/.stage0-reference" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ steps.source.outputs.path }}/target/bootstrap
+            .stage0-reference/llvm
+            .stage0-reference/target/toolchains
+          key: self-hosted-v1-${{ runner.os }}-${{ hashFiles('nerv/bootstrap/Cargo.lock', 'bootstrap/Cargo.lock') }}
       - name: Prepare Windows dependencies
         if: runner.os == 'Windows'
         shell: pwsh
@@ -69,7 +83,7 @@ jobs:
           echo "LLVM_SYS_231_PREFIX=$LLVM_SYS_231_PREFIX" >> "$GITHUB_ENV"
           echo "LLVM_CONFIG_PATH=$LLVM_CONFIG_PATH" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$LLVM_SYS_231_PREFIX/lib" >> "$GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=$LLVM_SYS_231_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_SYS_231_PREFIX/lib" >> "$GITHUB_ENV"
           echo "NERV_CC=$LLVM_SYS_231_PREFIX/bin/clang" >> "$GITHUB_ENV"
           if [ "$RUNNER_OS" = macOS ]; then python .stage0-reference/tools/setup-toolchain.py macos; fi
       - name: Prepare native link plan
@@ -89,6 +103,33 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Windows ]; then compiler=target/stage3.exe; library="$LLVM_SYS_231_PREFIX/bin/LLVM-C.dll"; elif [ "$RUNNER_OS" = macOS ]; then compiler=target/stage3; library="$LLVM_SYS_231_PREFIX/lib/libLLVM-23.dylib"; else compiler=target/stage3; library="$LLVM_SYS_231_PREFIX/lib/libLLVM-23.so"; fi
           python tools/package-portable.py --compiler "$compiler" --llvm-library "$library"
+      - name: Build and test Windows installer
+        if: runner.os == 'Windows'
+        working-directory: ${{ steps.source.outputs.path }}
+        shell: pwsh
+        run: |
+          $iscc = & "$env:NERV_REFERENCE/tools/setup-installer.ps1"
+          python "$env:NERV_REFERENCE/tools/build-installer.py" --payload target/portable --output target/installers --version 0.1.0 --platform windows --iscc "$iscc"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python "$env:NERV_REFERENCE/tools/test-installer-windows.py" --installer target/installers/nerv-0.1.0-windows-x64-setup-unsigned.exe --payload target/portable
+      - name: Build and test macOS installer
+        if: runner.os == 'macOS'
+        working-directory: ${{ steps.source.outputs.path }}
+        shell: bash
+        run: |
+          python "$NERV_REFERENCE/tools/build-installer.py" --payload target/portable --output target/installers --version 0.1.0 --platform macos
+          installed=/Library/Nerv/0.1.0
+          sudo installer -pkg target/installers/nerv-0.1.0-macos-arm64-installer-unsigned.pkg -target /
+          trap 'sudo sh target/portable/uninstall-macos.sh 0.1.0' EXIT
+          diff -r target/portable "$installed"
+          work=$(mktemp -d)
+          (cd "$work"; /usr/local/bin/nerv new hello; cd hello; env -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH PATH= /usr/local/bin/nerv run --release --locked)
+          sudo installer -pkg target/installers/nerv-0.1.0-macos-arm64-installer-unsigned.pkg -target /
+          diff -r target/portable "$installed"
+          sudo sh target/portable/uninstall-macos.sh 0.1.0
+          trap - EXIT
+          test -f "$work/hello/src/main.nerv"
+          test ! -L /usr/local/bin/nerv
       - uses: actions/upload-artifact@v4
         with:
           name: self-hosted-${{ matrix.label }}
@@ -96,6 +137,7 @@ jobs:
             ${{ steps.source.outputs.path }}/target/portable.zip
             ${{ steps.source.outputs.path }}/target/portable.tar.gz
             ${{ steps.source.outputs.path }}/target/bootstrap-proof.json
+            ${{ steps.source.outputs.path }}/target/installers/*
           if-no-files-found: error
 
   portable:

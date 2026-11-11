@@ -3,6 +3,8 @@ import json
 import importlib.util
 import platform
 import sys
+import time
+import tomllib
 import os
 from pathlib import Path
 import shutil
@@ -48,14 +50,27 @@ def main():
     (output / "native.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
     shutil.copy2(ROOT / "README.md", output / "README.md")
+    version = tomllib.loads((ROOT / "Nerv.toml").read_text(encoding="utf-8"))["package"]["version"]
+    (output / "VERSION").write_text(version + "\nSelf-hosted Nerv compiler\n", encoding="utf-8")
+    if platform.system() == "Darwin":
+        shutil.copy2(reference / "tools/installers/uninstall-macos.sh", output / "uninstall-macos.sh")
+        (output / "uninstall-macos.sh").chmod(0o755)
     notices = output / "licenses"
     notices.mkdir(exist_ok=True)
-    package.licenses(notices)
+    staging = ROOT / "target" / f"license-stage-{time.time_ns()}"
+    staging.mkdir()
+    try:
+        package.licenses(staging)
+        shutil.copytree(staging, notices, dirs_exist_ok=True)
+    finally:
+        if staging.resolve().parent != (ROOT / "target").resolve() or not staging.name.startswith("license-stage-"):
+            raise RuntimeError("license staging path escaped the build directory")
+        shutil.rmtree(staging)
     if platform.system() == "Darwin":
         package.mac_libraries(output / "nerv", args.llvm_library.resolve().parent.parent, output, original=compiler, extra=[(output / config["linker"], root / Path(config["linker"]).relative_to("toolchain"))])
     if platform.system() == "Linux":
         package.elf_libraries(output / "nerv", args.llvm_library.resolve().parent.parent, output, compiler, output / config["linker"])
-    env = {key: value for key, value in os.environ.items() if not key.startswith("NERV_")}
+    env = {key: value for key, value in os.environ.items() if not key.startswith("NERV_") and key not in {"LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "LLVM_SYS_231_PREFIX", "LLVM_CONFIG_PATH", "LIB", "LIBPATH", "INCLUDE", "CARGO_HOME", "RUSTUP_HOME"}}
     env["PATH"] = os.environ.get("SystemRoot", "C:/Windows") + "/System32" if os.name == "nt" else "/usr/bin:/bin"
     fixture = ROOT / "target/portable-smoke"
     fixture.mkdir(exist_ok=True)
@@ -69,7 +84,7 @@ def main():
         raise RuntimeError("portable smoke output mismatch")
     archive = output.with_suffix(".zip" if os.name == "nt" else ".tar.gz")
     if os.name == "nt":
-        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False) as bundle:
             for file in sorted(output.rglob("*")):
                 if file.is_file():
                     bundle.write(file, Path(output.name) / file.relative_to(output))

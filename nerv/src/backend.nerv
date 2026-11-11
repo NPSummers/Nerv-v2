@@ -820,7 +820,7 @@ fn emit_object(b: Backend, output: string, release: bool) -> string
         3
     else
         0
-    let machine = llvm.CreateTargetMachine(b.api, nerv.ffi.load(target), triple, "generic", "", level, 0, 0)
+    let machine = llvm.CreateTargetMachine(b.api, nerv.ffi.load(target), triple, "generic", "", level, 2, 0)
     nerv.ffi.free(target)
     if machine == 0
         nerv.ffi.free(error)
