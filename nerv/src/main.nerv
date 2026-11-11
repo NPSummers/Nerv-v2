@@ -1,0 +1,390 @@
+import nerv.std
+import lexer
+import ast
+import parser
+import nerv.json
+import sema
+import ir
+import source
+import loader
+import project
+import manifest
+import backend
+import linker
+import format
+import cache
+
+fn ids_json(ids: Buffer<i64>) -> string
+    let mut values = [""] * ids:len()
+    for index in 0 .. ids:len()
+        values [index] = integer_text(ids:get(index))
+    nerv.string.concat("[", nerv.string.concat(join_text(values, ","), "]"))
+
+fn show_ir(program: CheckedProgram) -> i64
+    for index in 0 .. program.source_paths:len()
+        println(join_text(["[\"source\",", integer_text(index), ",", nerv.json.string(program.source_paths:get(index)), "]"], ""))
+    for index in 0 .. program.types:len()
+        let item = program.types:get(index)
+        let row = ["\"type\"", integer_text(index), nerv.json.string(type_tag_name(item.tag)), nerv.json.string(item.name), integer_text(item.nominal), ids_json(item.parts)]
+        println(nerv.string.concat("[", nerv.string.concat(join_text(row, ","), "]")))
+    for index in 0 .. program.symbols:len()
+        let item = program.symbols:get(index)
+        let row = ["\"symbol\"", integer_text(index), nerv.json.string(item.name), nerv.json.string(item.category), integer_text(item.type_id), integer_text(item.owner), integer_text(item.slot), boolean_text(item.mutable), integer_text(item.module_id)]
+        println(nerv.string.concat("[", nerv.string.concat(join_text(row, ","), "]")))
+    for index in 0 .. program.nodes:len()
+        let item = program.nodes:get(index)
+        let row = ["\"node\"", integer_text(index), nerv.json.string(ir_name(item.op)), integer_text(item.type_id), integer_text(item.symbol), integer_text(item.slot), integer_text(item.start), integer_text(item.end), nerv.json.string(item.text), ids_json(item.children), integer_text(item.module_id)]
+        println(nerv.string.concat("[", nerv.string.concat(join_text(row, ","), "]")))
+    for index in 0 .. program.captures:len()
+        let item = program.captures:get(index)
+        let row = ["\"capture\"", integer_text(item.function), integer_text(item.target), integer_text(item.symbol), integer_text(item.slot)]
+        println(nerv.string.concat("[", nerv.string.concat(join_text(row, ","), "]")))
+    println(join_text(["[\"program\",", integer_text(program.main), ",", ids_json(program.functions), "]"], ""))
+    0
+
+fn semantic_error(error: SemanticError, text: string) -> i64
+    let prefix = nerv.string.slice(text, 0, error.start)
+    let location = source.load_source(prefix)
+    let line = location.lines [location.length]
+    let column = location.columns [location.length]
+    stderr(join_text([integer_text(line), ":", integer_text(column), ": ", error.message, "\n"], ""))
+    1
+
+fn checked_output(program: CheckedProgram, dump: bool, output: string, release: bool, object_only: bool, tests: bool, fingerprint: string) -> i64
+    if output != ""
+        let problem = cache.build(program, output, release, tests, fingerprint, object_only)
+        if problem != ""
+            stderr(nerv.string.concat(problem, "\n"))
+            return 1
+        stderr(join_text(["Built ", output, "\n"], ""))
+        return 0
+    if dump
+        return show_ir(program)
+    println("Type check passed")
+    0
+
+fn graph_error(error: SemanticError, graph: SourceGraph) -> i64
+    let unit = graph.modules:get(error.source)
+    stderr(nerv.string.concat(unit.path, ":"))
+    semantic_error(error, unit.text)
+
+fn analyze_graph(graph: SourceGraph, dump: bool, output: string, release: bool, object_only: bool, tests: bool) -> i64
+    match sema.check_graph(graph)
+        Ok(program) => checked_output(program, dump, output, release, object_only, tests, graph_fingerprint(graph, output))
+        Err(error) => graph_error(error, graph)
+
+fn loading_error(error: LoadError) -> i64
+    let text = result_or(read_text(error.path), "")
+    stderr(nerv.string.concat(error.path, ":"))
+    semantic_error(SemanticError { source: 0, start: error.start, end: error.end, message: error.message }, text)
+
+fn analyze_file(file: string, dump: bool, manifest_file: string, locked: bool, output: string, release: bool, object_only: bool, tests: bool) -> i64
+    let args = arguments()
+    let bundled = path(nerv.ffi.executable()):parent():join("stdlib")
+    let fallback = if loader.exists(bundled)
+        bundled.text
+    else
+        "stdlib"
+    let stdlib = option_or(environment("NERV_STDLIB"), fallback)
+    match loader.load_options(file, stdlib, manifest_file, locked)
+        Ok(graph) => analyze_graph(graph, dump, output, release, object_only, tests)
+        Err(error) => loading_error(error)
+
+fn display_ast(tree: Ast) -> i64
+    for index in 0 .. tree.nodes:len()
+        let node = tree.nodes:get(index)
+        let mut ids = [""] * node.children:len()
+        for offset in 0 .. node.children:len()
+            ids [offset] = integer_text(node.children:get(offset))
+        let children = nerv.string.concat("[", nerv.string.concat(join_text(ids, ","), "]"))
+        let fields = [integer_text(index), nerv.json.string(tag_name(node.tag)), integer_text(node.start), integer_text(node.end), nerv.json.string(node.text), children]
+        println(nerv.string.concat("[", nerv.string.concat(join_text(fields, ","), "]")))
+    0
+
+fn syntax_error(error: SyntaxError) -> i64
+    stderr(join_text([integer_text(error.line), ":", integer_text(error.column), ": ", error.message, "\n"], ""))
+    1
+
+fn parse_source(text: string) -> i64
+    match parser.parse(text)
+        Ok(tree) => display_ast(tree)
+        Err(error) => syntax_error(error)
+
+fn process(text: string, mode: string) -> i64
+    if mode == "--parse"
+        return parse_source(text)
+    scan(text, mode == "--tokens")
+
+fn display(stream: TokenStream, text: string, spans: bool) -> i64
+    for index in 0 .. stream.tokens:len()
+        let item = stream.tokens:get(index)
+        if spans
+            println(join_text([item.kind, integer_text(item.start), integer_text(item.end), integer_text(item.line), integer_text(item.column)], "\t"))
+        else
+            let location = nerv.string.concat(integer_text(item.line), nerv.string.concat(":", integer_text(item.column)))
+            println(join_text([location, item.kind, nerv.string.slice(text, item.start, item.end)], " "))
+    0
+
+fn lexical_error(error: LexError) -> i64
+    stderr(join_text([integer_text(error.line), ":", integer_text(error.column), ": ", error.message, "\n"], ""))
+    1
+
+fn scan(text: string, spans: bool) -> i64
+    match lexer.lex(text)
+        Ok(stream) => display(stream, text, spans)
+        Err(error) => lexical_error(error)
+
+fn io_failure(error: IoError) -> i64
+    stderr(nerv.string.concat(error.message, "\n"))
+    1
+
+fn main() -> i64
+    let args = arguments()
+    if nerv.arrays.len(args) < 2
+        stderr("Usage: nerv_bootstrap --check|--ir [FILE] [--manifest-path PATH] [--locked]\n")
+        return 1
+    let mode = args [1]
+    if mode == "--help" or mode == "-h"
+        println("Nerv: new, check, run, build, test, fmt\nBuild: --release|--debug --emit-object --no-cache -o PATH\nProject: --manifest-path Nerv.toml --locked\nRun: -- arguments\nInspect: --lex|--tokens|--parse|--ir FILE")
+        return 0
+    if mode == "--version"
+        println("Nerv 0.1.0 (compiler written in Nerv)")
+        return 0
+    if mode == "new"
+        return create_project(args)
+    if mode == "--check" or mode == "--ir" or mode == "check" or mode == "build" or mode == "run" or mode == "test" or mode == "fmt"
+        let mut file = ""
+        let mut manifest_file = ""
+        let mut locked = false
+        let mut output = ""
+        let mut release = false
+        let mut object_only = false
+        let mut run_args = buffer("")
+        let mut format_check = false
+        let mut index = 2
+        while index < nerv.arrays.len(args)
+            let argument = args [index]
+            if argument == "--" and mode == "run"
+                index = index + 1
+                while index < nerv.arrays.len(args)
+                    run_args = run_args:push(args [index])
+                    index = index + 1
+                break
+            if argument == "--check" and mode == "fmt"
+                format_check = true
+                index = index + 1
+                continue
+            if argument == "--no-cache"
+                index = index + 1
+                continue
+            if argument == "--debug"
+                release = false
+                index = index + 1
+                continue
+            if argument == "--release"
+                release = true
+                index = index + 1
+                continue
+            if argument == "--emit-object"
+                object_only = true
+                index = index + 1
+                continue
+            if argument == "-o" and index + 1 < nerv.arrays.len(args)
+                index = index + 1
+                output = args [index]
+                index = index + 1
+                continue
+            if argument == "--locked"
+                locked = true
+            else
+                if argument == "--manifest-path" and index + 1 < nerv.arrays.len(args)
+                    index = index + 1
+                    manifest_file = args [index]
+                else
+                    if file != "" or nerv.string.starts_with(argument, "--") == 1
+                        stderr("Unexpected argument\n")
+                        return 1
+                    file = argument
+            index = index + 1
+        if file == "" and manifest_file == ""
+            manifest_file = project.discover(result_or(current_directory(), path("")).text)
+        if (mode == "build" or mode == "run" or mode == "test") and output == ""
+            output = default_output(file, manifest_file, release, object_only, mode == "test")
+        if mode == "fmt" and file != ""
+            return format_file(file, format_check)
+        if (mode == "test" or mode == "fmt" or mode == "check" or mode == "--check") and file == ""
+            return project_operation(manifest_file, locked, release, mode, format_check)
+        let status = analyze_file(file, mode == "--ir", manifest_file, locked, output, release, object_only, mode == "test")
+        if status != 0 or (mode != "run" and mode != "test")
+            return status
+        return run_arguments(output, string_list(run_args))
+    if nerv.arrays.len(args) != 3 or (mode != "--lex" and mode != "--tokens" and mode != "--parse")
+        stderr("Supported modes: --lex, --tokens, --parse, --check, --ir, build.\n")
+        return 1
+    match read_text(args [2])
+        Ok(text) => process(text, mode)
+        Err(error) => io_failure(error)
+
+fn run_arguments(output: string, args: []string) -> i64
+    let executable = result_or(path(output):canonicalize(), path(output)).text
+    nerv.ffi.run(executable, args)
+
+fn run_output(output: string) -> i64 => run_arguments(output, [""] * 0)
+
+fn string_list(values: Buffer<string>) -> []string
+    let mut output = [""] * values:len()
+    for index in 0 .. values:len()
+        output [index] = values:get(index)
+    output
+
+fn project_directory(directory: string, manifest_file: string, locked: bool, release: bool, visited: Buffer<string>, operation: string, format_check: bool) -> i64
+    if not project.is_directory(directory)
+        return 0
+    let canonical = result_or(path(directory):canonicalize(), path(directory)).text
+    for index in 0 .. visited:len()
+        if visited:get(index) == canonical
+            stderr("source directory cycle\n")
+            return 1
+    let chain = visited:push(canonical)
+    let entries = match list_directory(directory)
+        Ok(values) => values
+        Err(error) => directory_failure(error)
+    if nerv.arrays.len(entries) == 1 and entries [0] == ""
+        return 1
+    let mut failures = 0
+    for index in 0 .. nerv.arrays.len(entries)
+        let file = path(directory):join(entries [index]).text
+        if project.is_directory(file)
+            failures = failures + project_directory(file, manifest_file, locked, release, chain, operation, format_check)
+        else
+            if nerv.string.ends_with(file, ".nerv") == 1
+                if operation == "fmt"
+                    failures = failures + format_file(file, format_check)
+                else
+                    if operation == "check" or operation == "--check"
+                        failures = failures + analyze_file(file, false, manifest_file, locked, "", false, false, false)
+                    else
+                        let args = arguments()
+                        let mode = if release
+                            "--release"
+                        else
+                            "--debug"
+                        let lock = if locked
+                            "--locked"
+                        else
+                            "--debug"
+                        let options = ["test", file, "--manifest-path", manifest_file, "-o", "target/nerv_test.exe", lock, mode]
+                        let status = nerv.ffi.run(args [0], options)
+                        if status != 0
+                            failures = failures + 1
+    failures
+
+fn process_package(packages: Project, manifest_file: string, locked: bool, release: bool, operation: string, format_check: bool) -> i64
+    let root = packages.packages:get(0).root
+    let created = result_or(create_directory("target"), -1)
+    let selected = packages.packages:get(0)
+    if operation == "check" or operation == "--check"
+        let entry_status = analyze_file("", false, manifest_file, locked, "", false, false, false)
+        if entry_status != 0
+            return entry_status
+    let first = project_directory(path(root):join("src").text, manifest_file, locked, release, buffer(""), operation, format_check)
+    let second = project_directory(path(root):join("tests").text, manifest_file, locked, release, buffer(""), operation, format_check)
+    if first + second != 0
+        stderr(nerv.string.concat(integer_text(first + second), " files failed\n"))
+        return 1
+    println("All files passed")
+    0
+
+fn project_failure(error: ProjectError) -> i64
+    stderr(nerv.string.concat(error.message, "\n"))
+    1
+
+fn project_operation(file: string, locked: bool, release: bool, operation: string, format_check: bool) -> i64
+    match project.load(file, locked)
+        Ok(packages) => process_package(packages, file, locked, release, operation, format_check)
+        Err(error) => project_failure(error)
+
+fn format_text(file: string, text: string, check: bool) -> i64
+    match format.source(text)
+        Ok(output) => save_format(file, text, output, check)
+        Err(error) => format_failure(file, error)
+
+fn format_failure(file: string, message: string) -> i64
+    stderr(join_text([file, ": ", message, "\n"], ""))
+    1
+
+fn format_file(file: string, check: bool) -> i64
+    match read_text(file)
+        Ok(text) => format_text(file, text, check)
+        Err(error) => io_failure(error)
+
+fn saved_format(result: Result<bool, ProjectError>) -> i64
+    match result
+        Ok(done) => 0
+        Err(error) => project_failure(error)
+
+fn save_format(file: string, before: string, after: string, check: bool) -> i64
+    if before == after
+        return 0
+    if check
+        stderr(join_text(["Would format ", file, "\n"], ""))
+        return 1
+    saved_format(project.write_atomic(file, after))
+
+fn directory_failure(error: IoError) -> []string
+    stderr(nerv.string.concat(error.message, "\n"))
+    [""]
+
+fn graph_fingerprint(graph: SourceGraph, output: string) -> string
+    if output == ""
+        return ""
+    cache.fingerprint(graph)
+
+fn created_project(packages: Project) -> i64
+    println(nerv.string.concat("Created ", packages.packages:get(0).root))
+    0
+
+fn create_project(args: []string) -> i64
+    let mut library = false
+    let mut destination = ""
+    for index in 2 .. nerv.arrays.len(args)
+        if args [index] == "--lib"
+            library = true
+        else
+            if destination != ""
+                stderr("Usage: nerv new [--lib] PATH\n")
+                return 1
+            destination = args [index]
+    match project.create(destination, library)
+        Ok(packages) => created_project(packages)
+        Err(error) => project_failure(error)
+
+fn default_name(package: Package) -> string => package.name
+fn fallback_name(error: ProjectError) -> string => "program"
+
+fn default_output(file: string, manifest_file: string, release: bool, object_only: bool, tests: bool) -> string
+    let config = if manifest_file != ""
+        manifest_file
+    else
+        project.discover(file)
+    let raw = result_or(read_text(config), "")
+    let name = match manifest.parse(raw, config, path(config):parent().text)
+        Ok(package) => default_name(package)
+        Err(error) => fallback_name(error)
+    let directory = if release
+        "target/nerv/release"
+    else
+        "target/nerv/debug"
+    let suffix = if nerv.string.ends_with(nerv.ffi.executable(), ".exe") == 1
+        ".exe"
+    else
+        ""
+    let extension = if object_only
+        ".o"
+    else
+        suffix
+    let label = if tests
+        nerv.string.concat(name, "_test")
+    else
+        name
+    path(directory):join(nerv.string.concat(label, extension)).text

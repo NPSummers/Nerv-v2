@@ -1,0 +1,62 @@
+import nerv.std
+import ast
+import parser
+import ir
+import sema
+
+fn generic_syntax_failure(error: SyntaxError) -> Ast
+    println(error.message)
+    assert(false)
+    Ast { nodes:buffer(empty_node()), root: - 1 }
+
+fn generic_ast(text: string) -> Ast
+    match parser.parse(text)
+        Ok(tree) => tree
+        Err(error) => generic_syntax_failure(error)
+
+fn generic_failure(error: SemanticError) -> CheckedProgram
+    println(error.message)
+    assert(false)
+    CheckedProgram { types:buffer(empty_type()), symbols:buffer(empty_symbol()), nodes:buffer(empty_ir()), functions:buffer(0), main: - 1, captures:buffer(Capture { function: - 1, target: - 1, symbol: - 1, slot: - 1 }), source_paths:buffer("") }
+
+fn generic_program(text: string) -> CheckedProgram
+    match sema.check(generic_ast(text))
+        Ok(program) => program
+        Err(error) => generic_failure(error)
+
+fn generic_rejects(text: string) -> bool
+    match sema.check(generic_ast(text))
+        Ok(program) => false
+        Err(error) => true
+
+test "generic instances are concrete and reused"
+    let text = "fn identity<T>(value: T) -> T => value\nfn main()\n    println(identity(1))\n    println(identity(2))\n    println(identity(true))\n"
+    let program = generic_program(text)
+    assert(program.functions:len() == 3)
+    for index in 0 .. program.nodes:len()
+        assert(program.nodes:get(index).type_id != 6)
+
+test "generic array and function arguments infer element types"
+    let text = "fn first<T>(values: []T) -> T => values[0]\nfn apply<T>(f: fn(T) -> T, value: T) -> T => f(value)\nfn add(n: i64) -> i64 => n + 1\nfn main() -> i64 => apply(add, first([41]))\n"
+    let program = generic_program(text)
+    assert(program.functions:len() == 4)
+
+test "return annotations can infer otherwise absent arguments"
+    let text = "fn empty<T>() -> []T => []\nfn main() -> i64\n    let values: []i64 = empty()\n    nerv.arrays.len(values)\n"
+    let program = generic_program(text)
+    assert(program.functions:len() == 2)
+
+test "recursive generic function has one specialization per type"
+    let text = "fn repeat<T>(n: i64, value: T) -> T\n    if n == 0\n        return value\n    repeat(n - 1, value)\nfn main() -> i64 => repeat(3, 42)\n"
+    let program = generic_program(text)
+    assert(program.functions:len() == 2)
+
+test "conflicts missing inference and generic body errors are rejected"
+    assert(generic_rejects("fn choose<T>(a: T, b: T) -> T => a\nfn main() -> i64 => choose(1, true)\n"))
+    assert(generic_rejects("fn unused<T>()\n    println(0)\nfn main()\n    unused()\n"))
+    assert(generic_rejects("fn broken<T>(value: T) -> T => absent\nfn main() -> i64 => broken(1)\n"))
+    assert(generic_rejects("fn constrained<T: Read>(value: T) -> T => value\nfn main() -> i64 => constrained(1)\n"))
+
+test "unused generic bodies are deferred"
+    let program = generic_program("fn unused<T>(value: T) -> T => absent\nfn main() -> i64 => 0\n")
+    assert(program.functions:len() == 1)

@@ -1,0 +1,600 @@
+import nerv.std
+import lexer
+import ast
+import source
+
+struct Parser
+    text: string
+    tokens: Buffer<Token>
+    cursor: []i64
+    arena: []Buffer<Node>
+    error: []string
+
+fn peek(p: Parser) -> Token => p.tokens:get(p.cursor [0])
+fn at(p: Parser, kind: string) -> bool => peek(p).kind == kind
+fn failed(p: Parser) -> bool => p.cursor [1] >= 0
+
+fn advance(p: Parser) -> Token
+    let item = peek(p)
+    let mut cursor = p.cursor
+    if item.kind != "Eof" and not failed(p)
+        cursor [0] = cursor [0] + 1
+    item
+
+fn fail(p: Parser, message: string) -> void
+    if not failed(p)
+        let mut cursor = p.cursor
+        let mut error = p.error
+        cursor [1] = cursor [0]
+        error [0] = message
+
+fn eat(p: Parser, kind: string) -> bool
+    if failed(p) or not at(p, kind)
+        return false
+    advance(p)
+    true
+
+fn need(p: Parser, kind: string) -> void
+    if not eat(p, kind)
+        fail(p, nerv.string.concat("expected ", kind))
+
+fn newlines(p: Parser) -> void
+    while eat(p, "Newline")
+        0
+
+fn end_line(p: Parser) -> void
+    if eat(p, "Newline") or at(p, "Dedent") or at(p, "Eof")
+        return
+    fail(p, "expected end of line")
+
+fn identifier(p: Parser) -> string
+    if at(p, "Ident") or at(p, "Some") or at(p, "None")
+        let item = advance(p)
+        return nerv.string.slice(p.text, item.start, item.end)
+    fail(p, "expected identifier")
+    ""
+
+fn path_name(p: Parser) -> string
+    let mut name = identifier(p)
+    while eat(p, "Dot")
+        name = nerv.string.concat(name, nerv.string.concat(".", identifier(p)))
+    name
+
+fn last_end(p: Parser, start: i64) -> i64
+    let mut index = p.cursor [0] - 1
+    while index >= 0
+        let item = p.tokens:get(index)
+        if item.kind != "Newline" and item.kind != "Indent" and item.kind != "Dedent" and item.kind != "Eof"
+            if item.end > start
+                return item.end
+            return start
+        index = index - 1
+    start
+
+fn make(p: Parser, tag: NodeTag, text: string, start: i64, children: Buffer<i64>) -> i64
+    if failed(p)
+        return -1
+    let mut arena = p.arena
+    let id = arena [0]:len()
+    arena [0] = arena [0]:push(Node { tag: tag, text: text, start: start, end:last_end(p, start), children: children })
+    id
+
+fn child(id: i64) -> Buffer<i64> => buffer(0):push(id)
+fn pair(left: i64, right: i64) -> Buffer<i64> => child(left):push(right)
+
+fn node_at(p: Parser, id: i64) -> Node
+    if id < 0
+        return empty_node()
+    p.arena [0]:get(id)
+
+fn enter(p: Parser) -> bool
+    if failed(p)
+        return false
+    if p.cursor [2] >= 128
+        fail(p, "syntax nesting limit exceeded")
+        return false
+    let mut cursor = p.cursor
+    cursor [2] = cursor [2] + 1
+    true
+
+fn leave(p: Parser) -> void
+    let mut cursor = p.cursor
+    cursor [2] = cursor [2] - 1
+
+fn type_list(p: Parser, close: string) -> Buffer<i64>
+    let mut children = buffer(0)
+    if not at(p, close)
+        while not failed(p)
+            children = children:push(parse_type(p))
+            if not eat(p, "Comma")
+                break
+    need(p, close)
+    children
+
+fn parse_type(p: Parser) -> i64
+    if not enter(p)
+        return -1
+    let result = type_body(p)
+    leave(p)
+    result
+
+fn type_body(p: Parser) -> i64
+    let start = peek(p).start
+    if eat(p, "Fn")
+        need(p, "LParen")
+        let params = type_list(p, "RParen")
+        need(p, "ThinArrow")
+        let result = parse_type(p)
+        return make(p, FunctionTypeNode(), "", start, params:push(result))
+    if eat(p, "LBracket")
+        if eat(p, "RBracket")
+            let element = parse_type(p)
+            return make(p, ArrayTypeNode(), "", start, child(element))
+        let element = parse_type(p)
+        need(p, "Semicolon")
+        let length = peek(p)
+        need(p, "Int")
+        need(p, "RBracket")
+        return make(p, ArrayTypeNode(), nerv.string.slice(p.text, length.start, length.end), start, child(element))
+    let name = path_name(p)
+    if eat(p, "Lt")
+        let mut args = buffer(0)
+        while not failed(p)
+            args = args:push(parse_type(p))
+            if not eat(p, "Comma")
+                break
+        need(p, "Gt")
+        return make(p, AppliedTypeNode(), name, start, args)
+    make(p, TypeNameNode(), name, start, buffer(0))
+
+fn generic_params(p: Parser) -> i64
+    let start = peek(p).start
+    let mut params = buffer(0)
+    let mut names = set()
+    if eat(p, "Lt")
+        while not failed(p)
+            let position = peek(p).start
+            let name = identifier(p)
+            if names:contains(name)
+                fail(p, "duplicate generic parameter")
+            names = names:insert(name)
+            let mut constraint = buffer(0)
+            if eat(p, "Colon")
+                let location = peek(p).start
+                let path = path_name(p)
+                constraint = constraint:push(make(p, TypeNameNode(), path, location, buffer(0)))
+            params = params:push(make(p, GenericNode(), name, position, constraint))
+            if not eat(p, "Comma")
+                break
+        need(p, "Gt")
+    make(p, GenericsNode(), "", start, params)
+
+fn parameters(p: Parser, receiver: string) -> Buffer<i64>
+    need(p, "LParen")
+    let mut params = buffer(0)
+    if not at(p, "RParen")
+        while not failed(p)
+            let start = peek(p).start
+            let name = identifier(p)
+            let mut ty = -1
+            if eat(p, "Colon")
+                ty = parse_type(p)
+            else
+                if params:len() != 0 or receiver == ""
+                    fail(p, "parameter type required")
+                ty = make(p, TypeNameNode(), receiver, start, buffer(0))
+            params = params:push(make(p, ParameterNode(), name, start, child(ty)))
+            if not eat(p, "Comma")
+                break
+    need(p, "RParen")
+    params
+
+fn precedence(kind: string) -> i64
+    if kind == "Or"
+        return 1
+    if kind == "And"
+        return 2
+    if kind == "EqEq" or kind == "NotEq"
+        return 3
+    if kind == "Lt" or kind == "LtEq" or kind == "Gt" or kind == "GtEq"
+        return 4
+    if kind == "Plus" or kind == "Minus"
+        return 5
+    if kind == "Star" or kind == "Slash" or kind == "Percent"
+        return 6
+    return -1
+
+fn expressions(p: Parser, close: string) -> Buffer<i64>
+    let mut values = buffer(0)
+    if not at(p, close)
+        while not failed(p)
+            values = values:push(expression(p, 0))
+            if not eat(p, "Comma")
+                break
+    need(p, close)
+    values
+
+fn expression(p: Parser, minimum: i64) -> i64
+    if not enter(p)
+        return -1
+    let result = expression_body(p, minimum)
+    leave(p)
+    result
+
+fn qualified(p: Parser, id: i64) -> string
+    let node = node_at(p, id)
+    if node.tag == NameNode()
+        return node.text
+    if node.tag == MemberNode()
+        let base = qualified(p, node.children:get(0))
+        return nerv.string.concat(base, nerv.string.concat(".", node.text))
+    fail(p, "expected struct name")
+    ""
+
+fn expression_body(p: Parser, minimum: i64) -> i64
+    let start = peek(p).start
+    let mut left = prefix(p)
+    while not failed(p)
+        if eat(p, "Question")
+            left = make(p, TryNode(), "", start, child(left))
+            continue
+        if eat(p, "LParen")
+            let args = expressions(p, "RParen")
+            let mut children = child(left)
+            for index in 0 .. args:len()
+                children = children:push(args:get(index))
+            left = make(p, CallNode(), "", start, children)
+            continue
+        if eat(p, "Dot")
+            let name = identifier(p)
+            left = make(p, MemberNode(), name, start, child(left))
+            continue
+        if eat(p, "Colon")
+            let name = identifier(p)
+            need(p, "LParen")
+            let args = expressions(p, "RParen")
+            let mut children = child(left)
+            for index in 0 .. args:len()
+                children = children:push(args:get(index))
+            left = make(p, MethodNode(), name, start, children)
+            continue
+        if eat(p, "LBracket")
+            let index = expression(p, 0)
+            need(p, "RBracket")
+            left = make(p, IndexNode(), "", start, pair(left, index))
+            continue
+        if eat(p, "LBrace")
+            let name = qualified(p, left)
+            let mut fields = buffer(0)
+            if not at(p, "RBrace")
+                while not failed(p)
+                    let field_start = peek(p).start
+                    let field_name = identifier(p)
+                    need(p, "Colon")
+                    let value = expression(p, 0)
+                    fields = fields:push(make(p, InitializerNode(), field_name, field_start, child(value)))
+                    if not eat(p, "Comma")
+                        break
+            need(p, "RBrace")
+            left = make(p, ConstructNode(), name, start, fields)
+            continue
+        let power = precedence(peek(p).kind)
+        if power < minimum
+            break
+        let op = advance(p).kind
+        let right = expression(p, power + 1)
+        left = make(p, BinaryNode(), op, start, pair(left, right))
+    left
+
+fn valid_integer(text: string) -> bool
+    match parse_integer(nerv.string.replace(text, "_", ""))
+        Ok(value) => true
+        Err(error) => false
+
+fn valid_float(text: string) -> bool
+    match parse_float(nerv.string.replace(text, "_", ""))
+        Ok(value) => true
+        Err(error) => false
+
+fn literal(p: Parser, tag: NodeTag) -> i64
+    let item = peek(p)
+    let text = nerv.string.slice(p.text, item.start, item.end)
+    if tag == IntegerNode() and not valid_integer(text)
+        fail(p, "invalid integer")
+    if tag == FloatNode() and not valid_float(text)
+        fail(p, "invalid float")
+    if tag == StringNode()
+        let chars = source.load_source(text)
+        let mut index = 1
+        while index < chars.length - 1 and not failed(p)
+            let value = chars:at(index)
+            if value == 0
+                fail(p, "NUL bytes are not supported in string literals")
+            if value == 92
+                index = index + 1
+                let escape = chars:at(index)
+                if escape != 110 and escape != 114 and escape != 116 and escape != 34 and escape != 92
+                    fail(p, "unsupported string escape")
+            index = index + 1
+    advance(p)
+    make(p, tag, text, item.start, buffer(0))
+
+fn prefix(p: Parser) -> i64
+    let start = peek(p).start
+    let kind = peek(p).kind
+    if kind == "Minus" or kind == "Not"
+        advance(p)
+        if kind == "Minus" and at(p, "Int")
+            let item = peek(p)
+            let text = nerv.string.slice(p.text, item.start, item.end)
+            if nerv.string.replace(text, "_", "") == "9223372036854775808"
+                advance(p)
+                return make(p, IntegerNode(), "-9223372036854775808", start, buffer(0))
+        let value = expression(p, 8)
+        return make(p, UnaryNode(), kind, start, child(value))
+    if kind == "Int"
+        return literal(p, IntegerNode())
+    if kind == "Float"
+        return literal(p, FloatNode())
+    if kind == "String"
+        return literal(p, StringNode())
+    if kind == "True" or kind == "False"
+        return literal(p, BooleanNode())
+    if kind == "Ident" or kind == "Some" or kind == "None"
+        let name = identifier(p)
+        return make(p, NameNode(), name, start, buffer(0))
+    if eat(p, "LParen")
+        let value = expression(p, 0)
+        need(p, "RParen")
+        let inner = node_at(p, value)
+        return make(p, inner.tag, inner.text, start, inner.children)
+    if eat(p, "LBracket")
+        let values = expressions(p, "RBracket")
+        if values:len() == 1 and eat(p, "Star")
+            let length = expression(p, 7)
+            return make(p, RepeatNode(), "", start, values:push(length))
+        return make(p, ArrayNode(), "", start, values)
+    if eat(p, "If")
+        let condition = expression(p, 0)
+        need(p, "Newline")
+        let yes = block(p)
+        let mut children = pair(condition, yes)
+        if eat(p, "Else")
+            need(p, "Newline")
+            children = children:push(block(p))
+        return make(p, IfNode(), "", start, children)
+    if eat(p, "Match")
+        return match_body(p, start)
+    if eat(p, "Fn")
+        let params = parameters(p, "")
+        need(p, "ThinArrow")
+        let result = parse_type(p)
+        need(p, "FatArrow")
+        let body = expression(p, 0)
+        return make(p, LambdaNode(), "", start, params:push(result):push(body))
+    fail(p, "expected expression")
+    return -1
+
+fn match_body(p: Parser, start: i64) -> i64
+    let value = expression(p, 0)
+    need(p, "Newline")
+    need(p, "Indent")
+    let mut children = child(value)
+    newlines(p)
+    while not failed(p) and not at(p, "Dedent") and not at(p, "Eof")
+        let position = peek(p).start
+        let name = path_name(p)
+        let mut arm = buffer(0)
+        if eat(p, "LParen")
+            let binding_start = peek(p).start
+            let binding = identifier(p)
+            arm = arm:push(make(p, NameNode(), binding, binding_start, buffer(0)))
+            need(p, "RParen")
+        need(p, "FatArrow")
+        let body = expression(p, 0)
+        arm = arm:push(body)
+        if previous_kind(p) != "Dedent"
+            end_line(p)
+        children = children:push(make(p, ArmNode(), name, position, arm))
+        newlines(p)
+    need(p, "Dedent")
+    make(p, MatchNode(), "", start, children)
+
+fn previous_kind(p: Parser) -> string
+    if p.cursor [0] == 0
+        return ""
+    p.tokens:get(p.cursor [0] - 1).kind
+
+fn block(p: Parser) -> i64
+    if not enter(p)
+        return -1
+    let start = peek(p).start
+    need(p, "Indent")
+    let mut body = buffer(0)
+    newlines(p)
+    while not failed(p) and not at(p, "Dedent") and not at(p, "Eof")
+        body = body:push(statement(p))
+        if previous_kind(p) != "Dedent"
+            end_line(p)
+        newlines(p)
+    need(p, "Dedent")
+    let result = make(p, BlockNode(), "", start, body)
+    leave(p)
+    result
+
+fn statement(p: Parser) -> i64
+    let start = peek(p).start
+    if eat(p, "Let")
+        let mutable = eat(p, "Mut")
+        let name = identifier(p)
+        let mut children = buffer(0)
+        if eat(p, "Colon")
+            children = children:push(parse_type(p))
+        need(p, "Eq")
+        children = children:push(expression(p, 0))
+        let modifier = if mutable
+            "mut "
+        else
+            ""
+        return make(p, LetNode(), nerv.string.concat(modifier, name), start, children)
+    if eat(p, "Break")
+        return make(p, BreakNode(), "", start, buffer(0))
+    if eat(p, "Continue")
+        return make(p, ContinueNode(), "", start, buffer(0))
+    if eat(p, "Return")
+        let mut children = buffer(0)
+        if not at(p, "Newline") and not at(p, "Dedent") and not at(p, "Eof")
+            children = children:push(expression(p, 0))
+        return make(p, ReturnNode(), "", start, children)
+    if eat(p, "While")
+        let condition = expression(p, 0)
+        need(p, "Newline")
+        let body = block(p)
+        return make(p, WhileNode(), "", start, pair(condition, body))
+    if eat(p, "For")
+        let name = identifier(p)
+        need(p, "In")
+        let first = expression(p, 0)
+        let inclusive = eat(p, "RangeInclusive")
+        if not inclusive
+            need(p, "Range")
+        let last = expression(p, 0)
+        need(p, "Newline")
+        let body = block(p)
+        let bounds = if inclusive
+            "..="
+        else
+            ".."
+        return make(p, ForNode(), nerv.string.concat(name, bounds), start, pair(first, last):push(body))
+    let target = expression(p, 0)
+    if eat(p, "Eq")
+        let value = expression(p, 0)
+        let tag = node_at(p, target).tag
+        if tag != NameNode() and tag != MemberNode() and tag != IndexNode()
+            fail(p, "invalid assignment target")
+        return make(p, AssignNode(), "", start, pair(target, value))
+    make(p, ExprStatementNode(), "", start, child(target))
+
+fn function_decl(p: Parser, receiver: string, declaration: bool) -> i64
+    let start = peek(p).start
+    need(p, "Fn")
+    let name = identifier(p)
+    let generics = generic_params(p)
+    if receiver != "" and node_at(p, generics).children:len() != 0
+        fail(p, "generic method declarations are not supported")
+    let params = parameters(p, receiver)
+    let mut result = -1
+    if eat(p, "ThinArrow")
+        result = parse_type(p)
+    else
+        result = make(p, TypeNameNode(), "void", start, buffer(0))
+    let mut children = child(generics)
+    for index in 0 .. params:len()
+        children = children:push(params:get(index))
+    children = children:push(result)
+    if declaration
+        end_line(p)
+    else
+        if eat(p, "FatArrow")
+            children = children:push(expression(p, 0))
+            end_line(p)
+        else
+            need(p, "Newline")
+            children = children:push(block(p))
+    make(p, FunctionNode(), name, start, children)
+
+fn aggregate(p: Parser, tag: NodeTag) -> i64
+    let start = advance(p).start
+    let name = if tag == ImplNode()
+        path_name(p)
+    else
+        identifier(p)
+    let mut children = buffer(0)
+    if tag == StructNode() or tag == EnumNode()
+        children = children:push(generic_params(p))
+    if tag == StructNode() and eat(p, "Implements")
+        let position = peek(p).start
+        let trait_name = path_name(p)
+        children = children:push(make(p, TypeNameNode(), trait_name, position, buffer(0)))
+    if tag == ImplNode() and eat(p, "For")
+        let position = peek(p).start
+        let trait_name = path_name(p)
+        children = children:push(make(p, TypeNameNode(), trait_name, position, buffer(0)))
+    need(p, "Newline")
+    need(p, "Indent")
+    newlines(p)
+    while not failed(p) and not at(p, "Dedent") and not at(p, "Eof")
+        if at(p, "Fn") and tag != EnumNode()
+            children = children:push(function_decl(p, name, tag == TraitNode()))
+        else
+            if tag == TraitNode() or tag == ImplNode()
+                fail(p, "expected method")
+            let position = peek(p).start
+            let field = identifier(p)
+            let mut types = buffer(0)
+            if tag == EnumNode()
+                if eat(p, "LParen")
+                    types = type_list(p, "RParen")
+                children = children:push(make(p, VariantNode(), field, position, types))
+            else
+                need(p, "Colon")
+                types = types:push(parse_type(p))
+                children = children:push(make(p, FieldNode(), field, position, types))
+            end_line(p)
+        newlines(p)
+    need(p, "Dedent")
+    make(p, tag, name, start, children)
+
+fn declaration(p: Parser) -> i64
+    let start = peek(p).start
+    if eat(p, "Module")
+        let name = path_name(p)
+        end_line(p)
+        return make(p, ModuleNameNode(), name, start, buffer(0))
+    if eat(p, "Import")
+        let name = path_name(p)
+        end_line(p)
+        return make(p, ImportNode(), name, start, buffer(0))
+    if at(p, "Struct")
+        return aggregate(p, StructNode())
+    if at(p, "Enum")
+        return aggregate(p, EnumNode())
+    if at(p, "Trait")
+        return aggregate(p, TraitNode())
+    if at(p, "Impl")
+        return aggregate(p, ImplNode())
+    if eat(p, "Export")
+        return function_decl(p, "", false)
+    if at(p, "Fn")
+        return function_decl(p, "", false)
+    if at(p, "Test") or at(p, "Bench")
+        let kind = advance(p).kind
+        let label = peek(p)
+        need(p, "String")
+        need(p, "Newline")
+        let body = block(p)
+        let name = nerv.string.concat(kind, nerv.string.slice(p.text, label.start, label.end))
+        return make(p, FunctionNode(), name, start, child(body))
+    fail(p, "expected module, import, struct, enum, or fn")
+    return -1
+
+fn parse_tokens(text: string, tokens: TokenStream) -> Result<Ast, SyntaxError>
+    let p = Parser { text: text, tokens: tokens.tokens, cursor: [0, -1, 0], arena: [buffer(empty_node())], error: [""] }
+    let mut declarations = buffer(0)
+    newlines(p)
+    while not at(p, "Eof") and not failed(p)
+        declarations = declarations:push(declaration(p))
+        newlines(p)
+    let root = make(p, ModuleNode(), "", 0, declarations)
+    if failed(p)
+        let item = p.tokens:get(p.cursor [1])
+        return Err(SyntaxError { start: item.start, end: item.end, line: item.line, column: item.column, message: p.error [0] })
+    Ok(Ast { nodes: p.arena [0], root: root })
+
+fn lex_failure(error: LexError) -> Result<Ast, SyntaxError>
+    Err(SyntaxError { start: error.start, end: error.end, line: error.line, column: error.column, message: error.message })
+
+fn parse(text: string) -> Result<Ast, SyntaxError>
+    match lexer.lex(text)
+        Ok(tokens) => parse_tokens(text, tokens)
+        Err(error) => lex_failure(error)

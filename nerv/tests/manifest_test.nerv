@@ -1,0 +1,60 @@
+import nerv.std
+import manifest
+
+fn invalid_manifest(error: ProjectError) -> Package
+    println(error.message)
+    assert(false)
+    Package { root: "", name: "", version: "", entry: "", library: "", manifest: "", dependencies:buffer(DependencySpec { alias: "", path: "" }) }
+
+fn parsed_manifest(text: string) -> Package
+    match manifest.parse(text, "Nerv.toml", ".")
+        Ok(package) => package
+        Err(error) => invalid_manifest(error)
+
+fn manifest_rejects(text: string) -> bool
+    match manifest.parse(text, "Nerv.toml", ".")
+        Ok(package) => false
+        Err(error) => true
+
+test "package fields comments and local inline dependencies"
+    let text = "[package]\nname = 'app' # example\nversion = \"0.1.0\"\n[dependencies]\nmath = { path = '../math' }\n"
+    let package = parsed_manifest(text)
+    assert(package.name == "app")
+    assert(package.version == "0.1.0")
+    assert(package.dependencies:len() == 1)
+    assert(package.dependencies:get(0).alias == "math")
+    assert(package.dependencies:get(0).path == "../math")
+
+test "dotted fields and dependency tables"
+    let text = "package.name = 'app'\npackage.version = '1.2.3'\n[dependencies.math]\npath = '../math'\n"
+    let package = parsed_manifest(text)
+    assert(package.name == "app")
+    assert(package.dependencies:get(0).path == "../math")
+
+test "quoted Unicode paths and multiline strings"
+    let text = "[package]\nname = \"app\"\nversion = \"1.0.0\"\nentry = \"src/m\\u0061in.nerv\"\n[dependencies]\nlib = { path = \"../\\U0001f600\" }\n"
+    let package = parsed_manifest(text)
+    assert(nerv.string.ends_with(package.entry, "main.nerv") == 1)
+    assert(package.dependencies:get(0).path == "../😀")
+    let multiline = parsed_manifest("[package]\nname = '''app'''\nversion = \"\"\"1.0.0\"\"\"\n")
+    assert(multiline.name == "app")
+
+test "unknown keys duplicate fields and remote dependencies are rejected"
+    assert(manifest_rejects("[package]\nname = 'app'\nname = 'other'\nversion = '1.0.0'\n"))
+    assert(manifest_rejects("[package]\nname = 'app'\nversion = '1.0.0'\nunknown = 'value'\n"))
+    assert(manifest_rejects("[package]\nname = 'app'\nversion = '1.0.0'\n[dependencies]\nlib = '1.0.0'\n"))
+    assert(manifest_rejects("[package]\nname = 'nerv'\nversion = '1.0.0'\n"))
+
+test "source containment numeric versions and invalid strings"
+    assert(manifest_rejects("[package]\nname = 'app'\nversion = '1.0.0'\nentry = '../main.nerv'\n"))
+    assert(manifest_rejects("[package]\nname = 'app'\nversion = '1.0.0-alpha'\n"))
+    assert(manifest_rejects("[package]\nname = 'app'\nversion = '1.0.0'\nentry = \"bad\\"))
+    assert(manifest.version("18446744073709551615.0.1"))
+    assert(not manifest.version("18446744073709551616.0.1"))
+
+test "inline tables and dotted tables cannot be redefined"
+    let base = "package = { name = 'app', version = '1.0.0' }\n"
+    assert(manifest_rejects(nerv.string.concat(base, "dependencies = { lib = {} }\ndependencies.lib.path = '../lib'\n")))
+    assert(manifest_rejects(nerv.string.concat(base, "dependencies.lib.path = '../lib'\n[dependencies.lib]\n")))
+    assert(manifest_rejects(nerv.string.concat(base, "dependencies.lib.path = '../lib'\ndependencies = 'bad'\n")))
+    assert(manifest_rejects(nerv.string.concat(base, "dependencies.lib = 'bad'\ndependencies.lib.path = '../lib'\n")))

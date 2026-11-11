@@ -1,0 +1,5 @@
+unknown_function.nerv:1:21: error: unknown function `absent`
+  |
+1 | fn main() -> i64 => absent(1)
+  |                     ^^^^^^
+  = note: check the spelling and import the module that defines this function

@@ -1,0 +1,9 @@
+version = 1
+
+[[package]]
+checksum = "0c4c7dc500ff2b6c1f7499aae4c3f7ccf3e759b50ed88b0a292360aae347080d"
+manifest = "Nerv.toml"
+name = "nerv_bootstrap"
+version = "0.1.0"
+
+[package.dependencies]

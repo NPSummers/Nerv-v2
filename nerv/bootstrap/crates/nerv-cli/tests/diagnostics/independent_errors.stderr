@@ -1,0 +1,11 @@
+independent_errors.nerv:2:18: error: unknown name `missing`
+  |
+2 |     let broken = missing
+  |                  ^^^^^^^
+  = note: names must be declared in this scope before use; check the spelling
+
+independent_errors.nerv:5:23: error: expected Int, found Bool
+  |
+5 | fn second() -> i64 => false
+  |                       ^^^^^
+  = note: function `second` declares result Int

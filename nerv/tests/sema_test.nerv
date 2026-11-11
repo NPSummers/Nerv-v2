@@ -1,0 +1,126 @@
+import nerv.std
+import ast
+import parser
+import ir
+import sema
+
+fn no_program(error: SemanticError) -> CheckedProgram
+    println(error.message)
+    assert(false)
+    CheckedProgram { types:buffer(empty_type()), symbols:buffer(empty_symbol()), nodes:buffer(empty_ir()), functions:buffer(0), source_paths:buffer(""), main: - 1, captures:buffer(Capture { function: - 1, target: - 1, symbol: - 1, slot: - 1 }) }
+
+fn no_syntax(error: SyntaxError) -> Ast
+    println(error.message)
+    assert(false)
+    Ast { nodes:buffer(empty_node()), root: - 1 }
+
+fn semantic_tree(text: string) -> Ast
+    match parser.parse(text)
+        Ok(tree) => tree
+        Err(error) => no_syntax(error)
+
+fn checked_program(text: string) -> CheckedProgram
+    match sema.check(semantic_tree(text))
+        Ok(program) => program
+        Err(error) => no_program(error)
+
+fn semantically_rejected(text: string) -> bool
+    match sema.check(semantic_tree(text))
+        Ok(program) => false
+        Err(error) => true
+
+fn operation_count(program: CheckedProgram, op: IROp) -> i64
+    let mut count = 0
+    for index in 0 .. program.nodes:len()
+        if program.nodes:get(index).op == op
+            count = count + 1
+    count
+
+test "forward functions and recursive calls resolve to symbols"
+    let program = checked_program("fn main() -> i64 => answer(4)\nfn answer(n: i64) -> i64\n    if n == 0\n        return 42\n    answer(n - 1)\n")
+    assert(program.main >= 0)
+    assert(program.functions:len() == 2)
+    assert(operation_count(program, CallIR()) == 2)
+
+test "shadowed bindings keep distinct symbol identities"
+    let program = checked_program("fn main() -> i64\n    let value = 40\n    let value = value + 2\n    value\n")
+    let mut first = -1
+    let mut second = -1
+    for index in 0 .. program.symbols:len()
+        let item = program.symbols:get(index)
+        if item.name == "value" and item.category == "local"
+            if first < 0
+                first = index
+            else
+                second = index
+    assert(first >= 0 and second > first)
+
+test "binding types mutability and local scope are enforced"
+    assert(semantically_rejected("fn main()\n    let n = 1\n    n = 2\n"))
+    assert(semantically_rejected("fn main()\n    let mut n = 1\n    n = true\n"))
+    assert(semantically_rejected("fn main()\n    let value: f64 = 1\n"))
+    assert(semantically_rejected("fn main() -> i64\n    if true\n        let hidden = 1\n    hidden\n"))
+
+test "arguments result types and main signature are checked"
+    assert(semantically_rejected("fn f(n: i64) -> i64 => n\nfn main() -> i64 => f(true)\n"))
+    assert(semantically_rejected("fn f(n: i64) -> i64 => n\nfn main() -> i64 => f()\n"))
+    assert(semantically_rejected("fn main() -> i64 => true\n"))
+    assert(semantically_rejected("fn main(n: i64) -> i64 => n\n"))
+    assert(semantically_rejected("fn main()\n    return 1\n"))
+
+test "arrays preserve element types and mutation requires mutable owner"
+    let program = checked_program("fn main() -> i64\n    let mut values = [1, 2]\n    values[0] = 42\n    values[0]\n")
+    assert(operation_count(program, AssignIndexIR()) == 1)
+    assert(semantically_rejected("fn main()\n    let x = [1, true]\n"))
+    assert(semantically_rejected("fn main()\n    let x = [1]\n    x[0] = 2\n"))
+    assert(semantically_rejected("fn main() -> i64 => [1][true]\n"))
+
+test "struct methods and layout slots are resolved"
+    let text = "struct Point\n    x: i64\n    fn get(self) -> i64 => self.x\nfn main() -> i64\n    let p = Point { x: 42 }\n    p:get()\n"
+    let program = checked_program(text)
+    assert(operation_count(program, StructIR()) == 1)
+    assert(operation_count(program, CallIR()) == 1)
+    assert(semantically_rejected("struct S\n    x: i64\nfn main() => S { x: true }\n"))
+    assert(semantically_rejected("struct S\n    x: i64\n    x: i64\n"))
+    assert(semantically_rejected("struct S\n    value: S\n"))
+
+test "enums resolve variants payloads and exhaustive matches"
+    let text = "enum Value\n    Number(i64)\n    Empty\nfn read(v: Value) -> i64\n    match v\n        Number(n) => n\n        Empty => 0\nfn main() -> i64 => read(Number(42))\n"
+    let program = checked_program(text)
+    assert(operation_count(program, EnumIR()) == 1)
+    assert(operation_count(program, MatchIR()) == 1)
+    assert(semantically_rejected("enum E\n    A\n    B\nfn f(x: E) -> i64\n    match x\n        A => 1\n"))
+    assert(semantically_rejected("enum E\n    A\nfn f(x: E) -> i64\n    match x\n        A(n) => n\n"))
+
+test "closure captures have explicit symbols and lifted functions"
+    let text = "fn make(base: i64) -> fn(i64) -> i64\n    fn(n: i64) -> i64 => base + n\nfn main() -> i64\n    let add = make(40)\n    add(2)\n"
+    let program = checked_program(text)
+    assert(program.captures:len() == 1)
+    assert(program.functions:len() == 3)
+    assert(operation_count(program, LambdaIR()) == 1)
+    assert(operation_count(program, IndirectCallIR()) == 1)
+
+test "conditions loop contexts and return flow are checked"
+    let program = checked_program("fn main() -> i64\n    let mut n = 0\n    for i in 0 .. 4\n        if i == 2\n            continue\n        n = n + i\n    if n > 0\n        return n\n    else\n        return 0\n")
+    assert(operation_count(program, ForIR()) == 1)
+    assert(semantically_rejected("fn main()\n    break\n"))
+    assert(semantically_rejected("fn main()\n    while 1\n        break\n"))
+    assert(semantically_rejected("fn main() -> i64\n    if true\n        1\n    else\n        false\n"))
+
+test "unsupported semantics fail explicitly"
+    assert(semantically_rejected("import other\nfn main() => 0\n"))
+    assert(semantically_rejected("trait Read\n    fn read(self) -> i64\nstruct Bad implements Read\n    value: i64\n"))
+    assert(semantically_rejected("fn f() -> i64 => value()?\n"))
+
+test "every checked operation has a concrete type and valid references"
+    let program = checked_program("fn main() -> i64\n    let mut n = 40\n    n = n + 2\n    n\n")
+    for index in 0 .. program.nodes:len()
+        let node = program.nodes:get(index)
+        assert(node.type_id >= 0 and node.type_id < program.types:len())
+        assert(node.type_id != 6)
+        assert(node.start >= 0 and node.end >= node.start)
+        if node.op == LocalIR() or node.op == LetIR() or node.op == FunctionIR() or node.op == CallIR()
+            assert(node.symbol >= 0 and node.symbol < program.symbols:len())
+        for offset in 0 .. node.children:len()
+            let child = node.children:get(offset)
+            assert(child >= 0 and child < index)

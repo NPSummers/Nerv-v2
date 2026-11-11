@@ -1,0 +1,32 @@
+import nerv.std
+import ir
+import generics_test
+
+test "inline trait claims specialize to concrete direct method calls"
+    let text = "trait Read\n    fn read(self) -> i64\nstruct Value implements Read\n    number: i64\n    fn read(self) -> i64 => self.number\nfn fetch<T: Read>(value: T) -> i64 => value:read()\nfn main() -> i64 => fetch(Value { number: 42 })\n"
+    let program = generics_test.generic_program(text)
+    assert(program.functions:len() == 3)
+    for index in 0 .. program.nodes:len()
+        let node = program.nodes:get(index)
+        if node.op == CallIR()
+            assert(node.symbol >= 0)
+            assert(program.symbols:get(node.symbol).category == "function")
+
+test "explicit and inherent implementations attach methods to nominal owners"
+    let text = "trait Read\n    fn read(self) -> i64\nstruct Value\n    number: i64\nimpl Value for Read\n    fn read(self) -> i64 => self.number\nimpl Value\n    fn twice(self) -> i64 => self.number * 2\nfn fetch<T: Read>(value: T) -> i64 => value:read()\nfn main() -> i64 => fetch(Value { number: 42 })\n"
+    let program = generics_test.generic_program(text)
+    assert(program.functions:len() == 4)
+
+test "trait contracts reject missing or incompatible methods"
+    assert(generics_test.generic_rejects("trait Read\n    fn read(self) -> i64\nstruct Bad implements Read\n    value: i64\n"))
+    assert(generics_test.generic_rejects("trait Read\n    fn read(self) -> i64\nstruct Bad implements Read\n    value: bool\n    fn read(self) -> bool => self.value\n"))
+    assert(generics_test.generic_rejects("trait Read\n    fn read(self) -> i64\ntrait Read\n    fn read(self) -> i64\n"))
+
+test "constraints require a claim and a nominal argument"
+    assert(generics_test.generic_rejects("trait Read\n    fn read(self) -> i64\nstruct Value\n    number: i64\n    fn read(self) -> i64 => self.number\nfn fetch<T: Read>(value: T) -> i64 => value:read()\nfn main() -> i64 => fetch(Value { number: 42 })\n"))
+    assert(generics_test.generic_rejects("trait Read\n    fn read(self) -> i64\nfn fetch<T: Read>(value: T) -> T => value\nfn main() -> i64 => fetch(42)\n"))
+
+test "generic owners restore parameter environments for trait methods"
+    let text = "trait Read\n    fn read(self) -> i64\nstruct Box<T> implements Read\n    value: T\n    fn read(self) -> i64 => 42\nfn fetch<T: Read>(value: T) -> i64 => value:read()\nfn main() -> i64 => fetch(Box { value: true })\n"
+    let program = generics_test.generic_program(text)
+    assert(program.functions:len() == 3)

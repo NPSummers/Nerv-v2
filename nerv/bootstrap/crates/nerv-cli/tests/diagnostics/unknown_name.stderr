@@ -1,0 +1,5 @@
+unknown_name.nerv:1:25: error: unknown name `absent`
+  |
+1 | fn main() -> i64 => 1 + absent
+  |                         ^^^^^^
+  = note: names must be declared in this scope before use; check the spelling

@@ -1,0 +1,136 @@
+name: Self-hosted compiler
+
+on:
+  push:
+    paths: ['nerv/**', 'src/**', 'tests/**', 'tools/**', 'bootstrap/**', '.github/workflows/self-host.yml']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-gnullvm
+            label: windows-x64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            label: macos-arm64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: NPSummers/Nerv-v2
+          ref: 96e4d3271af54c3a1e2064f26c4efe44e38177be
+          path: .stage0-reference
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Locate source
+        id: source
+        shell: bash
+        run: |
+          if [ -f bootstrap/Cargo.toml ]; then echo 'path=.' >> "$GITHUB_OUTPUT"; else echo 'path=nerv' >> "$GITHUB_OUTPUT"; fi
+          echo "NERV_REFERENCE=$GITHUB_WORKSPACE/.stage0-reference" >> "$GITHUB_ENV"
+      - name: Prepare Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          . ./.stage0-reference/tools/setup-llvm.ps1 -Minimal
+          python .stage0-reference/tools/setup-toolchain.py windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cc = "$env:GITHUB_WORKSPACE/.stage0-reference/target/toolchains/llvm-mingw/bin/x86_64-w64-mingw32-clang.exe"
+          "LLVM_SYS_231_PREFIX=$env:LLVM_SYS_231_PREFIX" >> $env:GITHUB_ENV
+          "CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=$cc" >> $env:GITHUB_ENV
+          "CC_x86_64_pc_windows_gnullvm=$cc" >> $env:GITHUB_ENV
+          "AR_x86_64_pc_windows_gnullvm=$env:GITHUB_WORKSPACE/.stage0-reference/target/toolchains/llvm-mingw/bin/llvm-ar.exe" >> $env:GITHUB_ENV
+          "NERV_CC=$cc" >> $env:GITHUB_ENV
+      - name: Prepare Unix dependencies
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y patchelf libzstd-dev libxml2-dev libedit-dev; else brew install zstd; fi
+          source .stage0-reference/tools/setup-llvm.sh
+          setup_llvm 23.1.3
+          echo "LLVM_SYS_231_PREFIX=$LLVM_SYS_231_PREFIX" >> "$GITHUB_ENV"
+          echo "LLVM_CONFIG_PATH=$LLVM_CONFIG_PATH" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$LLVM_SYS_231_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$LLVM_SYS_231_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "NERV_CC=$LLVM_SYS_231_PREFIX/bin/clang" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = macOS ]; then python .stage0-reference/tools/setup-toolchain.py macos; fi
+      - name: Prepare native link plan
+        working-directory: ${{ steps.source.outputs.path }}
+        shell: bash
+        run: |
+          cargo build --locked --release --manifest-path bootstrap/Cargo.toml -p nerv --target '${{ matrix.target }}' --target-dir target/bootstrap
+          if [ "$RUNNER_OS" = Windows ]; then binary="target/bootstrap/${{ matrix.target }}/release/nerv.exe"; support="$NERV_REFERENCE/target/toolchains/llvm-mingw"; cp "$support/bin/libunwind.dll" "$(dirname "$binary")/"; elif [ "$RUNNER_OS" = macOS ]; then binary="target/bootstrap/${{ matrix.target }}/release/nerv"; support="$NERV_REFERENCE/target/toolchains/macos-sysroot"; else binary="target/bootstrap/${{ matrix.target }}/release/nerv"; support=/; fi
+          python "$NERV_REFERENCE/tools/prepare-linker.py" --target '${{ matrix.target }}' --llvm "$LLVM_SYS_231_PREFIX" --source "$support" --destination target/native-toolchain --binary "$binary"
+      - name: Verify all bootstrap generations
+        working-directory: ${{ steps.source.outputs.path }}
+        shell: bash
+        run: python tools/bootstrap.py --llvm "$LLVM_SYS_231_PREFIX" --toolchain target/native-toolchain --cc "$NERV_CC"
+      - name: Package portable compiler
+        working-directory: ${{ steps.source.outputs.path }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then compiler=target/stage3.exe; library="$LLVM_SYS_231_PREFIX/bin/LLVM-C.dll"; elif [ "$RUNNER_OS" = macOS ]; then compiler=target/stage3; library="$LLVM_SYS_231_PREFIX/lib/libLLVM-23.dylib"; else compiler=target/stage3; library="$LLVM_SYS_231_PREFIX/lib/libLLVM-23.so"; fi
+          python tools/package-portable.py --compiler "$compiler" --llvm-library "$library"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: self-hosted-${{ matrix.label }}
+          path: |
+            ${{ steps.source.outputs.path }}/target/portable.zip
+            ${{ steps.source.outputs.path }}/target/portable.tar.gz
+            ${{ steps.source.outputs.path }}/target/bootstrap-proof.json
+          if-no-files-found: error
+
+  portable:
+    needs: bootstrap
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            label: windows-x64
+          - os: macos-15
+            label: macos-arm64
+          - os: ubuntu-24.04
+            label: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: self-hosted-${{ matrix.label }}
+      - name: Verify Windows portable on clean runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive portable.zip -DestinationPath .
+          'import nerv.std', 'fn main()', '    println(integer_text(42))' | Set-Content hello.nerv
+          $env:PATH = "$env:SystemRoot/System32"
+          & ./portable/nerv.exe build hello.nerv --release -o hello.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $result = & ./hello.exe
+          if ($LASTEXITCODE -ne 0 -or $result -ne '42') { throw 'Portable compilation failed' }
+      - name: Verify Unix portable on clean runner
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          tar -xzf portable.tar.gz
+          printf 'import nerv.std\nfn main()\n    println(integer_text(42))\n' > hello.nerv
+          env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH PATH=/usr/bin:/bin ./portable/nerv build hello.nerv --release -o hello
+          test "$(./hello)" = 42

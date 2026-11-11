@@ -1,0 +1,161 @@
+import nerv.std
+import source
+import kinds
+
+struct Token
+    kind: string
+    start: i64
+    end: i64
+    line: i64
+    column: i64
+
+struct LexError
+    start: i64
+    end: i64
+    line: i64
+    column: i64
+    message: string
+
+struct TokenStream
+    tokens: Buffer<Token>
+
+fn token(input: Source, kind: string, start: i64, end: i64) -> Token
+    Token { kind: kind, start: input.offsets [start], end: input.offsets [end], line: input.lines [start], column: input.columns [start] }
+
+fn invalid(input: Source, start: i64, end: i64) -> LexError
+    LexError { start: input.offsets [start], end: input.offsets [end], line: input.lines [start], column: input.columns [start], message: "invalid token" }
+
+fn digit(value: i64) -> bool => value >= 48 and value <= 57
+fn number_part(value: i64) -> bool => digit(value) or value == 95
+fn letter(value: i64) -> bool => (value >= 65 and value <= 90) or (value >= 97 and value <= 122) or value == 95
+
+fn exponent_end(input: Source, position: i64) -> i64
+    if input:at(position) != 101 and input:at(position) != 69
+        return position
+    let mut end = position + 1
+    if input:at(end) == 43 or input:at(end) == 45
+        end = end + 1
+    let first = end
+    while number_part(input:at(end))
+        end = end + 1
+    if end == first
+        return position
+    end
+
+fn quoted_end(input: Source, start: i64, quote: i64) -> i64
+    let mut end = start + 1
+    let mut count = 0
+    while end < input.length
+        let value = input:at(end)
+        if value == quote
+            if quote == 39 and count != 1
+                return -1
+            return end + 1
+        if value == 10 or value == 13
+            return -1
+        if value == 92
+            end = end + 1
+            if end >= input.length or input:at(end) == 10
+                return -1
+        end = end + 1
+        count = count + 1
+    -1
+
+fn lex(text: string) -> Result<TokenStream, LexError>
+    let input = load_source(text)
+    let mut tokens = buffer(token(input, "Eof", 0, 0))
+    let mut indents = buffer(0)
+    indents = indents:push(0)
+    let mut position = 0
+    let mut indentation = 0
+    let mut delimiters = 0
+    let mut line_start = true
+    let mut line_has_token = false
+    while position < input.length
+        let start = position
+        let value = input:at(position)
+        if value == 32 or value == 9
+            if line_start and delimiters == 0
+                indentation = indentation + if value == 9
+                    4
+                else
+                    1
+            position = position + 1
+            continue
+        if value == 45 and input:at(position + 1) == 45
+            while position < input.length and input:at(position) != 10 and input:at(position) != 13
+                position = position + 1
+            continue
+        if value == 10 or value == 13
+            position = position + 1
+            if value == 13 and input:at(position) == 10
+                position = position + 1
+            if line_has_token and delimiters == 0
+                tokens = tokens:push(token(input, "Newline", start, position))
+            line_start = true
+            line_has_token = false
+            indentation = 0
+            continue
+        let mut kind = ""
+        if letter(value)
+            position = position + 1
+            while letter(input:at(position)) or digit(input:at(position))
+                position = position + 1
+            kind = kinds.keyword(input:slice(start, position))
+        if kind == "" and digit(value)
+            position = position + 1
+            while number_part(input:at(position))
+                position = position + 1
+            kind = "Int"
+            if input:at(position) == 46 and number_part(input:at(position + 1))
+                position = position + 2
+                while number_part(input:at(position))
+                    position = position + 1
+                kind = "Float"
+            let exponent = exponent_end(input, position)
+            if exponent != position
+                position = exponent
+                kind = "Float"
+        if kind == "" and (value == 34 or value == 39)
+            position = quoted_end(input, start, value)
+            if position < 0
+                return Err(invalid(input, start, start + 1))
+            kind = if value == 34
+                "String"
+            else
+                "Char"
+        if kind == ""
+            let mut width = 3
+            while width > 0
+                if start + width <= input.length
+                    kind = kinds.operator(input:slice(start, start + width))
+                    if kind != ""
+                        break
+                width = width - 1
+            if width == 0
+                return Err(invalid(input, start, start + 1))
+            position = start + width
+        if line_start and delimiters == 0
+            let current = indents:get(indents:len() - 1)
+            if indentation > current
+                indents = indents:push(indentation)
+                tokens = tokens:push(token(input, "Indent", start, start))
+            if indentation < current
+                while indents:len() > 1 and indentation < indents:get(indents:len() - 1)
+                    indents = indents:pop()
+                    tokens = tokens:push(token(input, "Dedent", start, start))
+                if indentation != indents:get(indents:len() - 1)
+                    return Err(invalid(input, start, position))
+        line_start = false
+        line_has_token = true
+        if kind == "LParen" or kind == "LBracket" or kind == "LBrace"
+            delimiters = delimiters + 1
+        if kind == "RParen" or kind == "RBracket" or kind == "RBrace"
+            if delimiters > 0
+                delimiters = delimiters - 1
+        tokens = tokens:push(token(input, kind, start, position))
+    while indents:len() > 1
+        indents = indents:pop()
+        tokens = tokens:push(token(input, "Dedent", input.length, input.length))
+    tokens = tokens:push(token(input, "Eof", input.length, input.length))
+    Ok(TokenStream { tokens: tokens })

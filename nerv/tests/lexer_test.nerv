@@ -1,0 +1,35 @@
+import nerv.std
+import lexer
+
+fn checked(text: string) -> TokenStream
+    result_or(lexer.lex(text), TokenStream { tokens:buffer(Token { kind: "", start: 0, end: 0, line: 0, column: 0 }) })
+
+fn rejected(text: string) -> bool
+    match lexer.lex(text)
+        Ok(stream) => false
+        Err(error) => true
+
+test "indentation and end of source"
+    let stream = checked("fn main()\n    42")
+    assert(stream.tokens:len() == 9)
+    assert(stream.tokens:get(5).kind == "Indent")
+    assert(stream.tokens:get(7).kind == "Dedent")
+    assert(stream.tokens:get(8).kind == "Eof")
+
+test "unicode byte spans and scalar columns"
+    let stream = checked("\"é\" x")
+    assert(stream.tokens:get(0).start == 0)
+    assert(stream.tokens:get(0).end == 4)
+    assert(stream.tokens:get(1).start == 5)
+    assert(stream.tokens:get(1).column == 5)
+
+test "comments and nested line breaks"
+    let stream = checked("-- ignored\n[1,\n 2]\n")
+    assert(stream.tokens:len() == 7)
+    assert(stream.tokens:get(5).kind == "Newline")
+
+test "invalid characters and indentation"
+    assert(rejected("@"))
+    assert(rejected("fn main()\n    1\n  2"))
+    assert(rejected("\"unfinished"))
+    assert(rejected("'ab'"))

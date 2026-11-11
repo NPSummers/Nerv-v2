@@ -1,0 +1,42 @@
+import nerv.std
+
+struct Source
+    text: string
+    characters: []i64
+    offsets: []i64
+    lines: []i64
+    columns: []i64
+    length: i64
+    fn at(self, index: i64) -> i64
+        if index >= self.length
+            return 0
+        self.characters [index]
+    fn slice(self, start: i64, end: i64) -> string
+        nerv.string.slice(self.text, self.offsets [start], self.offsets [end])
+
+fn load_source(text: string) -> Source
+    let pieces = split_text(text, "")
+    let mut characters = buffer(0)
+    let mut offsets = buffer(0)
+    let mut lines = buffer(0)
+    let mut columns = buffer(0)
+    let mut offset = 0
+    let mut line = 1
+    let mut column = 1
+    for index in 1 .. nerv.arrays.len(pieces) - 1
+        let piece = pieces [index]
+        let character = nerv.string.char_at(piece, 0)
+        characters = characters:push(character)
+        offsets = offsets:push(offset)
+        lines = lines:push(line)
+        columns = columns:push(column)
+        offset = offset + nerv.string.len(piece)
+        if character == 10
+            line = line + 1
+            column = 1
+        else
+            column = column + 1
+    offsets = offsets:push(offset)
+    lines = lines:push(line)
+    columns = columns:push(column)
+    Source { text: text, characters: characters.values, offsets: offsets.values, lines: lines.values, columns: columns.values, length: characters:len() }

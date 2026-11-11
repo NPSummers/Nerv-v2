@@ -1,0 +1,176 @@
+import nerv.std
+import lexer
+import parser
+import ast
+
+fn layout(kind: string) -> bool => kind == "Indent" or kind == "Dedent" or kind == "Newline" or kind == "Eof"
+
+fn contains(values: []string, value: string) -> bool
+    for index in 0 .. nerv.arrays.len(values)
+        if values [index] == value
+            return true
+    false
+
+fn mark_types(tree: Ast, tokens: Buffer<Token>) -> []bool
+    let mut compact = [false] * tokens:len()
+    for index in 0 .. tree.nodes:len()
+        let item = tree.nodes:get(index)
+        if item.tag == TypeNameNode() or item.tag == AppliedTypeNode() or item.tag == ArrayTypeNode() or item.tag == FunctionTypeNode() or item.tag == GenericsNode()
+            for offset in 0 .. tokens:len()
+                let token = tokens:get(offset)
+                if token.start >= item.start and token.end <= item.end
+                    compact [offset] = true
+    for index in 2 .. tokens:len()
+        if tokens:get(index).kind == "Lt" and contains(["Fn", "Struct", "Enum"], tokens:get(index - 2).kind)
+            let mut depth = 0
+            for offset in index .. tokens:len()
+                compact [offset] = true
+                let kind = tokens:get(offset).kind
+                if kind == "Lt"
+                    depth = depth + 1
+                if kind == "Gt"
+                    depth = depth - 1
+                    if depth == 0
+                        break
+    compact
+
+fn width(text: string) -> i64
+    let mut result = 0
+    let parts = split_text(text, "")
+    for index in 0 .. nerv.arrays.len(parts)
+        if parts [index] == " "
+            result = result + 1
+        else
+            if parts [index] == "\t"
+                result = result + 4
+            else
+                if parts [index] != ""
+                    break
+    result
+
+fn indent(depth: i64) -> string
+    let values = ["    "] * depth
+    join_text(values, "")
+
+fn no_space(tokens: Buffer<Token>, ids: Buffer<i64>, position: i64, compact: []bool) -> bool
+    let index = ids:get(position)
+    let previous_id = ids:get(position - 1)
+    let item = tokens:get(index).kind
+    let previous = tokens:get(previous_id).kind
+    let next = if position + 1 < ids:len()
+        tokens:get(ids:get(position + 1)).kind
+    else
+        ""
+    let before = if position >= 2
+        tokens:get(ids:get(position - 2)).kind
+    else
+        "LParen"
+    let unary = (previous == "Minus" or previous == "Plus") and contains(["LParen", "LBracket", "Comma", "Eq", "FatArrow", "Return", "Plus", "Minus", "Star", "Slash"], before)
+    let generic = compact [index] and compact [previous_id]
+    contains(["Comma", "Semicolon", "RParen", "RBracket", "Dot", "Colon"], item) or contains(["LParen", "LBracket", "Dot"], previous) or (item == "LParen" and contains(["Ident", "Some", "None", "Fn", "RParen", "RBracket", "Gt"], previous)) or (generic and (item == "Lt" or item == "Gt" or previous == "Lt")) or (generic and item == "Ident" and previous == "RBracket") or (previous == "LBrace" and item == "RBrace") or (unary and item != "Minus") or (previous == "Colon" and next == "LParen")
+
+fn same_tokens(before: string, after: string, original: TokenStream) -> bool
+    let other = match lexer.lex(after)
+        Ok(value) => value
+        Err(error) => TokenStream { tokens:buffer(Token { kind: "", start: 0, end: 0, line: 0, column: 0 }) }
+    if original.tokens:len() != other.tokens:len()
+        return false
+    for index in 0 .. original.tokens:len()
+        let a = original.tokens:get(index)
+        let b = other.tokens:get(index)
+        if a.kind != b.kind
+            return false
+        if not layout(a.kind) and nerv.string.slice(before, a.start, a.end) != nerv.string.slice(after, b.start, b.end)
+            return false
+    true
+
+fn formatted(text: string, stream: TokenStream, tree: Ast) -> Result<string, string>
+    let tokens = stream.tokens
+    let originals = split_text(text, "\n")
+    let mut lines = [buffer(0)] * nerv.arrays.len(originals)
+    for index in 0 .. nerv.arrays.len(lines)
+        lines [index] = buffer(0)
+    let mut depths = [0] * nerv.arrays.len(lines)
+    let compact = mark_types(tree, tokens)
+    let mut depth = 0
+    let mut delimiters = 0
+    let mut continuation = 0
+    for index in 0 .. tokens:len()
+        let item = tokens:get(index)
+        if item.kind == "Indent"
+            depth = depth + 1
+        if item.kind == "Dedent" and depth > 0
+            depth = depth - 1
+        if not layout(item.kind)
+            let line = item.line - 1
+            if lines [line]:len() == 0
+                depths [line] = depth
+                if delimiters > 0
+                    let extra = if contains(["RParen", "RBracket", "RBrace"], item.kind)
+                        0
+                    else
+                        1
+                    depths [line] = continuation + extra
+            lines [line] = lines [line]:push(index)
+            if contains(["LParen", "LBracket", "LBrace"], item.kind)
+                if delimiters == 0
+                    continuation = depth
+                delimiters = delimiters + 1
+            if contains(["RParen", "RBracket", "RBrace"], item.kind) and delimiters > 0
+                delimiters = delimiters - 1
+    let mut widths = map(0)
+    for index in 0 .. nerv.arrays.len(lines)
+        if lines [index]:len() > 0
+            widths = widths:insert(integer_text(width(originals [index])), depths [index])
+    let mut output = buffer("")
+    let mut line_start = 0
+    for index in 0 .. nerv.arrays.len(lines)
+        let original = originals [index]
+        if index + 1 == nerv.arrays.len(lines) and original == ""
+            break
+        let trimmed = nerv.string.trim(original)
+        let mut value = ""
+        let ids = lines [index]
+        if trimmed != ""
+            if ids:len() == 0
+                let space = width(original)
+                value = nerv.string.concat(indent(option_or(widths:get(integer_text(space)), space / 4)), trimmed)
+            else
+                let mut pieces = buffer(""):push(indent(depths [index]))
+                for position in 0 .. ids:len()
+                    let token = tokens:get(ids:get(position))
+                    if position > 0 and not no_space(tokens, ids, position, compact)
+                        pieces = pieces:push(" ")
+                    pieces = pieces:push(nerv.string.slice(text, token.start, token.end))
+                let last = tokens:get(ids:get(ids:len() - 1))
+                let remainder = nerv.string.trim(nerv.string.slice(original, last.end - line_start, nerv.string.len(original)))
+                if remainder != ""
+                    pieces = pieces:push("  "):push(remainder)
+                let mut values = [""] * pieces:len()
+                for offset in 0 .. pieces:len()
+                    values [offset] = pieces:get(offset)
+                value = join_text(values, "")
+        output = output:push(nerv.string.concat(value, "\n"))
+        line_start = line_start + nerv.string.len(original) + 1
+    let mut length = output:len()
+    while length > 1 and output:get(length - 1) == "\n"
+        length = length - 1
+    let mut values = [""] * length
+    for index in 0 .. length
+        values [index] = output:get(index)
+    let result = join_text(values, "")
+    if not same_tokens(text, result, stream)
+        return Err("formatting would alter token structure")
+    match parser.parse(result)
+        Ok(value) => Ok(result)
+        Err(error) => Err(error.message)
+
+fn parsed(text: string, stream: TokenStream) -> Result<string, string>
+    match parser.parse(text)
+        Ok(tree) => formatted(text, stream, tree)
+        Err(error) => Err(error.message)
+
+fn source(text: string) -> Result<string, string>
+    match lexer.lex(text)
+        Ok(stream) => parsed(text, stream)
+        Err(error) => Err(error.message)

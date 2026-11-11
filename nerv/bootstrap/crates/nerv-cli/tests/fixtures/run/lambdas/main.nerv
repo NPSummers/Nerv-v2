@@ -1,0 +1,5 @@
+fn apply(callback: fn(i64) -> i64, value: i64) -> i64 => callback(value)
+
+fn main() -> i64
+    let increment = fn(value: i64) -> i64 => value + 1
+    apply(increment, 41)

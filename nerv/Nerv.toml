@@ -1,0 +1,5 @@
+[package]
+name = "nerv_bootstrap"
+version = "0.1.0"
+
+[dependencies]

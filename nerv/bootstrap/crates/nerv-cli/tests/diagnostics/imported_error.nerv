@@ -1,0 +1,2 @@
+import lib.broken
+fn main() -> i64 => 0

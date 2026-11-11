@@ -1,0 +1,15 @@
+import nerv.std
+import format
+
+test "formatter keeps comments strings and indentation"
+    let source = "-- heading\nfn main( )->i64\n  let value= -1 -- value\n  println(\"a--b\")\n  value+2\n"
+    let expected = "-- heading\nfn main() -> i64\n    let value = -1  -- value\n    println(\"a--b\")\n    value + 2\n"
+    assert(result_or(format.source(source), "") == expected)
+    assert(result_or(format.source(expected), "") == expected)
+
+test "formatter rejects invalid syntax"
+    let result = format.source("fn broken( => 0\n")
+    let invalid = match result
+        Ok(value) => false
+        Err(error) => true
+    assert(invalid)

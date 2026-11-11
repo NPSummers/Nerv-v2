@@ -1,0 +1,9 @@
+fn make() -> fn(i64) -> i64
+    fn(value: i64) -> i64 => value + 1
+
+fn main() -> i64
+    if true
+        let callback = make()
+        callback(make()(40))
+    else
+        0

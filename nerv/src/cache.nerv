@@ -1,0 +1,92 @@
+import nerv.std
+import nerv.json
+import loader
+import ir
+import backend
+import linker
+import project
+
+fn fingerprint(graph: SourceGraph) -> string
+    let executable = nerv.ffi.file_hash(nerv.ffi.executable())
+    let llvm = nerv.ffi.file_hash(linker.llvm_library())
+    if executable == "" or llvm == ""
+        return ""
+    let native_config = result_or(read_text(linker.configuration()), "")
+    let mut parts = buffer(""):push(native_config):push(executable):push(llvm):push(option_or(environment("NERV_TARGET"), "native"))
+    let manifest_file = project.discover(graph.modules:get(0).path)
+    if manifest_file != ""
+        let lock = path(manifest_file):parent():join("Nerv.lock").text
+        parts = parts:push(result_or(read_text(lock), ""))
+    for index in 0 .. graph.modules:len()
+        let unit = graph.modules:get(index)
+        parts = parts:push(nerv.json.string(unit.path)):push(nerv.json.string(unit.text))
+    let mut values = [""] * parts:len()
+    for index in 0 .. parts:len()
+        values [index] = parts:get(index)
+    nerv.ffi.hash(join_text(values, "\n"))
+
+fn enabled() -> bool
+    let args = arguments()
+    for index in 0 .. nerv.arrays.len(args)
+        if args [index] == "--no-cache"
+            return false
+    true
+
+fn failure(error: IoError) -> string => error.message
+fn publication_error(error: ProjectError) -> string => error.message
+
+fn publish(source: string, target: string) -> string
+    match rename_path(path(source), path(target))
+        Ok(done) => ""
+        Err(error) => failure(error)
+
+fn stamp(file: string, text: string) -> string
+    match project.write_atomic(file, text)
+        Ok(done) => ""
+        Err(error) => publication_error(error)
+
+fn build_locked(program: CheckedProgram, output: string, release: bool, tests: bool, fingerprint: string, object_only: bool) -> string
+    let object = nerv.string.concat(output, ".nerv-object")
+    let metadata = nerv.string.concat(output, ".nerv-cache")
+    let key = nerv.ffi.hash(join_text([fingerprint, boolean_text(release), boolean_text(tests)], "\n"))
+    let actual = nerv.ffi.file_hash(object)
+    let expected = join_text([key, actual, ""], "\n")
+    let hit = enabled() and fingerprint != "" and actual != "" and result_or(read_text(metadata), "") == expected
+    let mut problem = ""
+    if not hit
+        let temporary = nerv.string.concat(object, ".tmp")
+        problem = backend.compile(program, linker.llvm_library(), temporary, release, tests)
+        if problem == ""
+            problem = publish(temporary, object)
+        if problem == ""
+            let digest = nerv.ffi.file_hash(object)
+            if digest == ""
+                problem = "cannot hash generated object"
+            else
+                problem = stamp(metadata, join_text([key, digest, ""], "\n"))
+        let cleanup = result_or(remove_file(path(temporary)), false)
+    if problem != ""
+        return problem
+    let temporary = nerv.string.concat(output, ".nerv-link.tmp")
+    if object_only
+        if nerv.ffi.copy(object, temporary) != 0
+            return "cannot copy generated object"
+    else
+        problem = linker.executable(object, temporary)
+    if problem == ""
+        problem = publish(temporary, output)
+    let cleanup = result_or(remove_file(path(temporary)), false)
+    problem
+
+fn build(program: CheckedProgram, output: string, release: bool, tests: bool, fingerprint: string, object_only: bool) -> string
+    let directory = path(output):parent().text
+    if directory != ""
+        let created = result_or(create_directory(directory), -1)
+        if created < 0
+            return nerv.string.concat("cannot create output directory: ", directory)
+    let lock = nerv.ffi.lock(nerv.string.concat(output, ".nerv-build-lock"))
+    if lock == 0
+        return nerv.string.concat("cannot lock output: ", output)
+    let result = build_locked(program, output, release, tests, fingerprint, object_only)
+    nerv.ffi.unlock(lock)
+    result

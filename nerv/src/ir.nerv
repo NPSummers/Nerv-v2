@@ -1,0 +1,163 @@
+import nerv.std
+
+enum TypeTag
+    VoidType
+    BoolType
+    IntegerType
+    FloatType
+    StringType
+    ArrayType
+    FunctionType
+    NominalType
+    BottomType
+    ErrorType
+
+fn type_tag_name(tag: TypeTag) -> string
+    match tag
+        VoidType => "Void"
+        BoolType => "Bool"
+        IntegerType => "Integer"
+        FloatType => "Float"
+        StringType => "String"
+        ArrayType => "Array"
+        FunctionType => "Function"
+        NominalType => "Nominal"
+        BottomType => "Bottom"
+        ErrorType => "Error"
+
+enum IROp
+    ModuleIR
+    FunctionIR
+    ParameterIR
+    LocalIR
+    FunctionRefIR
+    IntegerIR
+    FloatIR
+    StringIR
+    BooleanIR
+    UnaryIR
+    BinaryIR
+    CastIR
+    BuiltinIR
+    CallIR
+    IndirectCallIR
+    StructIR
+    EnumIR
+    FieldIR
+    IndexIR
+    ArrayIR
+    RepeatIR
+    IfIR
+    MatchIR
+    ArmIR
+    LambdaIR
+    TryIR
+    BlockIR
+    LetIR
+    AssignIR
+    AssignFieldIR
+    AssignIndexIR
+    ReturnIR
+    BreakIR
+    ContinueIR
+    WhileIR
+    ForIR
+    ExprStatementIR
+
+fn ir_name(op: IROp) -> string
+    match op
+        ModuleIR => "Module"
+        FunctionIR => "Function"
+        ParameterIR => "Parameter"
+        LocalIR => "Local"
+        FunctionRefIR => "FunctionRef"
+        IntegerIR => "Integer"
+        FloatIR => "Float"
+        StringIR => "String"
+        BooleanIR => "Boolean"
+        UnaryIR => "Unary"
+        BinaryIR => "Binary"
+        CastIR => "Cast"
+        BuiltinIR => "Builtin"
+        CallIR => "Call"
+        IndirectCallIR => "IndirectCall"
+        StructIR => "Struct"
+        EnumIR => "Enum"
+        FieldIR => "Field"
+        IndexIR => "Index"
+        ArrayIR => "Array"
+        RepeatIR => "Repeat"
+        IfIR => "If"
+        MatchIR => "Match"
+        ArmIR => "Arm"
+        LambdaIR => "Lambda"
+        TryIR => "Try"
+        BlockIR => "Block"
+        LetIR => "Let"
+        AssignIR => "Assign"
+        AssignFieldIR => "AssignField"
+        AssignIndexIR => "AssignIndex"
+        ReturnIR => "Return"
+        BreakIR => "Break"
+        ContinueIR => "Continue"
+        WhileIR => "While"
+        ForIR => "For"
+        ExprStatementIR => "ExprStatement"
+
+struct SemanticType
+    tag: TypeTag
+    name: string
+    nominal: i64
+    parts: Buffer<i64>
+
+struct Symbol
+    name: string
+    category: string
+    type_id: i64
+    owner: i64
+    slot: i64
+    mutable: bool
+    syntax: i64
+    module_id: i64
+
+struct CheckedNode
+    op: IROp
+    type_id: i64
+    symbol: i64
+    slot: i64
+    text: string
+    syntax: i64
+    start: i64
+    end: i64
+    module_id: i64
+    children: Buffer<i64>
+
+struct SemanticError
+    source: i64
+    start: i64
+    end: i64
+    message: string
+
+struct CheckedProgram
+    types: Buffer<SemanticType>
+    symbols: Buffer<Symbol>
+    nodes: Buffer<CheckedNode>
+    functions: Buffer<i64>
+    main: i64
+    captures: Buffer<Capture>
+    source_paths: Buffer<string>
+
+struct Capture
+    function: i64
+    target: i64
+    symbol: i64
+    slot: i64
+
+fn empty_type() -> SemanticType
+    SemanticType { tag:ErrorType(), name: "", nominal: - 1, parts:buffer(0) }
+
+fn empty_symbol() -> Symbol
+    Symbol { name: "", category: "", type_id: 6, owner: - 1, slot: - 1, mutable: false, syntax: - 1, module_id: 0 }
+
+fn empty_ir() -> CheckedNode
+    CheckedNode { op:ModuleIR(), type_id: 6, symbol: - 1, slot: - 1, text: "", syntax: - 1, start: 0, end: 0, module_id: 0, children:buffer(0) }

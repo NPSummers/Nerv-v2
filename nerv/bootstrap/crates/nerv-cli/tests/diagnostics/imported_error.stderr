@@ -1,0 +1,5 @@
+lib/broken.nerv:1:23: error: unknown name `missing`
+  |
+1 | fn broken() -> i64 => missing
+  |                       ^^^^^^^
+  = note: names must be declared in this scope before use; check the spelling

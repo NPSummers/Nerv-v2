@@ -1,0 +1,375 @@
+import nerv.core
+
+struct Vector <T>
+    values: []T
+    length: i64
+    fn len(self) -> i64 => self.length
+    fn get(self, index: i64) -> T
+        assert(index >= 0 and index < self.length)
+        self.values [index]
+    fn push(self, value: T) -> Vector<T>
+        let mut values = [value] * (self.length + 1)
+        for i in 0 .. self.length
+            values [i] = self.values [i]
+        Vector { values: values, length: self.length + 1 }
+    fn each(self, callback:fn(T) -> void) -> void
+        for i in 0 .. self.length
+            callback(self.values [i])
+
+fn vector <T>(seed: T) -> Vector<T> => Vector { values: [seed] * 0, length: 0 }
+
+fn string_equal(left: string, right: string) -> bool
+    nerv.string.len(left) == nerv.string.len(right) and nerv.string.contains(left, right) == 1
+
+struct Map <T>
+    keys: Vector<string>
+    values: Vector<T>
+    fn len(self) -> i64 => self.keys.length
+    fn get(self, key: string) -> Option<T>
+        let mut found: Option<T> = None()
+        for i in 0 .. self.keys.length
+            if string_equal(self.keys:get(i), key)
+                found = Some(self.values:get(i))
+            else
+                assert(true)
+        found
+    fn insert(self, key: string, value: T) -> Map<T>
+        let mut keys = [key] * (self.keys.length + 1)
+        let mut values = [value] * (self.keys.length + 1)
+        let mut replaced = false
+        for i in 0 .. self.keys.length
+            keys [i] = self.keys:get(i)
+            if string_equal(keys [i], key)
+                values [i] = value
+                replaced = true
+            else
+                values [i] = self.values:get(i)
+        let length = if replaced
+            self.keys.length
+        else
+            self.keys.length + 1
+        Map { keys: Vector { values: keys, length: length }, values: Vector { values: values, length: length } }
+
+fn map <T>(seed: T) -> Map<T> => Map { keys:vector(""), values:vector(seed) }
+
+struct Set
+    entries: Map<bool>
+    fn len(self) -> i64 => self.entries:len()
+    fn contains(self, key: string) -> bool => option_or(self.entries:get(key), false)
+    fn insert(self, key: string) -> Set => Set { entries: self.entries:insert(key, true) }
+
+fn set() -> Set => Set { entries:map(false) }
+
+struct IoError
+    kind: string
+    operation: string
+    path: string
+    message: string
+
+fn io_error(operation: string, path: string, raw: []string) -> IoError
+    IoError { kind: raw [2], operation: operation, path: path, message: raw [1] }
+
+fn read_text(path: string) -> Result<string, IoError>
+    let raw = nerv.fs.read_text(path)
+    if nerv.string.len(raw [1]) == 0
+        Ok(raw [0])
+    else
+        Err(io_error("read", path, raw))
+
+fn write_text(path: string, contents: string) -> Result<i64, IoError>
+    let raw = nerv.fs.write_text(path, contents)
+    if nerv.string.len(raw [1]) == 0
+        Ok(nerv.string.len(contents))
+    else
+        Err(io_error("write", path, raw))
+
+fn create_directory(path: string) -> Result<i64, IoError>
+    let raw = nerv.fs.create_directory(path)
+    if nerv.string.len(raw [1]) == 0
+        Ok(0)
+    else
+        Err(io_error("mkdir", path, raw))
+
+fn list_directory(path: string) -> Result<[]string, IoError>
+    let response = nerv.io.list_directory(path)
+    if nerv.string.len(response [0]) == 0
+        let mut values = [""] * (nerv.arrays.len(response) - 1)
+        for i in 0 .. nerv.arrays.len(values)
+            values [i] = response [i + 1]
+        Ok(values)
+    else
+        Err(IoError { kind: response [1], operation: "list", path: path, message: response [0] })
+
+fn read_stdin() -> Result<string, IoError>
+    let response = nerv.io.read_stdin()
+    if nerv.string.len(response [1]) == 0
+        Ok(response [0])
+    else
+        Err(IoError { kind: response [2], operation: "stdin", path: "", message: response [1] })
+
+fn environment(name: string) -> Option<string>
+    let response = nerv.io.environment(name)
+    if nerv.string.len(response [1]) == 0
+        Some(response [0])
+    else
+        None()
+
+fn arguments() -> []string => nerv.io.arguments()
+fn stderr(message: string) -> void => nerv.io.stderr(message)
+fn now_ms() -> i64 => nerv.io.now_ms()
+fn sleep_ms(duration: i64) -> void => nerv.io.sleep_ms(duration)
+fn random_below(limit: i64) -> i64 => nerv.random(limit)
+
+struct Duration
+    milliseconds: i64
+
+fn duration_ms(milliseconds: i64) -> Duration
+    assert(milliseconds >= 0)
+    Duration { milliseconds: milliseconds }
+
+fn sleep(duration: Duration) -> void => sleep_ms(duration.milliseconds)
+
+fn assert_equal <T>(actual: T, expected: T) -> void => assert(actual == expected)
+fn assert_string_equal(actual: string, expected: string) -> void => assert(string_equal(actual, expected))
+
+fn monotonic_ms() -> i64 => nerv.io.monotonic_ms()
+
+struct ParseError
+    message: string
+
+struct FormatError
+    message: string
+
+fn integer_text(value: i64) -> string => nerv.text.integer(value)
+fn float_text(value: f64) -> string => nerv.text.float(value)
+fn boolean_text(value: bool) -> string
+    if value
+        "true"
+    else
+        "false"
+
+fn parse_integer(value: string) -> Result<i64, ParseError>
+    if nerv.text.valid_integer(value) == 1
+        Ok(nerv.text.parse_integer(value))
+    else
+        Err(ParseError { message: "invalid or out-of-range integer" })
+
+fn parse_float(value: string) -> Result<f64, ParseError>
+    if nerv.text.valid_float(value) == 1
+        Ok(nerv.text.parse_float(value))
+    else
+        Err(ParseError { message: "invalid or non-finite float" })
+
+fn split_text(value: string, separator: string) -> []string => nerv.text.split(value, separator)
+fn text_lines(value: string) -> []string => nerv.text.lines(value)
+fn join_text(values: []string, separator: string) -> string => nerv.text.join(values, separator)
+
+fn format_text(template: string, values: []string) -> Result<string, FormatError>
+    let raw = nerv.text.format(template, values)
+    if nerv.string.len(raw [1]) == 0
+        Ok(raw [0])
+    else
+        Err(FormatError { message: raw [1] })
+
+struct Path
+    text: string
+    fn join(self, child: string) -> Path => Path { text: nerv.path.join(self.text, child) }
+    fn parent(self) -> Path => Path { text: nerv.path.parent(self.text) }
+    fn file_name(self) -> string => nerv.path.file_name(self.text)
+    fn extension(self) -> string => nerv.path.extension(self.text)
+    fn canonicalize(self) -> Result<Path, IoError>
+        let raw = nerv.path.canonicalize(self.text)
+        if nerv.string.len(raw [1]) == 0
+            Ok(path(raw [0]))
+        else
+            Err(io_error("canonicalize", self.text, raw))
+    fn is_absolute(self) -> bool => nerv.path.is_absolute(self.text) == 1
+
+fn path(value: string) -> Path => Path { text: value }
+
+fn current_directory() -> Result<Path, IoError>
+    let raw = nerv.path.current_directory()
+    if nerv.string.len(raw [1]) == 0
+        Ok(path(raw [0]))
+    else
+        Err(io_error("current_directory", "", raw))
+
+fn path_exists(value: Path) -> Result<bool, IoError>
+    let raw = nerv.fs.exists(value.text)
+    if nerv.string.len(raw [1]) == 0
+        Ok(string_equal(raw [0], "true"))
+    else
+        Err(io_error("exists", value.text, raw))
+
+fn io_status(operation: string, value: string, raw: []string) -> Result<bool, IoError>
+    if nerv.string.len(raw [1]) == 0
+        Ok(true)
+    else
+        Err(io_error(operation, value, raw))
+
+fn rename_path(source: Path, destination: Path) -> Result<bool, IoError>
+    io_status("rename", source.text, nerv.fs.rename(source.text, destination.text))
+
+fn remove_file(value: Path) -> Result<bool, IoError>
+    io_status("remove_file", value.text, nerv.fs.remove_file(value.text))
+
+fn remove_directory(value: Path) -> Result<bool, IoError>
+    io_status("remove_directory", value.text, nerv.fs.remove_directory(value.text))
+
+struct Task
+    id: i64
+
+struct TaskError
+    message: string
+
+fn spawn_task(input: i64, worker:fn(i64) -> i64) -> Result<Task, TaskError>
+    let raw = nerv.task.spawn(input, worker)
+    if nerv.string.len(raw [1]) == 0
+        Ok(Task { id: nerv.text.parse_integer(raw [0]) })
+    else
+        Err(TaskError { message: raw [1] })
+
+fn join_task(task: Task) -> Result<i64, TaskError>
+    let raw = nerv.task.join(task.id)
+    if nerv.string.len(raw [1]) == 0
+        Ok(nerv.text.parse_integer(raw [0]))
+    else
+        Err(TaskError { message: raw [1] })
+
+fn cancel_task(task: Task) -> bool => nerv.task.cancel(task.id) == 1
+fn cancellation_requested() -> bool => nerv.task.cancelled() == 1
+fn allocation_scope(input: i64, worker:fn(i64) -> i64) -> i64 => nerv.memory.scope(input, worker)
+
+struct Buffer <T>
+    values: []T
+    length: i64
+    seed: T
+    fn len(self) -> i64 => self.length
+    fn capacity(self) -> i64 => nerv.arrays.len(self.values)
+    fn get(self, index: i64) -> T
+        assert(index >= 0 and index < self.length)
+        self.values [index]
+    fn reserve(self, capacity: i64) -> Buffer<T>
+        assert(capacity >= 0)
+        if capacity <= self:capacity()
+            self
+        else
+            let mut values = [self.seed] * capacity
+            for i in 0 .. self.length
+                values [i] = self.values [i]
+            Buffer { values: values, length: self.length, seed: self.seed }
+    fn push(self, value: T) -> Buffer<T>
+        let capacity = if self:capacity() == 0
+            4
+        else
+            self:capacity() * 2
+        let buffer = if self.length == self:capacity()
+            self:reserve(capacity)
+        else
+            self
+        let mut values = buffer.values
+        values [self.length] = value
+        Buffer { values: values, length: self.length + 1, seed: self.seed }
+    fn pop(self) -> Buffer<T>
+        let length = if self.length > 0
+            self.length - 1
+        else
+            0
+        Buffer { values: self.values, length: length, seed: self.seed }
+    fn clear(self) -> Buffer<T>
+        Buffer { values: self.values, length: 0, seed: self.seed }
+
+fn buffer <T>(seed: T) -> Buffer<T>
+    Buffer { values: [seed] * 0, length: 0, seed: seed }
+
+struct HashMap <T>
+    keys: []string
+    values: []T
+    states: []i64
+    length: i64
+    used: i64
+    seed: T
+    fn len(self) -> i64 => self.length
+    fn capacity(self) -> i64 => nerv.arrays.len(self.keys)
+    fn get(self, key: string) -> Option<T>
+        let mut result: Option<T> = None()
+        let mut slot = nerv.text.hash(key) % self:capacity()
+        for i in 0 .. self:capacity()
+            if self.states [slot] == 0
+                break
+            if self.states [slot] == 1 and self.keys [slot] == key
+                result = Some(self.values [slot])
+                break
+            slot = (slot + 1) % self:capacity()
+        result
+    fn insert(self, key: string, value: T) -> HashMap<T>
+        let entries = if (self.used + 1) * 10 >= self:capacity() * 7
+            self:rehash(self:capacity() * 2)
+        else
+            self
+        let mut slot = nerv.text.hash(key) % entries:capacity()
+        let mut available = -1
+        let mut replaced = false
+        for i in 0 .. entries:capacity()
+            if entries.states [slot] == 0
+                if available == - 1
+                    available = slot
+                break
+            if entries.states [slot] == 2 and available == - 1
+                available = slot
+            if entries.states [slot] == 1 and entries.keys [slot] == key
+                available = slot
+                replaced = true
+                break
+            slot = (slot + 1) % entries:capacity()
+        assert(available >= 0)
+        let used = entries.used + if entries.states [available] == 0
+            1
+        else
+            0
+        let length = entries.length + if replaced
+            0
+        else
+            1
+        let mut keys = entries.keys
+        let mut values = entries.values
+        let mut states = entries.states
+        keys [available] = key
+        values [available] = value
+        states [available] = 1
+        HashMap { keys: keys, values: values, states: states, length: length, used: used, seed: self.seed }
+    fn remove(self, key: string) -> HashMap<T>
+        let mut slot = nerv.text.hash(key) % self:capacity()
+        let mut states = self.states
+        let mut length = self.length
+        for i in 0 .. self:capacity()
+            if states [slot] == 0
+                break
+            if states [slot] == 1 and self.keys [slot] == key
+                states [slot] = 2
+                length = length - 1
+                break
+            slot = (slot + 1) % self:capacity()
+        HashMap { keys: self.keys, values: self.values, states: states, length: length, used: self.used, seed: self.seed }
+    fn rehash(self, capacity: i64) -> HashMap<T>
+        let mut result = HashMap { keys: [""] * capacity, values: [self.seed] * capacity, states: [0] * capacity, length: 0, used: 0, seed: self.seed }
+        for i in 0 .. self:capacity()
+            if self.states [i] == 1
+                result = result:insert(self.keys [i], self.values [i])
+        result
+
+fn hash_map <T>(seed: T) -> HashMap<T>
+    HashMap { keys: [""] * 8, values: [seed] * 8, states: [0] * 8, length: 0, used: 0, seed: seed }
+
+struct FileMetadata
+    size: i64
+    is_file: bool
+    is_directory: bool
+    modified_ms: i64
+
+fn file_metadata(value: Path) -> Result<FileMetadata, IoError>
+    let raw = nerv.fs.metadata(value.text)
+    if nerv.string.len(raw [4]) == 0
+        Ok(FileMetadata { size: nerv.text.parse_integer(raw [0]), is_file:string_equal(raw [1], "true"), is_directory:string_equal(raw [2], "true"), modified_ms: nerv.text.parse_integer(raw [3]) })
+    else
+        Err(IoError { kind: raw [5], operation: "metadata", path: value.text, message: raw [4] })

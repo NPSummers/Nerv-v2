@@ -1,0 +1,2008 @@
+import nerv.std
+import ast
+import ir
+import loader
+import runtime
+
+struct CheckContext
+    function: i64
+    result: i64
+    loops: i64
+
+struct TypeBinding
+    name: string
+    type_id: i64
+
+struct GenericTemplate
+    name: string
+    module_id: i64
+    syntax: i64
+    generics: Buffer<i64>
+
+struct Specialization
+    template: i64
+    arguments: Buffer<i64>
+    symbol: i64
+
+struct TraitImplementation
+    owner: i64
+    trait_id: i64
+    syntax: i64
+
+struct Checker
+    tree: Ast
+    types: []Buffer<SemanticType>
+    symbols: []Buffer<Symbol>
+    code: []Buffer<CheckedNode>
+    active: []Buffer<i64>
+    declarations: []i64
+    errors: []Buffer<SemanticError>
+    captures: []Buffer<Capture>
+    functions: []Buffer<i64>
+    modules: Buffer<SourceModule>
+    node_sources: Buffer<i64>
+    current: []i64
+    templates: []Buffer<GenericTemplate>
+    instances: []Buffer<Specialization>
+    type_env: []Buffer<TypeBinding>
+    nominal_templates: []Buffer<GenericTemplate>
+    nominal_instances: []Buffer<Specialization>
+    nominal_depth: []i64
+    traits: []Buffer<GenericTemplate>
+    implementations: []Buffer<TraitImplementation>
+
+fn syntax(c: Checker, id: i64) -> Node => c.tree.nodes:get(id)
+fn broken(c: Checker) -> bool => c.errors [0]:len() != 0
+
+fn reject(c: Checker, id: i64, message: string) -> void
+    if not broken(c)
+        let node = syntax(c, id)
+        let mut errors = c.errors
+        errors [0] = errors [0]:push(SemanticError { source: c.node_sources:get(id), start: node.start, end: node.end, message: message })
+
+fn type_at(c: Checker, id: i64) -> SemanticType => c.types [0]:get(id)
+fn symbol_at(c: Checker, id: i64) -> Symbol => c.symbols [0]:get(id)
+
+fn same_parts(left: Buffer<i64>, right: Buffer<i64>) -> bool
+    if left:len() != right:len()
+        return false
+    for index in 0 .. left:len()
+        if left:get(index) != right:get(index)
+            return false
+    true
+
+fn intern(c: Checker, tag: TypeTag, name: string, nominal: i64, parts: Buffer<i64>) -> i64
+    for index in 0 .. c.types [0]:len()
+        let existing = type_at(c, index)
+        if existing.tag == tag and existing.name == name and existing.nominal == nominal and same_parts(existing.parts, parts)
+            return index
+    let mut types = c.types
+    let id = types [0]:len()
+    types [0] = types [0]:push(SemanticType { tag: tag, name: name, nominal: nominal, parts: parts })
+    id
+
+fn add_symbol(c: Checker, name: string, category: string, ty: i64, owner: i64, slot: i64, mutable: bool, node: i64) -> i64
+    let mut symbols = c.symbols
+    let id = symbols [0]:len()
+    symbols [0] = symbols [0]:push(Symbol { name: name, category: category, type_id: ty, owner: owner, slot: slot, mutable: mutable, syntax: node, module_id: c.node_sources:get(node) })
+    id
+
+fn replace_symbol_type(c: Checker, id: i64, ty: i64) -> void
+    let old = symbol_at(c, id)
+    let mut values = c.symbols [0].values
+    values [id] = Symbol { name: old.name, category: old.category, type_id: ty, owner: old.owner, slot: old.slot, mutable: old.mutable, syntax: old.syntax, module_id: old.module_id }
+
+fn emit(c: Checker, op: IROp, ty: i64, symbol: i64, slot: i64, text: string, node: i64, children: Buffer<i64>) -> i64
+    if broken(c)
+        return -1
+    let mut code = c.code
+    let id = code [0]:len()
+    let location = syntax(c, node)
+    code [0] = code [0]:push(CheckedNode { op: op, type_id: ty, symbol: symbol, slot: slot, text: text, syntax: node, start: location.start, end: location.end, module_id: c.node_sources:get(node), children: children })
+    id
+
+fn result_type(c: Checker, value: i64) -> i64
+    if value < 0
+        return 6
+    c.code [0]:get(value).type_id
+
+fn one(id: i64) -> Buffer<i64> => buffer(0):push(id)
+fn two(left: i64, right: i64) -> Buffer<i64> => one(left):push(right)
+
+fn append_ids(left: Buffer<i64>, right: Buffer<i64>) -> Buffer<i64>
+    let mut result = left
+    for index in 0 .. right:len()
+        result = result:push(right:get(index))
+    result
+
+fn primitive_type(c: Checker, name: string) -> i64
+    for index in 0 .. c.types [0]:len()
+        let item = type_at(c, index)
+        if item.name == name and item.parts:len() == 0 and item.tag != NominalType()
+            return index
+    return -1
+
+fn raw_global(c: Checker, name: string, owner: i64, module_id: i64) -> i64
+    let mut found = -1
+    for index in 0 .. c.symbols [0]:len()
+        let item = symbol_at(c, index)
+        if item.name == name and item.owner == owner and (owner >= 0 or item.module_id == module_id) and item.category != "local" and item.category != "parameter" and item.category != "capture"
+            if found != - 1
+                return -2
+            found = index
+    found
+
+fn binding(c: Checker, name: string) -> i64
+    let mut index = c.active [0]:len() - 1
+    while index >= 0
+        let id = c.active [0]:get(index)
+        if symbol_at(c, id).name == name
+            return id
+        index = index - 1
+    let direct = visible(c, name)
+    if direct == - 2
+        return -2
+    if direct >= 0
+        let category = symbol_at(c, direct).category
+        if category == "function" or category == "variant"
+            return direct
+    let mut variant = -1
+    for offset in 0 .. c.symbols [0]:len()
+        let item = symbol_at(c, offset)
+        if item.category == "variant" and item.name == name and reachable(c, c.current [0], item.module_id, buffer(0))
+            if variant >= 0
+                return -2
+            variant = offset
+    variant
+
+fn bind_local(c: Checker, name: string, ty: i64, owner: i64, mutable: bool, node: i64, category: string) -> i64
+    let id = add_symbol(c, name, category, ty, owner, -1, mutable, node)
+    let mut active = c.active
+    active [0] = active [0]:push(id)
+    id
+
+fn require_type(c: Checker, actual: i64, expected: i64, node: i64, message: string) -> void
+    if actual != expected and actual != 5 and actual != 6 and expected != 6
+        reject(c, node, message)
+
+fn resolve_type_inner(c: Checker, node: i64) -> i64
+    if broken(c)
+        return 6
+    let item = syntax(c, node)
+    if item.tag == TypeNameNode()
+        let bound = bound_type(c, item.text)
+        if bound >= 0
+            return bound
+        let id = named_type(c, item.text)
+        if id < 0
+            if trait_for_node(c, node) >= 0
+                reject(c, node, "trait objects are not implemented; use a generic constraint")
+                return 6
+            reject(c, node, nerv.string.concat("unknown type: ", item.text))
+            return 6
+        return id
+    if item.tag == ArrayTypeNode()
+        let element = resolve_type(c, item.children:get(0))
+        if element == 0
+            reject(c, node, "array elements cannot be void")
+        return intern(c, ArrayType(), "", -1, one(element))
+    if item.tag == FunctionTypeNode()
+        let mut parts = buffer(0)
+        for index in 0 .. item.children:len()
+            let ty = resolve_type(c, item.children:get(index))
+            if index < item.children:len() - 1 and ty == 0
+                reject(c, node, "function parameters cannot be void")
+            parts = parts:push(ty)
+        return intern(c, FunctionType(), "", -1, parts)
+    if item.tag == AppliedTypeNode()
+        let template = nominal_pattern(c, node)
+        if template < 0
+            reject(c, node, "unknown or ambiguous generic type")
+            return 6
+        let mut arguments = buffer(0)
+        for index in 0 .. item.children:len()
+            arguments = arguments:push(resolve_type(c, item.children:get(index)))
+        return instantiate_nominal(c, template, arguments)
+    reject(c, node, "expected a type")
+    6
+
+fn has_generics(c: Checker, node: Node) -> bool
+    for index in 0 .. node.children:len()
+        let child = syntax(c, node.children:get(index))
+        if child.tag == GenericsNode() and child.children:len() > 0
+            return true
+    false
+
+fn register_nominal_inner(c: Checker, id: i64) -> void
+    let node = syntax(c, id)
+    if has_generics(c, node)
+        register_nominal_template(c, id)
+        return
+    if primitive_type(c, node.text) >= 0 or global(c, node.text, -1) >= 0 or raw_template_in(c.nominal_templates [0], node.text, c.current [0]) >= 0
+        reject(c, id, "duplicate declaration")
+        return
+    let category = if node.tag == EnumNode()
+        "enum"
+    else
+        "struct"
+    let symbol = add_symbol(c, node.text, category, 6, -1, -1, false, id)
+    let ty = intern(c, NominalType(), node.text, symbol, buffer(0))
+    replace_symbol_type(c, symbol, ty)
+    let mut declarations = c.declarations
+    declarations [id] = symbol
+
+fn register_function_inner(c: Checker, id: i64, owner: i64) -> void
+    let node = syntax(c, id)
+    if has_generics(c, node)
+        register_template(c, id)
+        return
+    if global(c, node.text, owner) >= 0 or (owner == - 1 and raw_template(c, node.text, c.current [0]) >= 0)
+        reject(c, id, "duplicate function")
+        return
+    let mut parts = buffer(0)
+    let mut result = 0
+    let mut names = set()
+    for index in 0 .. node.children:len()
+        let child_id = node.children:get(index)
+        let child = syntax(c, child_id)
+        if child.tag == ParameterNode()
+            if names:contains(child.text)
+                reject(c, child_id, "duplicate parameter")
+            names = names:insert(child.text)
+            let ty = resolve_type(c, child.children:get(0))
+            if ty == 0
+                reject(c, child_id, "parameters cannot be void")
+            parts = parts:push(ty)
+        if child.tag == TypeNameNode() or child.tag == ArrayTypeNode() or child.tag == FunctionTypeNode() or child.tag == AppliedTypeNode()
+            result = resolve_type(c, child_id)
+    let ty = intern(c, FunctionType(), "", -1, parts:push(result))
+    let symbol = add_symbol(c, node.text, "function", ty, owner, -1, false, id)
+    let mut declarations = c.declarations
+    declarations [id] = symbol
+    if node.text == "main" and owner == - 1 and c.current [0] == 0
+        if parts:len() != 0 or (result != 0 and result != 2)
+            reject(c, id, "main must have no parameters and return void or i64")
+
+fn register_members_inner(c: Checker, id: i64, owner: i64) -> void
+    let node = syntax(c, id)
+    let mut slot = 0
+    for index in 0 .. node.children:len()
+        let child_id = node.children:get(index)
+        let member = syntax(c, child_id)
+        if member.tag == TypeNameNode()
+            register_trait_claim(c, owner, trait_for_node(c, child_id), child_id)
+        if member.tag == FieldNode() or member.tag == VariantNode()
+            if global(c, member.text, owner) >= 0
+                reject(c, child_id, "duplicate field or variant")
+            let mut ty = 6
+            let category = if member.tag == FieldNode()
+                "field"
+            else
+                "variant"
+            if member.tag == FieldNode()
+                ty = resolve_type(c, member.children:get(0))
+                if ty == 0
+                    reject(c, child_id, "fields cannot be void")
+            else
+                if member.children:len() > 1
+                    reject(c, child_id, "enum variants support at most one payload")
+                let mut parts = buffer(0)
+                for offset in 0 .. member.children:len()
+                    let payload = resolve_type(c, member.children:get(offset))
+                    if payload == 0
+                        reject(c, child_id, "enum payload cannot be void")
+                    parts = parts:push(payload)
+                ty = intern(c, FunctionType(), "", -1, parts:push(symbol_at(c, owner).type_id))
+            let symbol = add_symbol(c, member.text, category, ty, owner, slot, false, child_id)
+            let mut declarations = c.declarations
+            declarations [child_id] = symbol
+            slot = slot + 1
+        if member.tag == FunctionNode()
+            register_function(c, child_id, owner)
+
+fn recursive_layout(c: Checker, owner: i64, visiting: Buffer<i64>) -> bool
+    for index in 0 .. visiting:len()
+        if visiting:get(index) == owner
+            return true
+    let chain = visiting:push(owner)
+    for index in 0 .. c.symbols [0]:len()
+        let member = symbol_at(c, index)
+        if member.owner == owner and member.category == "field"
+            let ty = type_at(c, member.type_id)
+            if ty.tag == NominalType()
+                if recursive_layout(c, ty.nominal, chain)
+                    return true
+        if member.owner == owner and member.category == "variant"
+            let parts = type_at(c, member.type_id).parts
+            for offset in 0 .. parts:len() - 1
+                let ty = type_at(c, parts:get(offset))
+                if ty.tag == NominalType()
+                    if recursive_layout(c, ty.nominal, chain)
+                        return true
+    false
+
+fn enum_equality(c: Checker, ty: i64) -> bool
+    let item = type_at(c, ty)
+    if item.tag != NominalType() or symbol_at(c, item.nominal).category != "enum"
+        return false
+    for index in 0 .. c.symbols [0]:len()
+        let variant = symbol_at(c, index)
+        if variant.owner == item.nominal and variant.category == "variant"
+            if type_at(c, variant.type_id).parts:len() != 1
+                return false
+    true
+
+fn dotted(c: Checker, id: i64) -> string
+    let node = syntax(c, id)
+    if node.tag == NameNode()
+        return node.text
+    if node.tag == MemberNode()
+        let base = dotted(c, node.children:get(0))
+        if base != ""
+            return nerv.string.concat(base, nerv.string.concat(".", node.text))
+    ""
+
+fn qualified_symbol(c: Checker, name: string) -> i64
+    let direct = binding(c, name)
+    if direct >= 0
+        return direct
+    let parts = split_text(name, ".")
+    if nerv.arrays.len(parts) >= 2
+        let mut prefix = [""] * (nerv.arrays.len(parts) - 1)
+        for index in 0 .. nerv.arrays.len(prefix)
+            prefix [index] = parts [index]
+        let ty = named_type(c, join_text(prefix, "."))
+        if ty >= 0 and type_at(c, ty).tag == NominalType()
+            return global(c, parts [nerv.arrays.len(parts) - 1], type_at(c, ty).nominal)
+    return -1
+
+fn numeric(c: Checker, ty: i64) -> bool
+    let tag = type_at(c, ty).tag
+    tag == IntegerType() or tag == FloatType()
+
+fn function_result(c: Checker, ty: i64) -> i64
+    let parts = type_at(c, ty).parts
+    parts:get(parts:len() - 1)
+
+fn reference(c: Checker, node: i64, symbol: i64) -> i64
+    let item = symbol_at(c, symbol)
+    if item.category == "local" or item.category == "parameter" or item.category == "capture"
+        return emit(c, LocalIR(), item.type_id, symbol, -1, "", node, buffer(0))
+    if item.category == "function" or item.category == "variant"
+        return emit(c, FunctionRefIR(), item.type_id, symbol, -1, "", node, buffer(0))
+    reject(c, node, "declaration is not a value")
+    return -1
+
+fn check_arguments(c: Checker, context: CheckContext, node: i64, ty: i64, offset: i64) -> Buffer<i64>
+    let call = syntax(c, node)
+    let parts = type_at(c, ty).parts
+    let mut values = buffer(0)
+    if call.children:len() - 1 + offset != parts:len() - 1
+        reject(c, node, "wrong argument count")
+        return values
+    for index in 1 .. call.children:len()
+        let expected = parts:get(index - 1 + offset)
+        let value_id = call.children:get(index)
+        let value = check_node(c, context, value_id, expected)
+        require_type(c, result_type(c, value), expected, value_id, "argument type mismatch")
+        values = values:push(value)
+    values
+
+fn builtin(c: Checker, context: CheckContext, node: i64, name: string) -> i64
+    let call = syntax(c, node)
+    let count = call.children:len() - 1
+    if nerv.string.starts_with(name, "nerv.ffi.call_") == 1
+        return foreign_call(c, context, node, name)
+    let mut expected = buffer(0)
+    let mut result = 0
+    let mut flexible = false
+    if name == "print" or name == "println"
+        flexible = true
+        expected = one(6)
+    if name == "assert"
+        expected = one(1)
+    if name == "nerv.arrays.len"
+        flexible = true
+        expected = one(6)
+        result = 2
+    let specification = runtime.signature(name)
+    let known = specification != ""
+    if known
+        let sections = split_text(specification, ">")
+        if sections [0] != ""
+            let parameters = split_text(sections [0], ",")
+            for index in 0 .. nerv.arrays.len(parameters)
+                expected = expected:push(runtime_type_code(c, parameters [index]))
+        result = runtime_type_code(c, sections [1])
+    if name == "nerv.math.abs"
+        expected = one(6)
+        flexible = true
+    let cast = named_type(c, name)
+    if cast >= 0 and numeric(c, cast)
+        flexible = true
+        expected = one(6)
+        result = cast
+    if expected:len() == 0 and not known
+        return -1
+    if count != expected:len()
+        reject(c, node, "wrong builtin argument count")
+        return -1
+    let mut args = buffer(0)
+    let mut actuals = buffer(0)
+    for index in 0 .. count
+        let value_id = call.children:get(index + 1)
+        let value = check_node(c, context, value_id, expected:get(index))
+        let actual = result_type(c, value)
+        if not flexible
+            require_type(c, actual, expected:get(index), value_id, "invalid builtin argument")
+        if name == "nerv.math.abs" and not broken(c)
+            if actual != 2 and actual != 3
+                reject(c, value_id, "abs requires i64 or f64")
+            result = actual
+        if flexible and not broken(c)
+            if name == "nerv.arrays.len"
+                if type_at(c, actual).tag != ArrayType()
+                    reject(c, value_id, "array length requires an array")
+            else
+                if cast >= 0
+                    if not numeric(c, actual)
+                        reject(c, value_id, "numeric conversion requires a number")
+                else
+                    if not numeric(c, actual) and actual != 1 and actual != 4
+                        reject(c, value_id, "printing requires a scalar or string")
+        let normalized = if name == "print" or name == "println"
+            promote_print(c, value_id, value)
+        else
+            value
+        args = args:push(normalized)
+        actuals = actuals:push(result_type(c, normalized))
+    let fn_type = intern(c, FunctionType(), "", -1, actuals:push(result))
+    let abi = if cast >= 0
+        name
+    else
+        builtin_abi(c, name, actuals)
+    let category = if cast >= 0
+        "cast"
+    else
+        if name == "assert"
+            "intrinsic"
+        else
+            "builtin"
+    let symbol = add_symbol(c, abi, category, fn_type, -1, -1, false, node)
+    let op = if cast >= 0
+        CastIR()
+    else
+        BuiltinIR()
+    emit(c, op, result, symbol, -1, "", node, args)
+
+fn check_call(c: Checker, context: CheckContext, node: i64, expected: i64) -> i64
+    let call = syntax(c, node)
+    let callee_id = call.children:get(0)
+    let name = dotted(c, callee_id)
+    let symbol = qualified_symbol(c, name)
+    let choice = find_generic_variant(c, name, expected)
+    if choice.template == - 2 and symbol < 0
+        reject(c, node, "ambiguous generic variant")
+        return -1
+    if choice.template >= 0 and choice.syntax >= 0
+        let candidate = if symbol >= 0
+            symbol_at(c, symbol).category == "variant"
+        else
+            true
+        if candidate
+            return construct_variant(c, context, node, choice, expected)
+    let local_template = raw_template(c, name, c.current [0])
+    if local_template >= 0
+        let lexical = if symbol >= 0
+            symbol_at(c, symbol).category == "local" or symbol_at(c, symbol).category == "parameter" or symbol_at(c, symbol).category == "capture"
+        else
+            false
+        if not lexical
+            return generic_call(c, context, node, local_template, expected)
+    if symbol >= 0 and nerv.string.contains(name, ".") == 0
+        let item = symbol_at(c, symbol)
+        let imported_template = find_template(c, name)
+        if item.category == "function" and item.module_id != c.current [0] and imported_template >= 0
+            reject(c, node, "ambiguous imported function")
+            return -1
+    if symbol < 0
+        let template = find_template(c, name)
+        if template >= 0
+            return generic_call(c, context, node, template, expected)
+        if template == - 2
+            reject(c, node, "ambiguous generic function")
+            return -1
+        let value = builtin(c, context, node, name)
+        if value >= 0 or broken(c)
+            return value
+    let callee = check_node(c, context, callee_id, -1)
+    let ty = result_type(c, callee)
+    if broken(c)
+        return -1
+    if type_at(c, ty).tag != FunctionType()
+        reject(c, node, "call target is not a function")
+        return -1
+    let args = check_arguments(c, context, node, ty, 0)
+    let result = function_result(c, ty)
+    if symbol >= 0 and symbol_at(c, symbol).category == "variant"
+        let variant = symbol_at(c, symbol)
+        return emit(c, EnumIR(), result, symbol, variant.slot, "", node, args)
+    if symbol >= 0 and symbol_at(c, symbol).category == "function"
+        return emit(c, CallIR(), result, symbol, -1, "", node, args)
+    emit(c, IndirectCallIR(), result, -1, -1, "", node, append_ids(one(callee), args))
+
+fn restore_scope(c: Checker, saved: Buffer<i64>) -> void
+    let mut active = c.active
+    active [0] = saved
+
+fn value_reference(c: Checker, context: CheckContext, node: i64, target: i64) -> i64
+    let item = symbol_at(c, target)
+    if (item.category == "local" or item.category == "parameter" or item.category == "capture") and item.owner != context.function
+        let mut slot = 0
+        for index in 0 .. c.captures [0]:len()
+            let capture = c.captures [0]:get(index)
+            if capture.function == context.function
+                if capture.target == target
+                    return emit(c, LocalIR(), item.type_id, capture.symbol, -1, "", node, buffer(0))
+                slot = slot + 1
+        let symbol = add_symbol(c, item.name, "capture", item.type_id, context.function, slot, false, node)
+        let mut captures = c.captures
+        captures [0] = captures [0]:push(Capture { function: context.function, target: target, symbol: symbol, slot: slot })
+        return emit(c, LocalIR(), item.type_id, symbol, -1, "", node, buffer(0))
+    reference(c, node, target)
+
+fn merge_types(c: Checker, left: i64, right: i64, node: i64) -> i64
+    if left == 5
+        return right
+    if right == 5
+        return left
+    require_type(c, right, left, node, "branches have different types")
+    left
+
+fn check_block(c: Checker, context: CheckContext, id: i64, expected: i64) -> i64
+    let saved = c.active [0]
+    let node = syntax(c, id)
+    let mut children = buffer(0)
+    let mut result = 0
+    let mut exits = false
+    for index in 0 .. node.children:len()
+        if not broken(c)
+            let hint = if index == node.children:len() - 1
+                expected
+            else
+                -1
+            let value = check_node(c, context, node.children:get(index), hint)
+            children = children:push(value)
+            result = result_type(c, value)
+            exits = exits or result == 5
+    restore_scope(c, saved)
+    if exits
+        result = 5
+    emit(c, BlockIR(), result, -1, -1, "", id, children)
+
+fn local_base(c: Checker, node: i64) -> i64
+    let item = syntax(c, node)
+    if item.tag == NameNode()
+        return binding(c, item.text)
+    if item.tag == IndexNode() or item.tag == MemberNode()
+        return local_base(c, item.children:get(0))
+    return -1
+
+fn check_assignment(c: Checker, context: CheckContext, id: i64) -> i64
+    let node = syntax(c, id)
+    let target_id = node.children:get(0)
+    let target = syntax(c, target_id)
+    let symbol = local_base(c, target_id)
+    if symbol < 0
+        reject(c, target_id, "assignment requires a named mutable binding")
+        return -1
+    let item = symbol_at(c, symbol)
+    if not item.mutable or item.owner != context.function
+        reject(c, target_id, "cannot assign to immutable or captured binding")
+        return -1
+    let left = check_node(c, context, target_id, -1)
+    let ty = result_type(c, left)
+    let right_id = node.children:get(1)
+    let right = check_node(c, context, right_id, ty)
+    require_type(c, result_type(c, right), ty, right_id, "assignment type mismatch")
+    let mut op = AssignIR()
+    let mut slot = -1
+    if target.tag == IndexNode()
+        op = AssignIndexIR()
+    if target.tag == MemberNode()
+        op = AssignFieldIR()
+        if left >= 0
+            slot = c.code [0]:get(left).slot
+    emit(c, op, 0, symbol, slot, "", id, two(left, right))
+
+fn check_member(c: Checker, context: CheckContext, id: i64) -> i64
+    let name = dotted(c, id)
+    let resolved = qualified_symbol(c, name)
+    if resolved >= 0
+        let category = symbol_at(c, resolved).category
+        if category == "variant" or category == "function"
+            return reference(c, id, resolved)
+    let node = syntax(c, id)
+    let base = check_node(c, context, node.children:get(0), -1)
+    let ty = type_at(c, result_type(c, base))
+    if ty.tag != NominalType()
+        reject(c, id, "field access requires a struct")
+        return -1
+    let field = global(c, node.text, ty.nominal)
+    if field < 0
+        reject(c, id, "unknown field")
+        return -1
+    let item = symbol_at(c, field)
+    if item.category != "field"
+        reject(c, id, "member is not a field")
+        return -1
+    emit(c, FieldIR(), item.type_id, field, item.slot, "", id, one(base))
+
+fn check_method(c: Checker, context: CheckContext, id: i64) -> i64
+    let node = syntax(c, id)
+    let base = check_node(c, context, node.children:get(0), -1)
+    let ty = type_at(c, result_type(c, base))
+    if ty.tag != NominalType()
+        reject(c, id, "method receiver must have a nominal type")
+        return -1
+    let method = global(c, node.text, ty.nominal)
+    if method < 0
+        reject(c, id, "unknown method")
+        return -1
+    let item = symbol_at(c, method)
+    if item.category != "function"
+        reject(c, id, "member is not a method")
+        return -1
+    let signature = type_at(c, item.type_id)
+    if signature.parts:len() < 2
+        reject(c, id, "method requires a receiver parameter")
+        return -1
+    require_type(c, result_type(c, base), signature.parts:get(0), id, "method receiver type mismatch")
+    let args = check_arguments(c, context, id, item.type_id, 1)
+    emit(c, CallIR(), function_result(c, item.type_id), method, -1, "", id, append_ids(one(base), args))
+
+fn check_construct(c: Checker, context: CheckContext, id: i64, expected: i64) -> i64
+    let node = syntax(c, id)
+    let template = find_nominal_template(c, node.text)
+    if template >= 0
+        return construct_generic(c, context, id, template, expected)
+    let ty = named_type(c, node.text)
+    if ty < 0
+        reject(c, id, "unknown struct")
+        return -1
+    let nominal = type_at(c, ty)
+    if nominal.tag != NominalType() or symbol_at(c, nominal.nominal).category != "struct"
+        reject(c, id, "construction requires a struct type")
+        return -1
+    let mut count = 0
+    for index in 0 .. c.symbols [0]:len()
+        let item = symbol_at(c, index)
+        if item.owner == nominal.nominal and item.category == "field"
+            count = count + 1
+    if node.children:len() != count
+        reject(c, id, "wrong struct field count")
+    let mut seen = set()
+    let mut values = buffer(0)
+    for index in 0 .. node.children:len()
+        let field_id = node.children:get(index)
+        let field_node = syntax(c, field_id)
+        let field = global(c, field_node.text, nominal.nominal)
+        if field < 0
+            reject(c, field_id, "unknown initializer field")
+            return -1
+        let item = symbol_at(c, field)
+        if item.category != "field" or seen:contains(field_node.text)
+            reject(c, field_id, "duplicate or invalid initializer field")
+        seen = seen:insert(field_node.text)
+        let value_id = field_node.children:get(0)
+        let value = check_node(c, context, value_id, item.type_id)
+        require_type(c, result_type(c, value), item.type_id, value_id, "initializer type mismatch")
+        values = values:push(emit(c, FieldIR(), item.type_id, field, item.slot, "", field_id, one(value)))
+    emit(c, StructIR(), ty, nominal.nominal, -1, "", id, values)
+
+fn check_match(c: Checker, context: CheckContext, id: i64, expected: i64) -> i64
+    let node = syntax(c, id)
+    let value = check_node(c, context, node.children:get(0), -1)
+    let ty = result_type(c, value)
+    if type_at(c, ty).tag != NominalType()
+        reject(c, id, "match requires an enum")
+        return -1
+    let owner = type_at(c, ty).nominal
+    if symbol_at(c, owner).category != "enum"
+        reject(c, id, "match requires an enum")
+        return -1
+    let saved = c.active [0]
+    let mut children = one(value)
+    let mut covered = set()
+    let mut wildcard = false
+    let mut result = 5
+    for index in 1 .. node.children:len()
+        let arm_id = node.children:get(index)
+        let arm = syntax(c, arm_id)
+        restore_scope(c, saved)
+        let mut variant = -1
+        let mut bound = -1
+        if wildcard
+            reject(c, arm_id, "unreachable match arm after wildcard")
+        if arm.text == "_"
+            reject(c, arm_id, "wildcard matching is not supported by stage 0")
+            wildcard = true
+            if arm.children:len() != 1
+                reject(c, arm_id, "wildcard cannot bind a payload")
+        else
+            let parts = split_text(arm.text, ".")
+            let name = parts [nerv.arrays.len(parts) - 1]
+            variant = global(c, name, owner)
+            if nerv.arrays.len(parts) > 1
+                let qualified = match_variant(c, arm.text, owner)
+                if qualified != variant
+                    reject(c, arm_id, "variant belongs to a different enum")
+            if variant < 0
+                reject(c, arm_id, "unknown match variant")
+                return -1
+            let item = symbol_at(c, variant)
+            if item.category != "variant" or covered:contains(name)
+                reject(c, arm_id, "duplicate or invalid match variant")
+            covered = covered:insert(name)
+            let signature = type_at(c, item.type_id).parts
+            if arm.children:len() == 2
+                if signature:len() != 2
+                    reject(c, arm_id, "variant has no payload to bind")
+                else
+                    let binding_id = arm.children:get(0)
+                    bound = bind_local(c, syntax(c, binding_id).text, signature:get(0), context.function, false, binding_id, "local")
+        let body = check_node(c, context, arm.children:get(arm.children:len() - 1), expected)
+        result = merge_types(c, result, result_type(c, body), arm_id)
+        children = children:push(emit(c, ArmIR(), result_type(c, body), variant, bound, "", arm_id, one(body)))
+    restore_scope(c, saved)
+    if not wildcard
+        let mut total = 0
+        for index in 0 .. c.symbols [0]:len()
+            let item = symbol_at(c, index)
+            if item.owner == owner and item.category == "variant"
+                total = total + 1
+        if covered:len() != total
+            reject(c, id, "non-exhaustive match")
+    emit(c, MatchIR(), result, owner, -1, "", id, children)
+
+fn decode_string(text: string) -> string
+    let parts = split_text(text, "")
+    let mut output = [""] * nerv.arrays.len(parts)
+    let mut index = 2
+    while index < nerv.arrays.len(parts) - 2
+        let mut value = parts [index]
+        if value == "\\"
+            index = index + 1
+            value = parts [index]
+            if value == "n"
+                value = "\n"
+            if value == "r"
+                value = "\r"
+            if value == "t"
+                value = "\t"
+        output [index] = value
+        index = index + 1
+    join_text(output, "")
+
+fn check_lambda(c: Checker, outer: CheckContext, id: i64) -> i64
+    let node = syntax(c, id)
+    let mut parts = buffer(0)
+    for index in 0 .. node.children:len() - 2
+        let param = syntax(c, node.children:get(index))
+        let ty = resolve_type(c, param.children:get(0))
+        if ty == 0
+            reject(c, id, "lambda parameters cannot be void")
+        parts = parts:push(ty)
+    let result = resolve_type(c, node.children:get(node.children:len() - 2))
+    let ty = intern(c, FunctionType(), "", -1, parts:push(result))
+    let symbol = add_symbol(c, "", "lambda", ty, outer.function, -1, false, id)
+    let context = CheckContext { function: symbol, result: result, loops: 0 }
+    let saved = c.active [0]
+    let mut params = buffer(0)
+    let mut names = set()
+    for index in 0 .. parts:len()
+        let param_id = node.children:get(index)
+        let param = syntax(c, param_id)
+        if names:contains(param.text)
+            reject(c, param_id, "duplicate lambda parameter")
+        names = names:insert(param.text)
+        let binding = bind_local(c, param.text, parts:get(index), symbol, false, param_id, "parameter")
+        params = params:push(emit(c, ParameterIR(), parts:get(index), binding, index, "", param_id, buffer(0)))
+    let body_id = node.children:get(node.children:len() - 1)
+    let body = check_node(c, context, body_id, result)
+    require_type(c, result_type(c, body), result, body_id, "lambda result type mismatch")
+    restore_scope(c, saved)
+    let function = emit(c, FunctionIR(), ty, symbol, -1, "", id, params:push(body))
+    let mut functions = c.functions
+    functions [0] = functions [0]:push(function)
+    let mut captures = buffer(0)
+    for index in 0 .. c.captures [0]:len()
+        let item = c.captures [0]:get(index)
+        if item.function == symbol
+            captures = captures:push(value_reference(c, outer, id, item.target))
+    emit(c, LambdaIR(), ty, symbol, -1, "", id, captures)
+
+fn check_node_inner(c: Checker, context: CheckContext, id: i64, expected: i64) -> i64
+    if broken(c)
+        return -1
+    let node = syntax(c, id)
+    let tag = node.tag
+    if tag == IntegerNode()
+        return emit(c, IntegerIR(), 2, -1, -1, nerv.string.replace(node.text, "_", ""), id, buffer(0))
+    if tag == FloatNode()
+        return emit(c, FloatIR(), 3, -1, -1, nerv.string.replace(node.text, "_", ""), id, buffer(0))
+    if tag == StringNode()
+        return emit(c, StringIR(), 4, -1, -1, decode_string(node.text), id, buffer(0))
+    if tag == BooleanNode()
+        return emit(c, BooleanIR(), 1, -1, -1, node.text, id, buffer(0))
+    if tag == NameNode()
+        let symbol = binding(c, node.text)
+        if symbol < 0
+            reject(c, id, nerv.string.concat("unknown or ambiguous name: ", node.text))
+            return -1
+        return value_reference(c, context, id, symbol)
+    if tag == BlockNode()
+        return check_block(c, context, id, expected)
+    if tag == ExprStatementNode()
+        let value = check_node(c, context, node.children:get(0), expected)
+        return emit(c, ExprStatementIR(), result_type(c, value), -1, -1, "", id, one(value))
+    if tag == UnaryNode()
+        let value = check_node(c, context, node.children:get(0), -1)
+        let ty = result_type(c, value)
+        if node.text == "Not"
+            require_type(c, ty, 1, id, "not requires bool")
+        else
+            if not numeric(c, ty)
+                reject(c, id, "negation requires a number")
+        return emit(c, UnaryIR(), ty, -1, -1, node.text, id, one(value))
+    if tag == BinaryNode()
+        let left = check_node(c, context, node.children:get(0), -1)
+        let ty = result_type(c, left)
+        let right = check_node(c, context, node.children:get(1), ty)
+        require_type(c, result_type(c, right), ty, id, "binary operand type mismatch")
+        let mut result = ty
+        if node.text == "And" or node.text == "Or"
+            require_type(c, ty, 1, id, "boolean operator requires bool")
+        else
+            if node.text == "EqEq" or node.text == "NotEq"
+                result = 1
+                if not numeric(c, ty) and ty != 1 and ty != 4 and type_at(c, ty).tag != ArrayType()
+                    if not enum_equality(c, ty)
+                        reject(c, id, "type does not support equality")
+            else
+                if not numeric(c, ty)
+                    reject(c, id, "arithmetic or comparison requires numbers")
+                if node.text == "Lt" or node.text == "LtEq" or node.text == "Gt" or node.text == "GtEq"
+                    result = 1
+        return emit(c, BinaryIR(), result, -1, -1, node.text, id, two(left, right))
+    if tag == CallNode()
+        return check_call(c, context, id, expected)
+    if tag == MemberNode()
+        return check_member(c, context, id)
+    if tag == MethodNode()
+        return check_method(c, context, id)
+    if tag == ConstructNode()
+        return check_construct(c, context, id, expected)
+    if tag == IndexNode()
+        let base = check_node(c, context, node.children:get(0), -1)
+        let index = check_node(c, context, node.children:get(1), 2)
+        require_type(c, result_type(c, index), 2, id, "array index must be i64")
+        let array = type_at(c, result_type(c, base))
+        if array.tag != ArrayType()
+            reject(c, id, "indexing requires an array")
+            return -1
+        return emit(c, IndexIR(), array.parts:get(0), -1, -1, "", id, two(base, index))
+    if tag == ArrayNode() or tag == RepeatNode()
+        let mut element = -1
+        if expected >= 0 and type_at(c, expected).tag == ArrayType()
+            element = type_at(c, expected).parts:get(0)
+        let mut values = buffer(0)
+        let count = if tag == RepeatNode()
+            1
+        else
+            node.children:len()
+        for index in 0 .. count
+            let value_id = node.children:get(index)
+            let value = check_node(c, context, value_id, element)
+            let actual = result_type(c, value)
+            if element < 0
+                element = actual
+            require_type(c, actual, element, value_id, "array element type mismatch")
+            values = values:push(value)
+        if element < 0 and count == 0
+            element = 2
+        if element < 0 or element == 0
+            reject(c, id, "array requires a non-void element type")
+            return -1
+        let ty = intern(c, ArrayType(), "", -1, one(element))
+        if tag == RepeatNode()
+            let length_id = node.children:get(1)
+            let length = check_node(c, context, length_id, 2)
+            require_type(c, result_type(c, length), 2, length_id, "array length must be i64")
+            return emit(c, RepeatIR(), ty, -1, -1, "", id, values:push(length))
+        return emit(c, ArrayIR(), ty, -1, -1, "", id, values)
+    if tag == IfNode()
+        let condition_id = node.children:get(0)
+        let condition = check_node(c, context, condition_id, 1)
+        require_type(c, result_type(c, condition), 1, condition_id, "if condition must be bool")
+        let yes = check_node(c, context, node.children:get(1), expected)
+        let mut children = two(condition, yes)
+        let mut result = 0
+        if node.children:len() == 3
+            let no = check_node(c, context, node.children:get(2), expected)
+            result = merge_types(c, result_type(c, yes), result_type(c, no), id)
+            children = children:push(no)
+        return emit(c, IfIR(), result, -1, -1, "", id, children)
+    if tag == LetNode()
+        let value_id = node.children:get(node.children:len() - 1)
+        let mut annotation = -1
+        if node.children:len() == 2
+            annotation = resolve_type(c, node.children:get(0))
+        let value = check_node(c, context, value_id, annotation)
+        let ty = result_type(c, value)
+        if annotation >= 0
+            require_type(c, ty, annotation, value_id, "binding type mismatch")
+        if ty == 0 or ty == 5
+            reject(c, id, "binding requires a value")
+        let mutable = nerv.string.starts_with(node.text, "mut ") == 1
+        let name = if mutable
+            nerv.string.slice(node.text, 4, nerv.string.len(node.text))
+        else
+            node.text
+        let symbol = bind_local(c, name, ty, context.function, mutable, id, "local")
+        return emit(c, LetIR(), 0, symbol, -1, "", id, one(value))
+    if tag == AssignNode()
+        return check_assignment(c, context, id)
+    if tag == ReturnNode()
+        let mut children = buffer(0)
+        let mut result = 0
+        if node.children:len() > 0
+            let value = check_node(c, context, node.children:get(0), context.result)
+            result = result_type(c, value)
+            children = children:push(value)
+        require_type(c, result, context.result, id, "return type mismatch")
+        return emit(c, ReturnIR(), 5, -1, -1, "", id, children)
+    if tag == BreakNode() or tag == ContinueNode()
+        if context.loops == 0
+            reject(c, id, "loop exit outside a loop")
+        let op = if tag == BreakNode()
+            BreakIR()
+        else
+            ContinueIR()
+        return emit(c, op, 5, -1, -1, "", id, buffer(0))
+    if tag == WhileNode() or tag == ForNode()
+        let nested = CheckContext { function: context.function, result: context.result, loops: context.loops + 1 }
+        let saved = c.active [0]
+        let mut children = buffer(0)
+        let mut symbol = -1
+        let mut slot = -1
+        let mut op = WhileIR()
+        if tag == WhileNode()
+            let condition_id = node.children:get(0)
+            let condition = check_node(c, context, condition_id, 1)
+            require_type(c, result_type(c, condition), 1, condition_id, "while condition must be bool")
+            children = one(condition)
+        else
+            op = ForIR()
+            for index in 0 .. 2
+                let bound_id = node.children:get(index)
+                let bound = check_node(c, context, bound_id, 2)
+                require_type(c, result_type(c, bound), 2, bound_id, "range bound must be i64")
+                children = children:push(bound)
+            let inclusive = nerv.string.ends_with(node.text, "..=") == 1
+            let suffix = if inclusive
+                3
+            else
+                2
+            slot = if inclusive
+                1
+            else
+                0
+            let name = nerv.string.slice(node.text, 0, nerv.string.len(node.text) - suffix)
+            symbol = bind_local(c, name, 2, context.function, false, id, "local")
+        children = children:push(check_node(c, nested, node.children:get(node.children:len() - 1), -1))
+        restore_scope(c, saved)
+        return emit(c, op, 0, symbol, slot, "", id, children)
+    if tag == MatchNode()
+        return check_match(c, context, id, expected)
+    if tag == LambdaNode()
+        return check_lambda(c, context, id)
+    if tag == TryNode()
+        return check_propagation(c, context, id)
+    reject(c, id, "semantic support for this syntax is not implemented yet")
+    return -1
+
+fn check_function_inner(c: Checker, id: i64, symbol: i64) -> void
+    if broken(c)
+        return
+    let item = symbol_at(c, symbol)
+    let signature = type_at(c, item.type_id).parts
+    let result = signature:get(signature:len() - 1)
+    let context = CheckContext { function: symbol, result: result, loops: 0 }
+    let node = syntax(c, id)
+    let saved = c.active [0]
+    restore_scope(c, buffer(0))
+    let mut params = buffer(0)
+    let mut offset = 0
+    for index in 0 .. node.children:len()
+        let child_id = node.children:get(index)
+        let param = syntax(c, child_id)
+        if param.tag == ParameterNode()
+            let binding = bind_local(c, param.text, signature:get(offset), symbol, false, child_id, "parameter")
+            params = params:push(emit(c, ParameterIR(), signature:get(offset), binding, offset, "", child_id, buffer(0)))
+            offset = offset + 1
+    let body_id = node.children:get(node.children:len() - 1)
+    let hint = if result == 0
+        -1
+    else
+        result
+    let body = check_node(c, context, body_id, hint)
+    if result != 0
+        require_type(c, result_type(c, body), result, body_id, "function result type mismatch")
+    restore_scope(c, saved)
+    let value = emit(c, FunctionIR(), item.type_id, symbol, -1, "", id, params:push(body))
+    let mut functions = c.functions
+    functions [0] = functions [0]:push(value)
+
+fn seed_types(c: Checker) -> void
+    intern(c, VoidType(), "void", -1, buffer(0))
+    intern(c, BoolType(), "bool", -1, buffer(0))
+    intern(c, IntegerType(), "i64", -1, buffer(0))
+    intern(c, FloatType(), "f64", -1, buffer(0))
+    intern(c, StringType(), "string", -1, buffer(0))
+    intern(c, BottomType(), "<never>", -1, buffer(0))
+    intern(c, ErrorType(), "<error>", -1, buffer(0))
+    let integers = ["i8", "i16", "i32", "u8", "u16", "u32", "u64", "isize", "usize"]
+    for index in 0 .. nerv.arrays.len(integers)
+        intern(c, IntegerType(), integers [index], -1, buffer(0))
+    intern(c, FloatType(), "f32", -1, buffer(0))
+
+fn check_graph(graph: SourceGraph) -> Result<CheckedProgram, SemanticError>
+    let tree = graph.tree
+    let c = Checker { tree: tree, types: [buffer(empty_type())], symbols: [buffer(empty_symbol())], code: [buffer(empty_ir())], active: [buffer(0)], declarations: [-1] * tree.nodes:len(), errors: [buffer(SemanticError { source: 0, start: 0, end: 0, message: "" })], captures: [buffer(Capture { function: - 1, target: - 1, symbol: - 1, slot: - 1 })], functions: [buffer(0)], modules: graph.modules, node_sources: graph.node_sources, current: [0], templates: [buffer(GenericTemplate { name: "", module_id: 0, syntax: - 1, generics:buffer(0) })], instances: [buffer(Specialization { template: - 1, arguments:buffer(0), symbol: - 1 })], type_env: [buffer(TypeBinding { name: "", type_id: - 1 })], nominal_templates: [buffer(GenericTemplate { name: "", module_id: 0, syntax: - 1, generics:buffer(0) })], nominal_instances: [buffer(Specialization { template: - 1, arguments:buffer(0), symbol: - 1 })], nominal_depth: [0], traits: [buffer(GenericTemplate { name: "", module_id: 0, syntax: - 1, generics:buffer(0) })], implementations: [buffer(TraitImplementation { owner: - 1, trait_id: - 1, syntax: - 1 })] }
+    seed_types(c)
+    let root = syntax(c, tree.root)
+    for index in 0 .. root.children:len()
+        let id = root.children:get(index)
+        if syntax(c, id).tag == TraitNode()
+            register_trait(c, id)
+    for index in 0 .. root.children:len()
+        let id = root.children:get(index)
+        let node = syntax(c, id)
+        if node.tag == StructNode() or node.tag == EnumNode()
+            register_nominal(c, id)
+        if node.tag == ImportNode()
+            reject(c, id, "module loading is not implemented yet")
+
+    for index in 0 .. root.children:len()
+        let id = root.children:get(index)
+        if not broken(c) and syntax(c, id).tag == ImplNode()
+            register_impl_claim(c, id)
+    for index in 0 .. root.children:len()
+        if not broken(c)
+            let id = root.children:get(index)
+            let node = syntax(c, id)
+            if (node.tag == StructNode() or node.tag == EnumNode()) and not has_generics(c, node)
+                register_members(c, id)
+    for index in 0 .. root.children:len()
+        if not broken(c)
+            let id = root.children:get(index)
+            let node = syntax(c, id)
+            if node.tag == ImplNode()
+                register_impl_methods(c, id)
+            if node.tag == FunctionNode()
+                register_function(c, id, -1)
+    validate_trait_claims(c)
+    let count = c.symbols [0]:len()
+    for index in 0 .. count
+        if not broken(c)
+            let item = symbol_at(c, index)
+            if (item.category == "struct" or item.category == "enum") and recursive_layout(c, index, buffer(0))
+                reject(c, item.syntax, "infinitely sized recursive nominal type")
+
+    let mut index = 0
+    while index < c.symbols [0]:len() and not broken(c)
+        if symbol_at(c, index).category == "function"
+            check_function_symbol(c, index)
+        index = index + 1
+    for offset in 0 .. c.symbols [0]:len()
+        if not broken(c)
+            let item = symbol_at(c, offset)
+            if (item.category == "struct" or item.category == "enum") and recursive_layout(c, offset, buffer(0))
+                reject(c, item.syntax, "infinitely sized recursive nominal type")
+    validate_trait_claims(c)
+    if broken(c)
+        return Err(c.errors [0]:get(0))
+    let mut main = raw_global(c, "main", -1, 0)
+    if main >= 0
+        if symbol_at(c, main).category != "function"
+            main = -1
+    let mut paths = buffer("")
+    for index in 0 .. c.modules:len()
+        paths = paths:push(c.modules:get(index).path)
+    Ok(CheckedProgram { types: c.types [0], symbols: c.symbols [0], nodes: c.code [0], functions: c.functions [0], main: main, captures: c.captures [0], source_paths: paths })
+
+fn register_nominal(c: Checker, id: i64) -> void
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(id)
+    register_nominal_inner(c, id)
+    current [0] = saved
+
+fn register_function(c: Checker, id: i64, owner: i64) -> void
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(id)
+    register_function_inner(c, id, owner)
+    current [0] = saved
+
+fn register_members(c: Checker, id: i64) -> void
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(id)
+    register_members_inner(c, id, c.declarations [id])
+    current [0] = saved
+
+fn check(tree: Ast) -> Result<CheckedProgram, SemanticError>
+    let mut origins = buffer(0)
+    for index in 0 .. tree.nodes:len()
+        origins = origins:push(0)
+    let modules = buffer(SourceModule { path: "<input>", text: "", name: "", imports:buffer(ImportEdge { alias: "", target: - 1 }) }):push(SourceModule { path: "<input>", text: "", name: "", imports:buffer(ImportEdge { alias: "", target: - 1 }) })
+    check_graph(SourceGraph { tree: tree, node_sources: origins, modules: modules })
+
+fn global(c: Checker, name: string, owner: i64) -> i64
+    raw_global(c, name, owner, c.current [0])
+
+fn resolve_type(c: Checker, node: i64) -> i64
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(node)
+    let result = resolve_type_inner(c, node)
+    current [0] = saved
+    result
+
+fn check_node(c: Checker, context: CheckContext, id: i64, expected: i64) -> i64
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(id)
+    let result = check_node_inner(c, context, id, expected)
+    current [0] = saved
+    result
+
+fn reachable(c: Checker, from: i64, target: i64, visited: Buffer<i64>) -> bool
+    if from == target
+        return true
+    for index in 0 .. visited:len()
+        if visited:get(index) == from
+            return false
+    let chain = visited:push(from)
+    let unit = c.modules:get(from)
+    for index in 0 .. unit.imports:len()
+        if reachable(c, unit.imports:get(index).target, target, chain)
+            return true
+    false
+
+fn qualified_visible(c: Checker, from: i64, name: string) -> i64
+    let unit = c.modules:get(from)
+    let mut result = -1
+    let own_prefix = nerv.string.concat(unit.name, ".")
+    if unit.name != "" and nerv.string.starts_with(name, own_prefix) == 1
+        let local_name = nerv.string.slice(name, nerv.string.len(own_prefix), nerv.string.len(name))
+        result = raw_global(c, local_name, -1, from)
+    for index in 0 .. unit.imports:len()
+        let edge = unit.imports:get(index)
+        let declared_name = c.modules:get(edge.target).name
+        let aliases = [edge.alias, declared_name]
+        for offset in 0 .. nerv.arrays.len(aliases)
+            let prefix = nerv.string.concat(aliases [offset], ".")
+            if aliases [offset] != "" and nerv.string.starts_with(name, prefix) == 1
+                let local_name = nerv.string.slice(name, nerv.string.len(prefix), nerv.string.len(name))
+                let found = raw_global(c, local_name, -1, edge.target)
+                if found >= 0
+                    if result >= 0 and found != result
+                        return -2
+                    result = found
+    result
+
+fn visible(c: Checker, name: string) -> i64
+    let local = raw_global(c, name, -1, c.current [0])
+    if local != - 1
+        return local
+    let qualified = qualified_visible(c, c.current [0], name)
+    if qualified != - 1
+        return qualified
+    let mut found = -1
+    for index in 0 .. c.modules:len()
+        if index != c.current [0] and reachable(c, c.current [0], index, buffer(0))
+            let candidate = raw_global(c, name, -1, index)
+            if candidate >= 0
+                if found >= 0 and candidate != found
+                    return -2
+                found = candidate
+    found
+
+fn named_type(c: Checker, name: string) -> i64
+    let primitive = primitive_type(c, name)
+    if primitive >= 0
+        return primitive
+    let symbol = visible(c, name)
+    if symbol >= 0
+        let item = symbol_at(c, symbol)
+        if item.category == "struct" or item.category == "enum"
+            return item.type_id
+    return -1
+
+fn bound_type(c: Checker, name: string) -> i64
+    let mut index = c.type_env [0]:len() - 1
+    while index >= 0
+        let item = c.type_env [0]:get(index)
+        if item.name == name
+            return item.type_id
+        index = index - 1
+    return -1
+
+fn raw_template_in(entries: Buffer<GenericTemplate>, name: string, module_id: i64) -> i64
+    for index in 0 .. entries:len()
+        let item = entries:get(index)
+        if item.name == name and item.module_id == module_id
+            return index
+    return -1
+
+fn raw_template(c: Checker, name: string, module_id: i64) -> i64
+    raw_template_in(c.templates [0], name, module_id)
+
+fn register_template(c: Checker, id: i64) -> void
+    let node = syntax(c, id)
+    if node.text == "main" and c.current [0] == 0
+        reject(c, id, "main cannot have generic parameters")
+        return
+    if raw_template(c, node.text, c.current [0]) >= 0 or global(c, node.text, -1) >= 0
+        reject(c, id, "duplicate generic function")
+        return
+    let mut generics = buffer(0)
+    for index in 0 .. node.children:len()
+        let member = syntax(c, node.children:get(index))
+        if member.tag == GenericsNode()
+            generics = member.children
+    let mut templates = c.templates
+    templates [0] = templates [0]:push(GenericTemplate { name: node.text, module_id: c.current [0], syntax: id, generics: generics })
+
+fn find_template_in(c: Checker, entries: Buffer<GenericTemplate>, name: string) -> i64
+    let local = raw_template_in(entries, name, c.current [0])
+    if local >= 0
+        return local
+    let unit = c.modules:get(c.current [0])
+    let own_prefix = nerv.string.concat(unit.name, ".")
+    if unit.name != "" and nerv.string.starts_with(name, own_prefix) == 1
+        let own_name = nerv.string.slice(name, nerv.string.len(own_prefix), nerv.string.len(name))
+        let own = raw_template_in(entries, own_name, c.current [0])
+        if own >= 0
+            return own
+    let mut found = -1
+    for index in 0 .. unit.imports:len()
+        let edge = unit.imports:get(index)
+        let aliases = [edge.alias, c.modules:get(edge.target).name]
+        for offset in 0 .. nerv.arrays.len(aliases)
+            let prefix = nerv.string.concat(aliases [offset], ".")
+            if aliases [offset] != "" and nerv.string.starts_with(name, prefix) == 1
+                let local_name = nerv.string.slice(name, nerv.string.len(prefix), nerv.string.len(name))
+                let candidate = raw_template_in(entries, local_name, edge.target)
+                if candidate >= 0
+                    if found >= 0 and candidate != found
+                        return -2
+                    found = candidate
+    if found >= 0
+        return found
+    for index in 0 .. entries:len()
+        let item = entries:get(index)
+        if item.name == name and reachable(c, c.current [0], item.module_id, buffer(0))
+            if found >= 0 and found != index
+                return -2
+            found = index
+    found
+
+fn find_template(c: Checker, name: string) -> i64
+    find_template_in(c, c.templates [0], name)
+
+fn find_nominal_template(c: Checker, name: string) -> i64
+    find_template_in(c, c.nominal_templates [0], name)
+
+fn generic_index(c: Checker, template: GenericTemplate, name: string) -> i64
+    for index in 0 .. template.generics:len()
+        if syntax(c, template.generics:get(index)).text == name
+            return index
+    return -1
+
+fn infer_type(c: Checker, template: GenericTemplate, pattern_id: i64, actual: i64, arguments: []i64) -> void
+    if broken(c) or actual == 6 or actual == 5
+        return
+    let pattern = syntax(c, pattern_id)
+    if pattern.tag == TypeNameNode()
+        let variable = generic_index(c, template, pattern.text)
+        if variable >= 0
+            let mut values = arguments
+            if values [variable] < 0
+                values [variable] = actual
+            else
+                require_type(c, actual, values [variable], pattern_id, "conflicting generic arguments")
+            return
+        let saved = c.type_env [0]
+        let mut env = c.type_env
+        env [0] = buffer(TypeBinding { name: "", type_id: - 1 })
+        let expected = resolve_type(c, pattern_id)
+        env [0] = saved
+        require_type(c, actual, expected, pattern_id, "generic argument type mismatch")
+        return
+    let concrete = type_at(c, actual)
+    if pattern.tag == ArrayTypeNode() and concrete.tag == ArrayType()
+        infer_type(c, template, pattern.children:get(0), concrete.parts:get(0), arguments)
+        return
+    if pattern.tag == FunctionTypeNode() and concrete.tag == FunctionType()
+        if pattern.children:len() != concrete.parts:len()
+            reject(c, pattern_id, "generic function type arity mismatch")
+            return
+        for index in 0 .. pattern.children:len()
+            infer_type(c, template, pattern.children:get(index), concrete.parts:get(index), arguments)
+        return
+    if pattern.tag == AppliedTypeNode() and concrete.tag == NominalType()
+        let instance_id = nominal_instance(c, concrete.nominal)
+        let expected_template = nominal_pattern(c, pattern_id)
+        if instance_id >= 0 and expected_template >= 0
+            let instance = c.nominal_instances [0]:get(instance_id)
+            if instance.template == expected_template and instance.arguments:len() == pattern.children:len()
+                for index in 0 .. pattern.children:len()
+                    infer_type(c, template, pattern.children:get(index), instance.arguments:get(index), arguments)
+                return
+    reject(c, pattern_id, "generic inference requires compatible concrete types")
+
+fn template_env(c: Checker, template: GenericTemplate, arguments: Buffer<i64>) -> Buffer<TypeBinding>
+    let mut env = buffer(TypeBinding { name: "", type_id: - 1 })
+    for index in 0 .. arguments:len()
+        let parameter_id = template.generics:get(index)
+        let parameter = syntax(c, parameter_id)
+        if parameter.children:len() > 0
+            let constraint = parameter.children:get(0)
+            let trait_id = trait_for_node(c, constraint)
+            if trait_id < 0
+                reject(c, constraint, "unknown or ambiguous trait constraint")
+            else
+                if not satisfies_trait(c, arguments:get(index), trait_id)
+                    reject(c, parameter_id, "type does not implement required trait")
+        env = env:push(TypeBinding { name: parameter.text, type_id: arguments:get(index) })
+    env
+
+fn instantiate_function(c: Checker, template_id: i64, arguments: Buffer<i64>) -> i64
+    for index in 0 .. c.instances [0]:len()
+        let instance = c.instances [0]:get(index)
+        if instance.template == template_id and same_parts(instance.arguments, arguments)
+            return instance.symbol
+    let template = c.templates [0]:get(template_id)
+    if c.instances [0]:len() + c.nominal_instances [0]:len() >= 256
+        reject(c, template.syntax, "generic specialization limit exceeded")
+        return -1
+    let saved_env = c.type_env [0]
+    let mut env = c.type_env
+    env [0] = template_env(c, template, arguments)
+    let node = syntax(c, template.syntax)
+    let mut parts = buffer(0)
+    let mut result = 0
+    let mut names = set()
+    for index in 0 .. node.children:len()
+        let child_id = node.children:get(index)
+        let item = syntax(c, child_id)
+        if item.tag == ParameterNode()
+            if names:contains(item.text)
+                reject(c, child_id, "duplicate parameter")
+            names = names:insert(item.text)
+            let ty = resolve_type(c, item.children:get(0))
+            if ty == 0
+                reject(c, child_id, "parameter cannot be void")
+            parts = parts:push(ty)
+        if item.tag == TypeNameNode() or item.tag == ArrayTypeNode() or item.tag == FunctionTypeNode() or item.tag == AppliedTypeNode()
+            result = resolve_type(c, child_id)
+    env [0] = saved_env
+    let signature = intern(c, FunctionType(), "", -1, parts:push(result))
+    let name = nerv.string.concat(template.name, nerv.string.concat("$", integer_text(c.instances [0]:len())))
+    let symbol = add_symbol(c, name, "function", signature, -1, -1, false, template.syntax)
+    let mut instances = c.instances
+    instances [0] = instances [0]:push(Specialization { template: template_id, arguments: arguments, symbol: symbol })
+    symbol
+
+fn generic_call(c: Checker, context: CheckContext, id: i64, template_id: i64, expected: i64) -> i64
+    let template = c.templates [0]:get(template_id)
+    let node = syntax(c, template.syntax)
+    let call = syntax(c, id)
+    let mut parameters = buffer(0)
+    let mut result_pattern = -1
+    for index in 0 .. node.children:len()
+        let child_id = node.children:get(index)
+        let item = syntax(c, child_id)
+        if item.tag == ParameterNode()
+            parameters = parameters:push(item.children:get(0))
+        if item.tag == TypeNameNode() or item.tag == ArrayTypeNode() or item.tag == FunctionTypeNode() or item.tag == AppliedTypeNode()
+            result_pattern = child_id
+    if parameters:len() != call.children:len() - 1
+        reject(c, id, "wrong generic argument count")
+        return -1
+    let inferred = [-1] * template.generics:len()
+    if expected >= 0 and expected != 6 and result_pattern >= 0
+        infer_type(c, template, result_pattern, expected, inferred)
+    let mut values = buffer(0)
+    for index in 0 .. parameters:len()
+        let value_id = call.children:get(index + 1)
+        let hint = inference_hint(c, template, parameters:get(index), inferred)
+        let value = check_node(c, context, value_id, hint)
+        infer_type(c, template, parameters:get(index), result_type(c, value), inferred)
+        values = values:push(value)
+    let mut arguments = buffer(0)
+    for index in 0 .. nerv.arrays.len(inferred)
+        if inferred [index] < 0
+            reject(c, id, "cannot infer generic argument")
+        arguments = arguments:push(inferred [index])
+    if broken(c)
+        return -1
+    let symbol = instantiate_function(c, template_id, arguments)
+    if broken(c)
+        return -1
+    let ty = symbol_at(c, symbol).type_id
+    emit(c, CallIR(), function_result(c, ty), symbol, -1, "", id, values)
+
+fn check_function_symbol(c: Checker, symbol: i64) -> void
+    let item = symbol_at(c, symbol)
+    let saved_module = c.current [0]
+    let saved_env = c.type_env [0]
+    let mut current = c.current
+    let mut env = c.type_env
+    current [0] = item.module_id
+    env [0] = buffer(TypeBinding { name: "", type_id: - 1 })
+    let owner_instance = nominal_instance(c, item.owner)
+    if owner_instance >= 0
+        let instance = c.nominal_instances [0]:get(owner_instance)
+        let template = c.nominal_templates [0]:get(instance.template)
+        env [0] = template_env(c, template, instance.arguments):push(TypeBinding { name: template.name, type_id:symbol_at(c, item.owner).type_id })
+    for index in 0 .. c.instances [0]:len()
+        let instance = c.instances [0]:get(index)
+        if instance.symbol == symbol
+            env [0] = template_env(c, c.templates [0]:get(instance.template), instance.arguments)
+    check_function_inner(c, item.syntax, symbol)
+    current [0] = saved_module
+    env [0] = saved_env
+
+fn inference_hint(c: Checker, template: GenericTemplate, pattern_id: i64, arguments: []i64) -> i64
+    let pattern = syntax(c, pattern_id)
+    if pattern.tag == TypeNameNode()
+        let variable = generic_index(c, template, pattern.text)
+        if variable >= 0
+            return arguments [variable]
+        let saved = c.type_env [0]
+        let mut env = c.type_env
+        env [0] = buffer(TypeBinding { name: "", type_id: - 1 })
+        let ty = resolve_type(c, pattern_id)
+        env [0] = saved
+        return ty
+    if pattern.tag == ArrayTypeNode()
+        let element = inference_hint(c, template, pattern.children:get(0), arguments)
+        if element < 0
+            return -1
+        return intern(c, ArrayType(), "", -1, one(element))
+    if pattern.tag == FunctionTypeNode()
+        let mut parts = buffer(0)
+        for index in 0 .. pattern.children:len()
+            let ty = inference_hint(c, template, pattern.children:get(index), arguments)
+            if ty < 0
+                return -1
+            parts = parts:push(ty)
+        return intern(c, FunctionType(), "", -1, parts)
+    if pattern.tag == AppliedTypeNode()
+        let nominal = nominal_pattern(c, pattern_id)
+        if nominal < 0
+            return -1
+        let mut parts = buffer(0)
+        for index in 0 .. pattern.children:len()
+            let ty = inference_hint(c, template, pattern.children:get(index), arguments)
+            if ty < 0
+                return -1
+            parts = parts:push(ty)
+        return instantiate_nominal(c, nominal, parts)
+    return -1
+
+fn register_nominal_template(c: Checker, id: i64) -> void
+    let node = syntax(c, id)
+    if primitive_type(c, node.text) >= 0 or global(c, node.text, -1) >= 0 or raw_template_in(c.nominal_templates [0], node.text, c.current [0]) >= 0
+        reject(c, id, "duplicate generic type")
+        return
+    let mut generics = buffer(0)
+    for index in 0 .. node.children:len()
+        let item = syntax(c, node.children:get(index))
+        if item.tag == GenericsNode()
+            generics = item.children
+    let mut templates = c.nominal_templates
+    templates [0] = templates [0]:push(GenericTemplate { name: node.text, module_id: c.current [0], syntax: id, generics: generics })
+
+fn nominal_pattern(c: Checker, id: i64) -> i64
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(id)
+    let template = find_nominal_template(c, syntax(c, id).text)
+    current [0] = saved
+    template
+
+fn nominal_instance(c: Checker, symbol: i64) -> i64
+    for index in 0 .. c.nominal_instances [0]:len()
+        if c.nominal_instances [0]:get(index).symbol == symbol
+            return index
+    return -1
+
+fn instantiate_nominal(c: Checker, template_id: i64, arguments: Buffer<i64>) -> i64
+    if broken(c)
+        return 6
+    let template = c.nominal_templates [0]:get(template_id)
+    if arguments:len() != template.generics:len()
+        reject(c, template.syntax, "wrong generic type argument count")
+        return 6
+    for index in 0 .. c.nominal_instances [0]:len()
+        let instance = c.nominal_instances [0]:get(index)
+        if instance.template == template_id and same_parts(instance.arguments, arguments)
+            return symbol_at(c, instance.symbol).type_id
+    if c.nominal_instances [0]:len() + c.instances [0]:len() >= 256
+        reject(c, template.syntax, "generic specialization limit exceeded")
+        return 6
+    if c.nominal_depth [0] >= 64
+        reject(c, template.syntax, "generic type nesting limit exceeded")
+        return 6
+    let node = syntax(c, template.syntax)
+    let category = if node.tag == StructNode()
+        "struct"
+    else
+        "enum"
+    let name = nerv.string.concat(template.name, nerv.string.concat("$type", integer_text(c.nominal_instances [0]:len())))
+    let symbol = add_symbol(c, name, category, 6, -1, -1, false, template.syntax)
+    let ty = intern(c, NominalType(), name, symbol, arguments)
+    replace_symbol_type(c, symbol, ty)
+    let mut instances = c.nominal_instances
+    instances [0] = instances [0]:push(Specialization { template: template_id, arguments: arguments, symbol: symbol })
+    let saved_env = c.type_env [0]
+    let saved_module = c.current [0]
+    let mut env = c.type_env
+    let mut current = c.current
+    let mut depth = c.nominal_depth
+    env [0] = template_env(c, template, arguments):push(TypeBinding { name: template.name, type_id: ty })
+    current [0] = template.module_id
+    depth [0] = depth [0] + 1
+    register_members_inner(c, template.syntax, symbol)
+    depth [0] = depth [0] - 1
+    env [0] = saved_env
+    current [0] = saved_module
+    ty
+
+fn instance_arguments(c: Checker, template_id: i64, expected: i64) -> []i64
+    let template = c.nominal_templates [0]:get(template_id)
+    let mut arguments = [-1] * template.generics:len()
+    if expected >= 0
+        let ty = type_at(c, expected)
+        if ty.tag == NominalType()
+            let index = nominal_instance(c, ty.nominal)
+            if index >= 0
+                let instance = c.nominal_instances [0]:get(index)
+                if instance.template == template_id
+                    for offset in 0 .. instance.arguments:len()
+                        arguments [offset] = instance.arguments:get(offset)
+    arguments
+
+fn concrete_arguments(c: Checker, arguments: []i64, id: i64) -> Buffer<i64>
+    let mut result = buffer(0)
+    for index in 0 .. nerv.arrays.len(arguments)
+        if arguments [index] < 0
+            reject(c, id, "cannot infer generic type argument")
+        result = result:push(arguments [index])
+    result
+
+fn field_pattern(c: Checker, template: GenericTemplate, name: string) -> i64
+    let node = syntax(c, template.syntax)
+    for index in 0 .. node.children:len()
+        let id = node.children:get(index)
+        let item = syntax(c, id)
+        if item.tag == FieldNode() and item.text == name
+            return id
+    return -1
+
+fn construct_generic(c: Checker, context: CheckContext, id: i64, template_id: i64, expected: i64) -> i64
+    let template = c.nominal_templates [0]:get(template_id)
+    let declaration = syntax(c, template.syntax)
+    let node = syntax(c, id)
+    if declaration.tag != StructNode()
+        reject(c, id, "construction requires a struct type")
+        return -1
+    let arguments = instance_arguments(c, template_id, expected)
+    let mut seen = set()
+    let mut values = buffer(0)
+    let mut count = 0
+    for index in 0 .. declaration.children:len()
+        if syntax(c, declaration.children:get(index)).tag == FieldNode()
+            count = count + 1
+    if node.children:len() != count
+        reject(c, id, "wrong generic struct field count")
+    for index in 0 .. node.children:len()
+        let field_id = node.children:get(index)
+        let field = syntax(c, field_id)
+        let pattern_id = field_pattern(c, template, field.text)
+        if pattern_id < 0 or seen:contains(field.text)
+            reject(c, field_id, "unknown or duplicate initializer field")
+            return -1
+        seen = seen:insert(field.text)
+        let type_id = syntax(c, pattern_id).children:get(0)
+        let hint = inference_hint(c, template, type_id, arguments)
+        let value = check_node(c, context, field.children:get(0), hint)
+        infer_type(c, template, type_id, result_type(c, value), arguments)
+        values = values:push(value)
+    let args = concrete_arguments(c, arguments, id)
+    let ty = instantiate_nominal(c, template_id, args)
+    if broken(c)
+        return -1
+    let owner = type_at(c, ty).nominal
+    let mut fields = buffer(0)
+    for index in 0 .. node.children:len()
+        let field_id = node.children:get(index)
+        let field = syntax(c, field_id)
+        let symbol = global(c, field.text, owner)
+        let item = symbol_at(c, symbol)
+        let value = values:get(index)
+        require_type(c, result_type(c, value), item.type_id, field_id, "initializer type mismatch")
+        fields = fields:push(emit(c, FieldIR(), item.type_id, symbol, item.slot, "", field_id, one(value)))
+    emit(c, StructIR(), ty, owner, -1, "", id, fields)
+
+struct GenericVariant
+    template: i64
+    syntax: i64
+
+fn variant_pattern(c: Checker, template_id: i64, name: string) -> i64
+    let template = c.nominal_templates [0]:get(template_id)
+    let node = syntax(c, template.syntax)
+    if node.tag != EnumNode()
+        return -1
+    for index in 0 .. node.children:len()
+        let id = node.children:get(index)
+        let member = syntax(c, id)
+        if member.tag == VariantNode() and member.text == name
+            return id
+    return -1
+
+fn find_generic_variant(c: Checker, name: string, expected: i64) -> GenericVariant
+    let parts = split_text(name, ".")
+    let short_name = parts [nerv.arrays.len(parts) - 1]
+    if nerv.arrays.len(parts) >= 2
+        let mut prefix = [""] * (nerv.arrays.len(parts) - 1)
+        for index in 0 .. nerv.arrays.len(prefix)
+            prefix [index] = parts [index]
+        let template = find_nominal_template(c, join_text(prefix, "."))
+        if template >= 0
+            return GenericVariant { template: template, syntax:variant_pattern(c, template, short_name) }
+        return GenericVariant { template: - 1, syntax: - 1 }
+    if expected >= 0 and type_at(c, expected).tag == NominalType()
+        let instance = nominal_instance(c, type_at(c, expected).nominal)
+        if instance >= 0
+            let template = c.nominal_instances [0]:get(instance).template
+            let variant = variant_pattern(c, template, short_name)
+            if variant >= 0
+                return GenericVariant { template: template, syntax: variant }
+    let mut found = GenericVariant { template: - 1, syntax: - 1 }
+    for index in 0 .. c.nominal_templates [0]:len()
+        let template = c.nominal_templates [0]:get(index)
+        let variant = variant_pattern(c, index, short_name)
+        if variant >= 0 and reachable(c, c.current [0], template.module_id, buffer(0))
+            if found.template >= 0
+                let previous = c.nominal_templates [0]:get(found.template)
+                if previous.module_id == c.current [0] and template.module_id != c.current [0]
+                    continue
+                if previous.module_id == template.module_id or template.module_id != c.current [0]
+                    return GenericVariant { template: - 2, syntax: - 1 }
+            found = GenericVariant { template: index, syntax: variant }
+    found
+
+fn construct_variant(c: Checker, context: CheckContext, id: i64, choice: GenericVariant, expected: i64) -> i64
+    let template = c.nominal_templates [0]:get(choice.template)
+    let variant = syntax(c, choice.syntax)
+    let call = syntax(c, id)
+    if call.children:len() - 1 != variant.children:len()
+        reject(c, id, "wrong generic variant argument count")
+        return -1
+    let arguments = instance_arguments(c, choice.template, expected)
+    let mut values = buffer(0)
+    for index in 0 .. variant.children:len()
+        let pattern_id = variant.children:get(index)
+        let hint = inference_hint(c, template, pattern_id, arguments)
+        let value = check_node(c, context, call.children:get(index + 1), hint)
+        infer_type(c, template, pattern_id, result_type(c, value), arguments)
+        values = values:push(value)
+    let args = concrete_arguments(c, arguments, id)
+    let ty = instantiate_nominal(c, choice.template, args)
+    if broken(c)
+        return -1
+    let owner = type_at(c, ty).nominal
+    let symbol = global(c, variant.text, owner)
+    let item = symbol_at(c, symbol)
+    let signature = type_at(c, item.type_id).parts
+    for index in 0 .. values:len()
+        require_type(c, result_type(c, values:get(index)), signature:get(index), id, "variant payload type mismatch")
+    emit(c, EnumIR(), ty, symbol, item.slot, "", id, values)
+
+fn check_propagation(c: Checker, context: CheckContext, id: i64) -> i64
+    let node = syntax(c, id)
+    let value = check_node(c, context, node.children:get(0), -1)
+    let source_type = type_at(c, result_type(c, value))
+    let target_type = type_at(c, context.result)
+    if source_type.tag != NominalType() or target_type.tag != NominalType()
+        reject(c, id, "propagation requires Result or Option")
+        return -1
+    let source_instance = nominal_instance(c, source_type.nominal)
+    let target_instance = nominal_instance(c, target_type.nominal)
+    if source_instance < 0 or target_instance < 0
+        reject(c, id, "propagation requires specialized Result or Option")
+        return -1
+    let source_info = c.nominal_instances [0]:get(source_instance)
+    let target_info = c.nominal_instances [0]:get(target_instance)
+    let template = c.nominal_templates [0]:get(source_info.template)
+    if source_info.template != target_info.template or (template.name != "Result" and template.name != "Option")
+        reject(c, id, "incompatible propagation container")
+        return -1
+    let is_result = template.name == "Result"
+    let success_name = if is_result
+        "Ok"
+    else
+        "Some"
+    let failure_name = if is_result
+        "Err"
+    else
+        "None"
+    let arity = if is_result
+        2
+    else
+        1
+    if source_info.arguments:len() != arity
+        reject(c, id, "invalid propagation container parameters")
+        return -1
+    let success = global(c, success_name, source_type.nominal)
+    let failure = global(c, failure_name, source_type.nominal)
+    let target = global(c, failure_name, target_type.nominal)
+    if success < 0 or failure < 0 or target < 0
+        reject(c, id, "invalid propagation container variants")
+        return -1
+    let success_parts = type_at(c, symbol_at(c, success).type_id).parts
+    let failure_parts = type_at(c, symbol_at(c, failure).type_id).parts
+    let target_parts = type_at(c, symbol_at(c, target).type_id).parts
+    if success_parts:len() != 2 or failure_parts:len() != arity
+        reject(c, id, "invalid propagation payload layout")
+        return -1
+    if failure_parts:len() != target_parts:len()
+        reject(c, id, "propagation failure payload mismatch")
+        return -1
+    for index in 0 .. failure_parts:len() - 1
+        require_type(c, failure_parts:get(index), target_parts:get(index), id, "propagation error type mismatch")
+    emit(c, TryIR(), success_parts:get(0), target, symbol_at(c, failure).slot, "", id, one(value))
+
+fn match_variant(c: Checker, name: string, owner: i64) -> i64
+    let resolved = qualified_symbol(c, name)
+    if resolved >= 0
+        return resolved
+    let parts = split_text(name, ".")
+    if nerv.arrays.len(parts) >= 2
+        let mut prefix = [""] * (nerv.arrays.len(parts) - 1)
+        for index in 0 .. nerv.arrays.len(prefix)
+            prefix [index] = parts [index]
+        let template = find_nominal_template(c, join_text(prefix, "."))
+        let instance_id = nominal_instance(c, owner)
+        if template >= 0 and instance_id >= 0
+            if c.nominal_instances [0]:get(instance_id).template == template
+                return global(c, parts [nerv.arrays.len(parts) - 1], owner)
+    return -1
+
+fn runtime_type_code(c: Checker, code: string) -> i64
+    if code == "v"
+        return 0
+    if code == "b"
+        return 1
+    if code == "i"
+        return 2
+    if code == "f"
+        return 3
+    if code == "s"
+        return 4
+    if code == "a"
+        return intern(c, ArrayType(), "", -1, one(2))
+    if code == "S"
+        return intern(c, ArrayType(), "", -1, one(4))
+    if code == "B"
+        return intern(c, ArrayType(), "", -1, one(named_type(c, "u8")))
+    if code == "C"
+        return intern(c, FunctionType(), "", -1, two(2, 2))
+    if code == "D"
+        return intern(c, FunctionType(), "", -1, two(2, 2):push(2))
+    if code == "W"
+        let bytes = runtime_type_code(c, "B")
+        let strings = runtime_type_code(c, "S")
+        return intern(c, FunctionType(), "", -1, two(2, 4):push(4):push(bytes):push(4):push(strings))
+    return 6
+
+fn promote_print(c: Checker, id: i64, value: i64) -> i64
+    let actual = result_type(c, value)
+    let ty = type_at(c, actual)
+    let mut target = actual
+    if ty.tag == IntegerType()
+        target = if nerv.string.starts_with(ty.name, "u") == 1
+            named_type(c, "u64")
+        else
+            2
+    if ty.tag == FloatType()
+        target = 3
+    if target == actual
+        return value
+    let signature = intern(c, FunctionType(), "", -1, two(actual, target))
+    let symbol = add_symbol(c, type_at(c, target).name, "cast", signature, -1, -1, false, id)
+    emit(c, CastIR(), target, symbol, -1, "", id, one(value))
+
+fn builtin_abi(c: Checker, name: string, args: Buffer<i64>) -> string
+    if name == "assert"
+        return "assert"
+    if name == "nerv.math.abs"
+        return if args:get(0) == 2
+            "nerv_abs_i64"
+        else
+            "nerv_abs_f64"
+    if name == "print" or name == "println"
+        let ty = type_at(c, args:get(0))
+        let mut suffix = "i64"
+        if ty.tag == IntegerType() and nerv.string.starts_with(ty.name, "u") == 1
+            suffix = "u64"
+        if ty.tag == FloatType()
+            suffix = "f64"
+        if ty.tag == BoolType()
+            suffix = "bool"
+        if ty.tag == StringType()
+            suffix = "string"
+        return nerv.string.concat("nerv_", nerv.string.concat(name, nerv.string.concat("_", suffix)))
+    runtime.abi_name(name)
+
+fn register_trait(c: Checker, id: i64) -> void
+    let node = syntax(c, id)
+    let origin = c.node_sources:get(id)
+    if raw_template_in(c.traits [0], node.text, origin) >= 0
+        reject(c, id, "duplicate trait")
+        return
+    let mut names = set()
+    for index in 0 .. node.children:len()
+        let method = syntax(c, node.children:get(index))
+        if names:contains(method.text)
+            reject(c, id, "duplicate trait method")
+        names = names:insert(method.text)
+    let mut traits = c.traits
+    traits [0] = traits [0]:push(GenericTemplate { name: node.text, module_id: origin, syntax: id, generics:buffer(0) })
+
+fn trait_for_node(c: Checker, id: i64) -> i64
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(id)
+    let found = find_template_in(c, c.traits [0], syntax(c, id).text)
+    current [0] = saved
+    found
+
+fn register_trait_claim(c: Checker, owner: i64, trait_id: i64, id: i64) -> void
+    if trait_id < 0
+        reject(c, id, "unknown or ambiguous trait")
+        return
+    for index in 0 .. c.implementations [0]:len()
+        let item = c.implementations [0]:get(index)
+        if item.owner == owner and item.trait_id == trait_id
+            reject(c, id, "duplicate trait implementation")
+            return
+    let mut implementations = c.implementations
+    implementations [0] = implementations [0]:push(TraitImplementation { owner: owner, trait_id: trait_id, syntax: id })
+
+fn register_impl_claim(c: Checker, id: i64) -> void
+    let node = syntax(c, id)
+    let saved = c.current [0]
+    let mut current = c.current
+    current [0] = c.node_sources:get(id)
+    let ty = named_type(c, node.text)
+    if ty < 0
+        reject(c, id, "unknown implementation type")
+        current [0] = saved
+        return
+    let target = type_at(c, ty)
+    if target.tag != NominalType()
+        reject(c, id, "implementation requires a nominal type")
+        current [0] = saved
+        return
+    let mut declarations = c.declarations
+    declarations [id] = target.nominal
+    for index in 0 .. node.children:len()
+        let child = node.children:get(index)
+        if syntax(c, child).tag == TypeNameNode()
+            register_trait_claim(c, target.nominal, trait_for_node(c, child), id)
+    current [0] = saved
+
+fn register_impl_methods(c: Checker, id: i64) -> void
+    let node = syntax(c, id)
+    let owner = c.declarations [id]
+    if owner < 0
+        return
+    for index in 0 .. node.children:len()
+        let child = node.children:get(index)
+        if syntax(c, child).tag == FunctionNode()
+            register_function(c, child, owner)
+
+fn satisfies_trait(c: Checker, ty: i64, trait_id: i64) -> bool
+    let actual = type_at(c, ty)
+    if actual.tag != NominalType()
+        return false
+    for index in 0 .. c.implementations [0]:len()
+        let item = c.implementations [0]:get(index)
+        if item.owner == actual.nominal and item.trait_id == trait_id
+            return true
+    let declaration = syntax(c, symbol_at(c, actual.nominal).syntax)
+    for index in 0 .. declaration.children:len()
+        let child = declaration.children:get(index)
+        if syntax(c, child).tag == TypeNameNode() and trait_for_node(c, child) == trait_id
+            return true
+    false
+
+fn trait_method_signature(c: Checker, id: i64) -> i64
+    let node = syntax(c, id)
+    let mut parts = buffer(0)
+    let mut result = 0
+    for index in 0 .. node.children:len()
+        let child_id = node.children:get(index)
+        let child = syntax(c, child_id)
+        if child.tag == ParameterNode()
+            let ty = resolve_type(c, child.children:get(0))
+            if ty == 0
+                reject(c, child_id, "trait parameter cannot be void")
+            parts = parts:push(ty)
+        if child.tag == TypeNameNode() or child.tag == ArrayTypeNode() or child.tag == FunctionTypeNode() or child.tag == AppliedTypeNode()
+            result = resolve_type(c, child_id)
+    intern(c, FunctionType(), "", -1, parts:push(result))
+
+fn validate_trait_claims(c: Checker) -> void
+    for index in 0 .. c.implementations [0]:len()
+        if not broken(c)
+            let claim = c.implementations [0]:get(index)
+            let definition = c.traits [0]:get(claim.trait_id)
+            let declaration = syntax(c, definition.syntax)
+            let owner_type = symbol_at(c, claim.owner).type_id
+            let saved_env = c.type_env [0]
+            let mut env = c.type_env
+            env [0] = buffer(TypeBinding { name: "", type_id: - 1 }):push(TypeBinding { name: definition.name, type_id: owner_type })
+            for offset in 0 .. declaration.children:len()
+                let required_id = declaration.children:get(offset)
+                let required = syntax(c, required_id)
+                let method = global(c, required.text, claim.owner)
+                if method < 0
+                    reject(c, claim.syntax, nerv.string.concat("missing trait method: ", required.text))
+                else
+                    let expected = trait_method_signature(c, required_id)
+                    let actual = symbol_at(c, method)
+                    if actual.category != "function" or actual.type_id != expected
+                        reject(c, claim.syntax, nerv.string.concat("trait method signature mismatch: ", required.text))
+            env [0] = saved_env
+
+fn foreign_call(c: Checker, context: CheckContext, node: i64, name: string) -> i64
+    let call = syntax(c, node)
+    let suffix = nerv.string.slice(name, 14, nerv.string.len(name))
+    let mut result = primitive_type(c, suffix)
+    if result >= 0 and result != 0 and not numeric(c, result)
+        result = -1
+    if result < 0 or call.children:len() < 2
+        reject(c, node, "invalid native call")
+        return -1
+    let mut args = buffer(0)
+    let mut types = buffer(0)
+    for index in 1 .. call.children:len()
+        let child = call.children:get(index)
+        let value = check_node(c, context, child, -1)
+        let ty = result_type(c, value)
+        if not numeric(c, ty) or (index == 1 and ty != 2)
+            reject(c, child, "native calls require an i64 address and numeric ABI arguments")
+        args = args:push(value)
+        types = types:push(ty)
+    let signature = intern(c, FunctionType(), "", -1, types:push(result))
+    let symbol = add_symbol(c, runtime.abi_name(name), "builtin", signature, -1, -1, false, node)
+    emit(c, BuiltinIR(), result, symbol, -1, "", node, args)

@@ -1,0 +1,911 @@
+import nerv.std
+import ir
+import llvm
+
+struct NativeFunction
+    value: i64
+    signature: i64
+
+struct Backend
+    api: LLVM
+    program: CheckedProgram
+    context: i64
+    unit: i64
+    builder: i64
+    types: []i64
+    functions: []i64
+    signatures: []i64
+    slots: []i64
+    externals: []Map<NativeFunction>
+    current: []i64
+    loops: []Buffer<i64>
+    errors: []string
+
+fn words(values: []i64) -> i64
+    let memory = nerv.ffi.alloc(nerv.arrays.len(values) * 8)
+    for index in 0 .. nerv.arrays.len(values)
+        nerv.ffi.store(memory + index * 8, values [index])
+    memory
+
+fn list(values: Buffer<i64>) -> []i64
+    let mut output = [0] * values:len()
+    for index in 0 .. values:len()
+        output [index] = values:get(index)
+    output
+
+fn pointer(b: Backend) -> i64 => llvm.PointerTypeInContext(b.api, b.context, 0)
+fn integer(b: Backend, value: i64) -> i64 => llvm.ConstInt(b.api, b.types [2], value, 1)
+fn node(b: Backend, id: i64) -> CheckedNode => b.program.nodes:get(id)
+fn symbol(b: Backend, id: i64) -> Symbol => b.program.symbols:get(id)
+fn type_info(b: Backend, id: i64) -> SemanticType => b.program.types:get(id)
+
+fn signature(b: Backend, result: i64, parameters: []i64) -> i64
+    let memory = words(parameters)
+    let value = llvm.FunctionType(b.api, result, memory, nerv.arrays.len(parameters), 0)
+    nerv.ffi.free(memory)
+    value
+
+fn aggregate(b: Backend, fields: []i64) -> i64
+    let memory = words(fields)
+    let value = llvm.StructTypeInContext(b.api, b.context, memory, nerv.arrays.len(fields), 0)
+    nerv.ffi.free(memory)
+    value
+
+fn call(b: Backend, function: i64, ty: i64, arguments: []i64, result: i64) -> i64
+    let memory = words(arguments)
+    let name = if result == b.types [0]
+        ""
+    else
+        "call"
+    let value = llvm.BuildCall2(b.api, b.builder, ty, function, memory, nerv.arrays.len(arguments), name)
+    nerv.ffi.free(memory)
+    value
+
+fn external(b: Backend, name: string, result: i64, types: []i64, arguments: []i64) -> i64
+    let mut cache = b.externals
+    let existing = cache [0]:get(name)
+    let function = match existing
+        Some(value) => value
+        None => NativeFunction { value: 0, signature: 0 }
+    let mut target = function
+    if target.value == 0
+        let ty = signature(b, result, types)
+        target = NativeFunction { value: llvm.AddFunction(b.api, b.unit, name, ty), signature: ty }
+        cache [0] = cache [0]:insert(name, target)
+    call(b, target.value, target.signature, arguments, result)
+
+fn block(b: Backend, name: string) -> i64
+    llvm.AppendBasicBlockInContext(b.api, b.context, b.functions [b.current [0]], name)
+
+fn position(b: Backend, target: i64) -> void => llvm.PositionBuilderAtEnd(b.api, b.builder, target)
+fn terminated(b: Backend) -> bool => llvm.GetBasicBlockTerminator(b.api, llvm.GetInsertBlock(b.api, b.builder)) != 0
+
+fn branch(b: Backend, target: i64) -> void
+    if not terminated(b)
+        let instruction_84 = llvm.BuildBr(b.api, b.builder, target)
+
+fn guard(b: Backend, condition: i64, code: i64) -> void
+    let yes = block(b, "valid")
+    let no = block(b, "invalid")
+    let instruction_89 = llvm.BuildCondBr(b.api, b.builder, condition, yes, no)
+    position(b, no)
+    external(b, "nerv_fail", b.types [0], [b.types [2]], [integer(b, code)])
+    let instruction_92 = llvm.BuildUnreachable(b.api, b.builder)
+    position(b, yes)
+
+fn payload_enum(b: Backend, owner: i64) -> bool
+    for index in 0 .. b.program.symbols:len()
+        let item = symbol(b, index)
+        if item.owner == owner and item.category == "variant" and type_info(b, item.type_id).parts:len() > 1
+            return true
+    false
+
+fn initialize_types(b: Backend) -> void
+    let mut types = b.types
+    for index in 0 .. b.program.types:len()
+        let item = type_info(b, index)
+        let mut value = pointer(b)
+        if item.tag == VoidType() or item.tag == BottomType() or item.tag == ErrorType()
+            value = llvm.VoidTypeInContext(b.api, b.context)
+        if item.tag == BoolType()
+            value = llvm.IntTypeInContext(b.api, b.context, 1)
+        if item.tag == IntegerType()
+            let mut width = 64
+            if item.name != "i64" and item.name != "u64" and item.name != "isize" and item.name != "usize"
+                width = nerv.text.parse_integer(nerv.string.slice(item.name, 1, nerv.string.len(item.name)))
+            value = llvm.IntTypeInContext(b.api, b.context, width)
+        if item.tag == FloatType()
+            value = llvm.DoubleTypeInContext(b.api, b.context)
+            if item.name == "f32"
+                value = llvm.FloatTypeInContext(b.api, b.context)
+        if item.tag == NominalType()
+            value = llvm.IntTypeInContext(b.api, b.context, 64)
+            if symbol(b, item.nominal).category == "struct" or payload_enum(b, item.nominal)
+                value = llvm.StructCreateNamed(b.api, b.context, nerv.string.concat("type_", integer_text(index)))
+        types [index] = value
+    for index in 0 .. b.program.types:len()
+        let item = type_info(b, index)
+        if item.tag == NominalType()
+            let enumeration = symbol(b, item.nominal).category == "enum"
+            if not enumeration or payload_enum(b, item.nominal)
+                let mut count = 0
+                for offset in 0 .. b.program.symbols:len()
+                    let member = symbol(b, offset)
+                    if member.owner == item.nominal and (member.category == "field" or member.category == "variant")
+                        count = count + 1
+                let extra = if enumeration
+                    1
+                else
+                    0
+                let mut fields = [b.types [2]] * (count + extra)
+                for offset in 0 .. b.program.symbols:len()
+                    let member = symbol(b, offset)
+                    if member.owner == item.nominal
+                        if member.category == "field"
+                            fields [member.slot] = b.types [member.type_id]
+                        if member.category == "variant"
+                            let parts = type_info(b, member.type_id).parts
+                            if parts:len() > 1
+                                fields [member.slot + 1] = b.types [parts:get(0)]
+                let memory = words(fields)
+                llvm.StructSetBody(b.api, b.types [index], memory, nerv.arrays.len(fields), 0)
+                nerv.ffi.free(memory)
+
+fn function_signature(b: Backend, type_id: i64, closure: bool) -> i64
+    let parts = type_info(b, type_id).parts
+    let offset = if closure
+        1
+    else
+        0
+    let mut parameters = [pointer(b)] * (parts:len() - 1 + offset)
+    for index in 0 .. parts:len() - 1
+        parameters [index + offset] = b.types [parts:get(index)]
+    signature(b, b.types [parts:get(parts:len() - 1)], parameters)
+
+fn declare_functions(b: Backend) -> void
+    let mut functions = b.functions
+    let mut signatures = b.signatures
+    for index in 0 .. b.program.functions:len()
+        let item = node(b, b.program.functions:get(index))
+        let closure = symbol(b, item.symbol).category == "lambda"
+        let ty = function_signature(b, item.type_id, closure)
+        signatures [item.symbol] = ty
+        functions [item.symbol] = llvm.AddFunction(b.api, b.unit, nerv.string.concat("fn_", integer_text(item.symbol)), ty)
+
+fn enum_value(b: Backend, ty: i64, variant: i64, values: []i64) -> i64
+    let item = symbol(b, variant)
+    if not payload_enum(b, item.owner)
+        return integer(b, item.slot)
+    let mut value = llvm.ConstNull(b.api, b.types [ty])
+    value = llvm.BuildInsertValue(b.api, b.builder, value, integer(b, item.slot), 0, "tag")
+    if nerv.arrays.len(values) > 0
+        value = llvm.BuildInsertValue(b.api, b.builder, value, values [0], item.slot + 1, "payload")
+    value
+
+fn enum_tag(b: Backend, value: i64, ty: i64) -> i64
+    if payload_enum(b, type_info(b, ty).nominal)
+        return llvm.BuildExtractValue(b.api, b.builder, value, 0, "tag")
+    value
+
+fn array_data(b: Backend, value: i64) -> i64
+    return llvm.BuildLoad2(b.api, b.builder, pointer(b), value, "data")
+
+fn array_length(b: Backend, value: i64) -> i64
+    let memory = words([integer(b, 1)])
+    let address = llvm.BuildGEP2(b.api, b.builder, b.types [2], value, memory, 1, "length.address")
+    nerv.ffi.free(memory)
+    return llvm.BuildLoad2(b.api, b.builder, b.types [2], address, "length")
+
+fn element(b: Backend, array: i64, index: i64, ty: i64) -> i64
+    let length = array_length(b, array)
+    let valid = llvm.BuildICmp(b.api, b.builder, 36, index, length, "bounds")
+    guard(b, valid, 3)
+    let memory = words([index])
+    let address = llvm.BuildGEP2(b.api, b.builder, ty, array_data(b, array), memory, 1, "element")
+    nerv.ffi.free(memory)
+    address
+
+fn new_array(b: Backend, length: i64, ty: i64) -> i64
+    let stride = llvm.SizeOf(b.api, ty)
+    external(b, "nerv_array_new", pointer(b), [b.types [2], b.types [2]], [length, stride])
+
+fn local_slot(b: Backend, id: i64) -> i64
+    let mut slots = b.slots
+    if slots [id] == 0
+        slots [id] = allocate_slot(b, b.types [symbol(b, id).type_id])
+    slots [id]
+
+fn address(b: Backend, id: i64) -> i64
+    let item = node(b, id)
+    if item.op == LocalIR()
+        return local_slot(b, item.symbol)
+    if item.op == FieldIR()
+        let base = node(b, item.children:get(0))
+        let target = address(b, item.children:get(0))
+        return llvm.BuildStructGEP2(b.api, b.builder, b.types [base.type_id], target, item.slot, "field.address")
+    if item.op == IndexIR()
+        let base = emit(b, item.children:get(0))
+        let index = emit(b, item.children:get(1))
+        return element(b, base, index, b.types [item.type_id])
+    assert(false)
+    0
+
+fn emit_children(b: Backend, children: Buffer<i64>) -> []i64
+    let mut values = [0] * children:len()
+    for index in 0 .. children:len()
+        values [index] = emit(b, children:get(index))
+    values
+
+fn signed(b: Backend, ty: i64) -> bool => nerv.string.starts_with(type_info(b, ty).name, "u") == 0
+
+fn convert(b: Backend, item: CheckedNode) -> i64
+    let source = node(b, item.children:get(0))
+    let value = emit(b, item.children:get(0))
+    let from = type_info(b, source.type_id)
+    let target = type_info(b, item.type_id)
+    let ty = b.types [item.type_id]
+    if from.tag == IntegerType() and target.tag == IntegerType()
+        let sign = if signed(b, source.type_id)
+            1
+        else
+            0
+        return llvm.BuildIntCast2(b.api, b.builder, value, ty, sign, "cast")
+    if from.tag == FloatType() and target.tag == FloatType()
+        return llvm.BuildFPCast(b.api, b.builder, value, ty, "cast")
+    if from.tag == IntegerType()
+        if signed(b, source.type_id)
+            return llvm.BuildSIToFP(b.api, b.builder, value, ty, "cast")
+        return llvm.BuildUIToFP(b.api, b.builder, value, ty, "cast")
+    if target.tag == IntegerType()
+        let bits = llvm.GetIntTypeWidth(b.api, ty)
+        let sign = signed(b, item.type_id)
+        let exponent = if sign
+            bits - 1
+        else
+            bits
+        let maximum = nerv.math.pow(2.0, f64(exponent))
+        let minimum = if sign
+            -maximum
+        else
+            0.0
+        let lower = llvm.ConstReal(b.api, b.types [source.type_id], minimum)
+        let upper = llvm.ConstReal(b.api, b.types [source.type_id], maximum)
+        let above = llvm.BuildFCmp(b.api, b.builder, 3, value, lower, "cast.lower")
+        let below = llvm.BuildFCmp(b.api, b.builder, 4, value, upper, "cast.upper")
+        guard(b, llvm.BuildAnd(b.api, b.builder, above, below, "cast.valid"), 5)
+        if signed(b, item.type_id)
+            return llvm.BuildFPToSI(b.api, b.builder, value, ty, "cast")
+        return llvm.BuildFPToUI(b.api, b.builder, value, ty, "cast")
+    value
+
+fn merge(b: Backend, ty: i64, values: Buffer<i64>, blocks: Buffer<i64>) -> i64
+    if ty == 0 or ty == 5 or values:len() == 0
+        return 0
+    let value = llvm.BuildPhi(b.api, b.builder, b.types [ty], "merge")
+    let incoming = words(list(values))
+    let origins = words(list(blocks))
+    llvm.AddIncoming(b.api, value, incoming, origins, values:len())
+    nerv.ffi.free(incoming)
+    nerv.ffi.free(origins)
+    value
+
+fn conditional(b: Backend, item: CheckedNode) -> i64
+    let condition = emit(b, item.children:get(0))
+    let yes = block(b, "then")
+    let no = block(b, "else")
+    let done = block(b, "if.end")
+    let instruction_282 = llvm.BuildCondBr(b.api, b.builder, condition, yes, no)
+    let mut values = buffer(0)
+    let mut origins = buffer(0)
+    position(b, yes)
+    let value = emit(b, item.children:get(1))
+    if not terminated(b)
+        values = values:push(value)
+        origins = origins:push(llvm.GetInsertBlock(b.api, b.builder))
+        branch(b, done)
+    position(b, no)
+    let mut other = 0
+    if item.children:len() == 3
+        other = emit(b, item.children:get(2))
+    if not terminated(b)
+        values = values:push(other)
+        origins = origins:push(llvm.GetInsertBlock(b.api, b.builder))
+        branch(b, done)
+    position(b, done)
+    if values:len() == 0
+        let instruction_301 = llvm.BuildUnreachable(b.api, b.builder)
+        return 0
+    merge(b, item.type_id, values, origins)
+
+fn matching(b: Backend, item: CheckedNode) -> i64
+    let input = node(b, item.children:get(0))
+    let value = emit(b, item.children:get(0))
+    let tag = enum_tag(b, value, input.type_id)
+    let done = block(b, "match.end")
+    let mut values = buffer(0)
+    let mut origins = buffer(0)
+    for index in 1 .. item.children:len()
+        let arm = node(b, item.children:get(index))
+        let yes = block(b, "arm")
+        let next = block(b, "next.arm")
+        let variant = symbol(b, arm.symbol)
+        let condition = llvm.BuildICmp(b.api, b.builder, 32, tag, integer(b, variant.slot), "variant")
+        let instruction_318 = llvm.BuildCondBr(b.api, b.builder, condition, yes, next)
+        position(b, yes)
+        if arm.slot >= 0
+            let payload = llvm.BuildExtractValue(b.api, b.builder, value, variant.slot + 1, "payload")
+            let instruction_322 = llvm.BuildStore(b.api, b.builder, payload, local_slot(b, arm.slot))
+        let result = emit(b, arm.children:get(0))
+        if not terminated(b)
+            values = values:push(result)
+            origins = origins:push(llvm.GetInsertBlock(b.api, b.builder))
+            branch(b, done)
+        position(b, next)
+    let instruction_329 = llvm.BuildUnreachable(b.api, b.builder)
+    position(b, done)
+    if values:len() == 0
+        let instruction_332 = llvm.BuildUnreachable(b.api, b.builder)
+        return 0
+    merge(b, item.type_id, values, origins)
+
+fn loop_body(b: Backend, item: CheckedNode) -> i64
+    let condition_block = block(b, "loop.condition_block")
+    let body = block(b, "loop.body")
+    let next = block(b, "loop.next")
+    let done = block(b, "loop.end")
+    let mut upper = 0
+    if item.op == ForIR()
+        let lower = emit(b, item.children:get(0))
+        upper = emit(b, item.children:get(1))
+        let instruction_345 = llvm.BuildStore(b.api, b.builder, lower, local_slot(b, item.symbol))
+    branch(b, condition_block)
+    position(b, condition_block)
+    let mut condition = 0
+    if item.op == WhileIR()
+        condition = emit(b, item.children:get(0))
+    else
+        let index = llvm.BuildLoad2(b.api, b.builder, b.types [2], local_slot(b, item.symbol), "index")
+        let predicate = if item.slot == 1
+            41
+        else
+            40
+        condition = llvm.BuildICmp(b.api, b.builder, predicate, index, upper, "range")
+    let instruction_358 = llvm.BuildCondBr(b.api, b.builder, condition, body, done)
+    let mut loops = b.loops
+    let saved = loops [0]
+    let continuation = if item.op == WhileIR()
+        condition_block
+    else
+        next
+    loops [0] = loops [0]:push(done):push(continuation)
+    position(b, body)
+    emit(b, item.children:get(item.children:len() - 1))
+    branch(b, continuation)
+    if item.op == ForIR()
+        position(b, next)
+        let slot = local_slot(b, item.symbol)
+        let index = llvm.BuildLoad2(b.api, b.builder, b.types [2], slot, "index")
+        let increment = block(b, "loop.increment")
+        let last = llvm.BuildICmp(b.api, b.builder, 32, index, upper, "last")
+        let instruction_375 = llvm.BuildCondBr(b.api, b.builder, last, done, increment)
+        position(b, increment)
+        let value = llvm.BuildAdd(b.api, b.builder, index, integer(b, 1), "next")
+        let instruction_378 = llvm.BuildStore(b.api, b.builder, value, slot)
+        branch(b, condition_block)
+    if item.op == WhileIR()
+        position(b, next)
+        branch(b, condition_block)
+    loops [0] = saved
+    position(b, done)
+    0
+
+fn repeat_array(b: Backend, item: CheckedNode) -> i64
+    let value = emit(b, item.children:get(0))
+    let length = emit(b, item.children:get(1))
+    let ty = b.types [type_info(b, item.type_id).parts:get(0)]
+    let array = new_array(b, length, ty)
+    let index_slot = allocate_slot(b, b.types [2])
+    let instruction_390 = llvm.BuildStore(b.api, b.builder, integer(b, 0), index_slot)
+    let condition_block = block(b, "repeat.condition_block")
+    let body = block(b, "repeat.body")
+    let done = block(b, "repeat.end")
+    branch(b, condition_block)
+    position(b, condition_block)
+    let index = llvm.BuildLoad2(b.api, b.builder, b.types [2], index_slot, "index")
+    let condition = llvm.BuildICmp(b.api, b.builder, 40, index, length, "repeat")
+    let instruction_398 = llvm.BuildCondBr(b.api, b.builder, condition, body, done)
+    position(b, body)
+    let instruction_400 = llvm.BuildStore(b.api, b.builder, value, element(b, array, index, ty))
+    let instruction_401 = llvm.BuildStore(b.api, b.builder, llvm.BuildAdd(b.api, b.builder, index, integer(b, 1), "next"), index_slot)
+    branch(b, condition_block)
+    position(b, done)
+    array
+
+fn closure_value(b: Backend, item: CheckedNode) -> i64
+    let origin = llvm.GetInsertBlock(b.api, b.builder)
+    let target = item.symbol
+    let closure = symbol(b, target).category == "lambda"
+    let mut code = b.functions [target]
+    let mut environment = llvm.ConstNull(b.api, pointer(b))
+    if not closure
+        let parts = type_info(b, symbol(b, target).type_id).parts
+        let ty = function_signature(b, symbol(b, target).type_id, true)
+        code = llvm.AddFunction(b.api, b.unit, nerv.string.concat("thunk_", integer_text(item.syntax)), ty)
+        let entry = llvm.AppendBasicBlockInContext(b.api, b.context, code, "entry")
+        position(b, entry)
+        let mut args = [0] * (parts:len() - 1)
+        for index in 0 .. nerv.arrays.len(args)
+            args [index] = llvm.GetParam(b.api, code, index + 1)
+        let result_type = parts:get(parts:len() - 1)
+        let result = call(b, b.functions [target], b.signatures [target], args, b.types [result_type])
+        if result_type == 0
+            let instruction_424 = llvm.BuildRetVoid(b.api, b.builder)
+        else
+            let instruction_426 = llvm.BuildRet(b.api, b.builder, result)
+        position(b, origin)
+    if item.children:len() > 0
+        let mut fields = [0] * item.children:len()
+        let mut values = [0] * item.children:len()
+        for index in 0 .. item.children:len()
+            let id = item.children:get(index)
+            fields [index] = b.types [node(b, id).type_id]
+            values [index] = emit(b, id)
+        let ty = aggregate(b, fields)
+        environment = new_array(b, integer(b, 1), ty)
+        let mut value = llvm.ConstNull(b.api, ty)
+        for index in 0 .. nerv.arrays.len(values)
+            value = llvm.BuildInsertValue(b.api, b.builder, value, values [index], index, "capture")
+        let instruction_440 = llvm.BuildStore(b.api, b.builder, value, element(b, environment, integer(b, 0), ty))
+    external(b, "nerv_closure_new", pointer(b), [pointer(b), pointer(b), b.types [2]], [code, environment, integer(b, 1)])
+
+fn propagation(b: Backend, item: CheckedNode) -> i64
+    let input = node(b, item.children:get(0))
+    let value = emit(b, item.children:get(0))
+    let tag = enum_tag(b, value, input.type_id)
+    let failure = llvm.BuildICmp(b.api, b.builder, 32, tag, integer(b, item.slot), "failure")
+    let no = block(b, "propagate")
+    let yes = block(b, "unwrap")
+    let instruction_450 = llvm.BuildCondBr(b.api, b.builder, failure, no, yes)
+    position(b, no)
+    let target = symbol(b, item.symbol)
+    let signature_parts = type_info(b, target.type_id).parts
+    let mut args = [0] * (signature_parts:len() - 1)
+    if nerv.arrays.len(args) > 0
+        args [0] = llvm.BuildExtractValue(b.api, b.builder, value, item.slot + 1, "error")
+    let target_type = signature_parts:get(signature_parts:len() - 1)
+    let instruction_458 = llvm.BuildRet(b.api, b.builder, enum_value(b, target_type, item.symbol, args))
+    position(b, yes)
+    let success_slot = if item.slot == 0
+        1
+    else
+        0
+    return llvm.BuildExtractValue(b.api, b.builder, value, success_slot + 1, "success")
+
+fn emit(b: Backend, id: i64) -> i64
+    let item = node(b, id)
+    if terminated(b)
+        return 0
+    let op = item.op
+    if op == BlockIR()
+        let mut value = 0
+        for index in 0 .. item.children:len()
+            value = emit(b, item.children:get(index))
+        return value
+    if op == ExprStatementIR()
+        return emit(b, item.children:get(0))
+    if op == IntegerIR()
+        return llvm.ConstIntOfStringAndSize(b.api, b.types [item.type_id], item.text, nerv.string.len(item.text), 10)
+    if op == FloatIR()
+        return llvm.ConstReal(b.api, b.types [item.type_id], nerv.text.parse_float(item.text))
+    if op == BooleanIR()
+        let value = if item.text == "true"
+            1
+        else
+            0
+        return llvm.ConstInt(b.api, b.types [1], value, 0)
+    if op == StringIR()
+        let memory = nerv.ffi.bytes(item.text)
+        let initializer = llvm.ConstStringInContext2(b.api, b.context, memory, nerv.string.len(item.text), 0)
+        nerv.ffi.free(memory)
+        let bytes = llvm.AddGlobal(b.api, b.unit, llvm.TypeOf(b.api, initializer), "text")
+        llvm.SetInitializer(b.api, bytes, initializer)
+        llvm.SetGlobalConstant(b.api, bytes, 1)
+        return external(b, "nerv_string_new", pointer(b), [pointer(b), b.types [2]], [bytes, integer(b, nerv.string.len(item.text))])
+    if op == LocalIR()
+        return llvm.BuildLoad2(b.api, b.builder, b.types [item.type_id], local_slot(b, item.symbol), "value")
+    if op == LetIR()
+        let value = emit(b, item.children:get(0))
+        let instruction_495 = llvm.BuildStore(b.api, b.builder, value, local_slot(b, item.symbol))
+        return 0
+    if op == AssignIR() or op == AssignFieldIR() or op == AssignIndexIR()
+        let target = address(b, item.children:get(0))
+        let value = emit(b, item.children:get(1))
+        let instruction_500 = llvm.BuildStore(b.api, b.builder, value, target)
+        return 0
+    if op == ReturnIR()
+        if item.children:len() == 0
+            let instruction_504 = llvm.BuildRetVoid(b.api, b.builder)
+        else
+            let value = emit(b, item.children:get(0))
+            if not terminated(b)
+                let instruction_508 = llvm.BuildRet(b.api, b.builder, value)
+        return 0
+    if op == BreakIR() or op == ContinueIR()
+        let offset = if op == BreakIR()
+            2
+        else
+            1
+        branch(b, b.loops [0]:get(b.loops [0]:len() - offset))
+        return 0
+    if op == IfIR()
+        return conditional(b, item)
+    if op == MatchIR()
+        return matching(b, item)
+    if op == WhileIR() or op == ForIR()
+        return loop_body(b, item)
+    if op == RepeatIR()
+        return repeat_array(b, item)
+    if op == FieldIR()
+        let value = emit(b, item.children:get(0))
+        return llvm.BuildExtractValue(b.api, b.builder, value, item.slot, "field")
+    if op == IndexIR()
+        let array = emit(b, item.children:get(0))
+        let index = emit(b, item.children:get(1))
+        return llvm.BuildLoad2(b.api, b.builder, b.types [item.type_id], element(b, array, index, b.types [item.type_id]), "value")
+    if op == StructIR()
+        let mut value = llvm.ConstNull(b.api, b.types [item.type_id])
+        for index in 0 .. item.children:len()
+            let field = node(b, item.children:get(index))
+            let result = emit(b, field.children:get(0))
+            value = llvm.BuildInsertValue(b.api, b.builder, value, result, field.slot, "field")
+        return value
+    if op == EnumIR()
+        return enum_value(b, item.type_id, item.symbol, emit_children(b, item.children))
+    if op == ArrayIR()
+        let values = emit_children(b, item.children)
+        let ty = b.types [type_info(b, item.type_id).parts:get(0)]
+        let array = new_array(b, integer(b, nerv.arrays.len(values)), ty)
+        for index in 0 .. nerv.arrays.len(values)
+            let instruction_546 = llvm.BuildStore(b.api, b.builder, values [index], element(b, array, integer(b, index), ty))
+        return array
+    if op == LambdaIR() or op == FunctionRefIR()
+        return closure_value(b, item)
+    if op == TryIR()
+        return propagation(b, item)
+    if op == CastIR()
+        return convert(b, item)
+    if op == UnaryIR()
+        let value = emit(b, item.children:get(0))
+        if item.text == "Not"
+            return llvm.BuildNot(b.api, b.builder, value, "not")
+        if type_info(b, item.type_id).tag == FloatType()
+            return llvm.BuildFNeg(b.api, b.builder, value, "negate")
+        return llvm.BuildNeg(b.api, b.builder, value, "negate")
+    if op == BinaryIR()
+        return binary(b, item)
+    if op == CallIR() or op == IndirectCallIR() or op == BuiltinIR()
+        return invocation(b, item)
+    assert(false)
+    0
+
+fn binary(b: Backend, item: CheckedNode) -> i64
+    let left_id = item.children:get(0)
+    let right_id = item.children:get(1)
+    let left = emit(b, left_id)
+    let ty = node(b, left_id).type_id
+    let op = item.text
+    if op == "And" or op == "Or"
+        let origin = llvm.GetInsertBlock(b.api, b.builder)
+        let right_block = block(b, "boolean.right")
+        let done = block(b, "boolean.end")
+        if op == "And"
+            let instruction_579 = llvm.BuildCondBr(b.api, b.builder, left, right_block, done)
+        else
+            let instruction_581 = llvm.BuildCondBr(b.api, b.builder, left, done, right_block)
+        position(b, right_block)
+        let right = emit(b, right_id)
+        let last = llvm.GetInsertBlock(b.api, b.builder)
+        branch(b, done)
+        position(b, done)
+        return merge(b, 1, buffer(0):push(left):push(right), buffer(0):push(origin):push(last))
+    let right = emit(b, right_id)
+    let floating = type_info(b, ty).tag == FloatType()
+    let unsigned = not signed(b, ty)
+    if op == "Plus"
+        if floating
+            return llvm.BuildFAdd(b.api, b.builder, left, right, "add")
+        return llvm.BuildAdd(b.api, b.builder, left, right, "add")
+    if op == "Minus"
+        if floating
+            return llvm.BuildFSub(b.api, b.builder, left, right, "subtract")
+        return llvm.BuildSub(b.api, b.builder, left, right, "subtract")
+    if op == "Star"
+        if floating
+            return llvm.BuildFMul(b.api, b.builder, left, right, "multiply")
+        return llvm.BuildMul(b.api, b.builder, left, right, "multiply")
+    if op == "Slash" or op == "Percent"
+        if floating
+            if op == "Slash"
+                return llvm.BuildFDiv(b.api, b.builder, left, right, "divide")
+            return llvm.BuildFRem(b.api, b.builder, left, right, "remainder")
+        let nonzero = llvm.BuildICmp(b.api, b.builder, 33, right, llvm.ConstNull(b.api, b.types [ty]), "nonzero")
+        guard(b, nonzero, 1)
+        if op == "Slash"
+            if unsigned
+                return llvm.BuildUDiv(b.api, b.builder, left, right, "divide")
+            return signed_division(b, left, right, ty, false)
+        if unsigned
+            return llvm.BuildURem(b.api, b.builder, left, right, "remainder")
+        return signed_division(b, left, right, ty, true)
+    let mut predicate = 32
+    if op == "NotEq"
+        predicate = 33
+    if op == "Gt"
+        predicate = 38
+    if op == "GtEq"
+        predicate = 39
+    if op == "Lt"
+        predicate = 40
+    if op == "LtEq"
+        predicate = 41
+    if floating
+        let mut real = 1
+        if op == "NotEq"
+            real = 14
+        if op == "Gt"
+            real = 2
+        if op == "GtEq"
+            real = 3
+        if op == "Lt"
+            real = 4
+        if op == "LtEq"
+            real = 5
+        return llvm.BuildFCmp(b.api, b.builder, real, left, right, "compare")
+    if unsigned and predicate >= 38
+        predicate = predicate - 4
+    if ty == 4
+        let value = external(b, "nerv_str_equal", b.types [2], [pointer(b), pointer(b)], [left, right])
+        let expected = if op == "EqEq"
+            33
+        else
+            32
+        return llvm.BuildICmp(b.api, b.builder, expected, value, integer(b, 0), "compare")
+    return llvm.BuildICmp(b.api, b.builder, predicate, left, right, "compare")
+
+fn invocation(b: Backend, item: CheckedNode) -> i64
+    if item.op == IndirectCallIR()
+        let closure = emit(b, item.children:get(0))
+        let code = external(b, "nerv_closure_code", pointer(b), [pointer(b)], [closure])
+        let environment = external(b, "nerv_closure_environment", pointer(b), [pointer(b)], [closure])
+        let mut args = [0] * item.children:len()
+        args [0] = environment
+        for index in 1 .. item.children:len()
+            args [index] = emit(b, item.children:get(index))
+        let signature_id = node(b, item.children:get(0)).type_id
+        return call(b, code, function_signature(b, signature_id, true), args, b.types [item.type_id])
+    let values = emit_children(b, item.children)
+    let target = symbol(b, item.symbol)
+    if item.op == CallIR()
+        return call(b, b.functions [item.symbol], b.signatures [item.symbol], values, b.types [item.type_id])
+    if target.name == "assert"
+        guard(b, values [0], 2)
+        return 0
+    let parts = type_info(b, target.type_id).parts
+    let mut types = [0] * (parts:len() - 1)
+    for index in 0 .. nerv.arrays.len(types)
+        types [index] = b.types [parts:get(index)]
+    if nerv.string.starts_with(target.name, "nerv_ffi_call_") == 1
+        let address = llvm.BuildIntToPtr(b.api, b.builder, values [0], pointer(b), "native")
+        let mut args = [0] * (nerv.arrays.len(values) - 1)
+        let mut parameters = [0] * nerv.arrays.len(args)
+        for index in 0 .. nerv.arrays.len(args)
+            args [index] = values [index + 1]
+            parameters [index] = types [index + 1]
+        let ty = signature(b, b.types [item.type_id], parameters)
+        return call(b, address, ty, args, b.types [item.type_id])
+    external(b, target.name, b.types [item.type_id], types, values)
+
+fn compile_function(b: Backend, id: i64) -> void
+    let item = node(b, id)
+    let mut current = b.current
+    current [0] = item.symbol
+    let entry = block(b, "entry")
+    position(b, entry)
+    for index in 0 .. b.program.symbols:len()
+        let member = symbol(b, index)
+        if member.owner == item.symbol and (member.category == "local" or member.category == "parameter" or member.category == "capture")
+            let allocation = local_slot(b, index)
+    let closure = symbol(b, item.symbol).category == "lambda"
+    let offset = if closure
+        1
+    else
+        0
+    for index in 0 .. item.children:len() - 1
+        let parameter = node(b, item.children:get(index))
+        let value = llvm.GetParam(b.api, b.functions [item.symbol], index + offset)
+        let instruction_703 = llvm.BuildStore(b.api, b.builder, value, local_slot(b, parameter.symbol))
+    let mut captures = buffer(0)
+    for index in 0 .. b.program.captures:len()
+        let capture = b.program.captures:get(index)
+        if capture.function == item.symbol
+            captures = captures:push(capture.symbol)
+    if captures:len() > 0
+        let mut fields = [0] * captures:len()
+        for index in 0 .. captures:len()
+            fields [index] = b.types [symbol(b, captures:get(index)).type_id]
+        let ty = aggregate(b, fields)
+        let environment = llvm.GetParam(b.api, b.functions [item.symbol], 0)
+        let value = llvm.BuildLoad2(b.api, b.builder, ty, element(b, environment, integer(b, 0), ty), "environment")
+        for index in 0 .. captures:len()
+            let captured = llvm.BuildExtractValue(b.api, b.builder, value, index, "capture")
+            let instruction_718 = llvm.BuildStore(b.api, b.builder, captured, local_slot(b, captures:get(index)))
+    let result = emit(b, item.children:get(item.children:len() - 1))
+    if not terminated(b)
+        let parts = type_info(b, item.type_id).parts
+        if parts:get(parts:len() - 1) == 0
+            let instruction_723 = llvm.BuildRetVoid(b.api, b.builder)
+        else
+            let instruction_725 = llvm.BuildRet(b.api, b.builder, result)
+
+fn entry_adapter(b: Backend, tests: bool) -> void
+    let int32 = llvm.IntTypeInContext(b.api, b.context, 32)
+    let ty = signature(b, int32, [])
+    let main_function = llvm.AddFunction(b.api, b.unit, "main", ty)
+    let entry = llvm.AppendBasicBlockInContext(b.api, b.context, main_function, "entry")
+    position(b, entry)
+    external(b, "nerv_runtime_abi_v2", b.types [0], [], [])
+    let mut source = b.program.main
+    if tests
+        let test_ty = signature(b, b.types [0], [])
+        let runner = llvm.AddFunction(b.api, b.unit, "test_runner", test_ty)
+        let origin = llvm.GetInsertBlock(b.api, b.builder)
+        let test_block = llvm.AppendBasicBlockInContext(b.api, b.context, runner, "entry")
+        position(b, test_block)
+        for index in 0 .. b.program.functions:len()
+            let item = node(b, b.program.functions:get(index))
+            if item.module_id == 0 and nerv.string.starts_with(symbol(b, item.symbol).name, "Test") == 1
+                let called = call(b, b.functions [item.symbol], b.signatures [item.symbol], [], b.types [0])
+        let returned = llvm.BuildRetVoid(b.api, b.builder)
+        position(b, origin)
+        let result = external(b, "nerv_process_void", int32, [pointer(b)], [runner])
+        let finished = llvm.BuildRet(b.api, b.builder, result)
+        return
+    let parts = type_info(b, symbol(b, source).type_id).parts
+    let runtime = if parts:get(parts:len() - 1) == 0
+        "nerv_process_void"
+    else
+        "nerv_process_i64"
+    let result = external(b, runtime, int32, [pointer(b)], [b.functions [source]])
+    let instruction_741 = llvm.BuildRet(b.api, b.builder, result)
+
+fn message(b: Backend, error: i64) -> string
+    let text = nerv.ffi.text(error)
+    if error != 0
+        llvm.DisposeMessage(b.api, error)
+    text
+
+fn verify(b: Backend) -> string
+    let error = nerv.ffi.alloc(8)
+    let status = llvm.VerifyModule(b.api, b.unit, 2, error)
+    let text = message(b, nerv.ffi.load(error))
+    nerv.ffi.free(error)
+    if status != 0
+        return text
+    ""
+
+fn emit_object(b: Backend, output: string, release: bool) -> string
+    let triple_pointer = llvm.GetDefaultTargetTriple(b.api)
+    let native = nerv.string.replace(message(b, triple_pointer), "windows-msvc", "windows-gnu")
+    let triple = option_or(environment("NERV_TARGET"), native)
+    if nerv.string.starts_with(triple, "aarch64") == 1 or nerv.string.starts_with(triple, "arm64") == 1
+        llvm.InitializeAArch64TargetInfo(b.api)
+        llvm.InitializeAArch64Target(b.api)
+        llvm.InitializeAArch64TargetMC(b.api)
+        llvm.InitializeAArch64AsmPrinter(b.api)
+    else
+        llvm.InitializeX86TargetInfo(b.api)
+        llvm.InitializeX86Target(b.api)
+        llvm.InitializeX86TargetMC(b.api)
+        llvm.InitializeX86AsmPrinter(b.api)
+    llvm.SetTarget(b.api, b.unit, triple)
+    let target = nerv.ffi.alloc(8)
+    let error = nerv.ffi.alloc(8)
+    let status = llvm.GetTargetFromTriple(b.api, triple, target, error)
+    if status != 0
+        let text = message(b, nerv.ffi.load(error))
+        nerv.ffi.free(target)
+        nerv.ffi.free(error)
+        return text
+    let level = if release
+        3
+    else
+        0
+    let machine = llvm.CreateTargetMachine(b.api, nerv.ffi.load(target), triple, "generic", "", level, 0, 0)
+    nerv.ffi.free(target)
+    if machine == 0
+        nerv.ffi.free(error)
+        return "LLVM could not create target machine"
+    let layout = llvm.CreateTargetDataLayout(b.api, machine)
+    let data_layout = message(b, llvm.CopyStringRepOfTargetData(b.api, layout))
+    llvm.SetDataLayout(b.api, b.unit, data_layout)
+    llvm.DisposeTargetData(b.api, layout)
+    let mut problem = ""
+    if release
+        let options = llvm.CreatePassBuilderOptions(b.api)
+        let failure = llvm.RunPasses(b.api, b.unit, "default<O2>", machine, options)
+        llvm.DisposePassBuilderOptions(b.api, options)
+        if failure != 0
+            let details = llvm.GetErrorMessage(b.api, failure)
+            problem = nerv.ffi.text(details)
+            llvm.DisposeErrorMessage(b.api, details)
+    if problem == ""
+        let emitted = llvm.TargetMachineEmitToFile(b.api, machine, b.unit, output, 1, error)
+        if emitted != 0
+            problem = message(b, nerv.ffi.load(error))
+    nerv.ffi.free(error)
+    llvm.DisposeTargetMachine(b.api, machine)
+    problem
+
+fn compile(program: CheckedProgram, library: string, output: string, release: bool, tests: bool) -> string
+    if program.main < 0 and not tests
+        return "missing main function"
+    let api = llvm.open_library(library)
+    if api.library == 0
+        return nerv.string.concat("cannot load LLVM library: ", library)
+    let context = llvm.ContextCreate(api)
+    let unit = llvm.ModuleCreateWithNameInContext(api, "nerv", context)
+    let builder = llvm.CreateBuilderInContext(api, context)
+    let b = Backend { api: api, program: program, context: context, unit: unit, builder: builder, types: [0] * program.types:len(), functions: [0] * program.symbols:len(), signatures: [0] * program.symbols:len(), slots: [0] * program.symbols:len(), externals: [map(NativeFunction { value: 0, signature: 0 })], current: [-1], loops: [buffer(0)], errors: [""] }
+    initialize_types(b)
+    declare_functions(b)
+    for index in 0 .. program.functions:len()
+        compile_function(b, program.functions:get(index))
+    entry_adapter(b, tests)
+    let mut problem = verify(b)
+    if problem == ""
+        problem = emit_object(b, output, release)
+    llvm.DisposeBuilder(api, builder)
+    llvm.DisposeModule(api, unit)
+    llvm.ContextDispose(api, context)
+    nerv.ffi.close(api.library)
+    problem
+
+fn allocate_slot(b: Backend, ty: i64) -> i64
+    let entry = llvm.GetEntryBasicBlock(b.api, b.functions [b.current [0]])
+    let builder = llvm.CreateBuilderInContext(b.api, b.context)
+    let first = llvm.GetFirstInstruction(b.api, entry)
+    if first == 0
+        llvm.PositionBuilderAtEnd(b.api, builder, entry)
+    else
+        llvm.PositionBuilderBefore(b.api, builder, first)
+    let value = llvm.BuildAlloca(b.api, builder, ty, "local")
+    llvm.DisposeBuilder(b.api, builder)
+    value
+
+fn signed_division(b: Backend, left: i64, right: i64, ty: i64, remainder: bool) -> i64
+    let bits = llvm.GetIntTypeWidth(b.api, b.types [ty])
+    let mut minimum = -9223372036854775808
+    if bits < 64
+        let mut magnitude = 1
+        for index in 0 .. bits - 1
+            magnitude = magnitude * 2
+        minimum = -magnitude
+    let first = llvm.BuildICmp(b.api, b.builder, 32, left, llvm.ConstInt(b.api, b.types [ty], minimum, 1), "minimum")
+    let second = llvm.BuildICmp(b.api, b.builder, 32, right, llvm.ConstInt(b.api, b.types [ty], -1, 1), "negative.one")
+    let overflow = llvm.BuildAnd(b.api, b.builder, first, second, "overflow")
+    let origin = llvm.GetInsertBlock(b.api, b.builder)
+    let normal = block(b, "division")
+    let done = block(b, "division.end")
+    let jump = llvm.BuildCondBr(b.api, b.builder, overflow, done, normal)
+    position(b, normal)
+    let result = if remainder
+        llvm.BuildSRem(b.api, b.builder, left, right, "remainder")
+    else
+        llvm.BuildSDiv(b.api, b.builder, left, right, "divide")
+    branch(b, done)
+    position(b, done)
+    let special = if remainder
+        llvm.ConstNull(b.api, b.types [ty])
+    else
+        left
+    merge(b, ty, buffer(0):push(special):push(result), buffer(0):push(origin):push(normal))

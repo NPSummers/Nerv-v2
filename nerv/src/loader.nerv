@@ -1,0 +1,211 @@
+import nerv.std
+import ast
+import parser
+import project
+import manifest
+
+struct ImportEdge
+    alias: string
+    target: i64
+
+struct SourceModule
+    path: string
+    text: string
+    name: string
+    imports: Buffer<ImportEdge>
+
+struct SourceGraph
+    tree: Ast
+    node_sources: Buffer<i64>
+    modules: Buffer<SourceModule>
+
+struct LoadError
+    path: string
+    start: i64
+    end: i64
+    message: string
+
+struct Loader
+    modules: []Buffer<SourceModule>
+    states: []Buffer<i64>
+    nodes: []Buffer<Node>
+    origins: []Buffer<i64>
+    declarations: []Buffer<i64>
+    errors: []Buffer<LoadError>
+    packages: Project
+    stdlib: Path
+
+fn load_failed(state: Loader) -> bool => state.errors [0]:len() > 0
+
+fn load_error(state: Loader, file: string, start: i64, end: i64, message: string) -> void
+    if not load_failed(state)
+        let mut errors = state.errors
+        errors [0] = errors [0]:push(LoadError { path: file, start: start, end: end, message: message })
+
+fn canonical_failure(state: Loader, file: string, error: IoError) -> Path
+    load_error(state, file, 0, 0, error.message)
+    path("")
+
+fn canonical(state: Loader, file: Path) -> Path
+    match file:canonicalize()
+        Ok(value) => value
+        Err(error) => canonical_failure(state, file.text, error)
+
+fn read_failure(state: Loader, file: string, error: IoError) -> string
+    load_error(state, file, 0, 0, error.message)
+    ""
+
+fn read_source(state: Loader, file: string) -> string
+    match read_text(file)
+        Ok(text) => text
+        Err(error) => read_failure(state, file, error)
+
+fn parse_failure(state: Loader, file: string, error: SyntaxError) -> Ast
+    load_error(state, file, error.start, error.end, error.message)
+    Ast { nodes:buffer(empty_node()), root: - 1 }
+
+fn parse_module(state: Loader, file: string, text: string) -> Ast
+    match parser.parse(text)
+        Ok(tree) => tree
+        Err(error) => parse_failure(state, file, error)
+
+fn module_at(state: Loader, id: i64) -> SourceModule => state.modules [0]:get(id)
+
+fn replace_module(state: Loader, id: i64, value: SourceModule) -> void
+    let mut values = state.modules [0].values
+    values [id] = value
+
+fn exists(file: Path) -> bool => result_or(path_exists(file), false)
+
+fn runtime_import(name: string) -> bool
+    let modules = ["nerv", "nerv.ffi", "nerv.string", "nerv.arrays", "nerv.io", "nerv.random", "nerv.math", "nerv.collections"]
+    for index in 0 .. nerv.arrays.len(modules)
+        if name == modules [index]
+            return true
+    false
+
+fn import_file(state: Loader, from: string, name: string) -> Path
+    if nerv.string.starts_with(name, "nerv.") == 1
+        let pieces = split_text(name, ".")
+        if nerv.arrays.len(pieces) == 2
+            let part = pieces [1]
+            if part == "core" or part == "std" or part == "json" or part == "net"
+                return state.stdlib:join(nerv.string.concat(part, ".nerv"))
+            let helpers = ["text", "path", "fs", "task", "memory"]
+            for index in 0 .. nerv.arrays.len(helpers)
+                if part == helpers [index]
+                    return state.stdlib:join("std.nerv")
+        return path("")
+    let dependency = project.import_target(state.packages, from, name)
+    if dependency != ""
+        return path(dependency)
+    let relative = nerv.string.concat(nerv.string.replace(name, ".", "/"), ".nerv")
+    let local = path(from):parent():join(relative)
+    if exists(local)
+        return local
+    path(project.source_fallback(state.packages, from)):join(relative)
+
+fn append_module_ast(state: Loader, source: i64, tree: Ast) -> void
+    let offset = state.nodes [0]:len()
+    let mut nodes = state.nodes
+    let mut origins = state.origins
+    for index in 0 .. tree.nodes:len()
+        let old = tree.nodes:get(index)
+        let mut children = buffer(0)
+        for child in 0 .. old.children:len()
+            children = children:push(old.children:get(child) + offset)
+        nodes [0] = nodes [0]:push(Node { tag: old.tag, text: old.text, start: old.start, end: old.end, children: children })
+        origins [0] = origins [0]:push(source)
+    let root = tree.nodes:get(tree.root)
+    let mut declarations = state.declarations
+    for index in 0 .. root.children:len()
+        let id = root.children:get(index)
+        let node = tree.nodes:get(id)
+        if node.tag != ImportNode() and node.tag != ModuleNameNode()
+            declarations [0] = declarations [0]:push(id + offset)
+
+fn visit_module(state: Loader, requested: Path, parent: string, start: i64, end: i64) -> i64
+    if load_failed(state)
+        return -1
+    if not exists(requested)
+        load_error(state, parent, start, end, nerv.string.concat("module file not found: ", requested.text))
+        return -1
+    let file = canonical(state, requested)
+    if load_failed(state)
+        return -1
+    for index in 0 .. state.modules [0]:len()
+        if module_at(state, index).path == file.text
+            if state.states [0]:get(index) == 1
+                load_error(state, parent, start, end, "import cycle")
+                return -1
+            return index
+    if state.modules [0]:len() >= 256
+        load_error(state, parent, start, end, "module limit exceeded")
+        return -1
+    let text = read_source(state, file.text)
+    let tree = parse_module(state, file.text, text)
+    if load_failed(state)
+        return -1
+    let id = state.modules [0]:len()
+    let mut modules = state.modules
+    let mut states = state.states
+    modules [0] = modules [0]:push(SourceModule { path: file.text, text: text, name: "", imports:buffer(ImportEdge { alias: "", target: - 1 }) })
+    states [0] = states [0]:push(1)
+    let root = tree.nodes:get(tree.root)
+    let mut edges = buffer(ImportEdge { alias: "", target: - 1 })
+    let mut name = ""
+    for index in 0 .. root.children:len()
+        let node = tree.nodes:get(root.children:get(index))
+        if node.tag == ModuleNameNode()
+            name = node.text
+        if node.tag == ImportNode() and not runtime_import(node.text)
+            let target_file = import_file(state, file.text, node.text)
+            let target = visit_module(state, target_file, file.text, node.start, node.end)
+            if target >= 0
+                edges = edges:push(ImportEdge { alias: node.text, target: target })
+    if load_failed(state)
+        return -1
+    replace_module(state, id, SourceModule { path: file.text, text: text, name: name, imports: edges })
+    append_module_ast(state, id, tree)
+    let mut status = state.states [0].values
+    status [id] = 2
+    id
+
+fn load_graph(entry: string, stdlib: string, packages: Project) -> Result<SourceGraph, LoadError>
+    let state = Loader { modules: [buffer(SourceModule { path: "", text: "", name: "", imports:buffer(ImportEdge { alias: "", target: - 1 }) })], states: [buffer(0)], nodes: [buffer(empty_node())], origins: [buffer(0)], declarations: [buffer(0)], errors: [buffer(LoadError { path: "", start: 0, end: 0, message: "" })], packages: packages, stdlib:path(stdlib) }
+    visit_module(state, path(entry), entry, 0, 0)
+    if load_failed(state)
+        return Err(state.errors [0]:get(0))
+    let mut nodes = state.nodes
+    let root = nodes [0]:len()
+    nodes [0] = nodes [0]:push(Node { tag:ModuleNode(), text: "", start: 0, end: 0, children: state.declarations [0] })
+    let mut origins = state.origins
+    origins [0] = origins [0]:push(0)
+    Ok(SourceGraph { tree: Ast { nodes: nodes [0], root: root }, node_sources: origins [0], modules: state.modules [0] })
+
+fn project_failure(error: ProjectError) -> Result<SourceGraph, LoadError>
+    Err(LoadError { path: error.path, start: error.start, end: error.end, message: error.message })
+
+fn with_project(packages: Project, entry: string, stdlib: string) -> Result<SourceGraph, LoadError>
+    let mut file = entry
+    if file == ""
+        let package = packages.packages:get(0)
+        file = package.entry
+        if not project.is_file(file)
+            file = package.library
+    load_graph(file, stdlib, packages)
+
+fn load_options(entry: string, stdlib: string, manifest_file: string, locked: bool) -> Result<SourceGraph, LoadError>
+    let mut file = manifest_file
+    if file == ""
+        file = project.discover(entry)
+    if file != ""
+        return match project.load(file, locked)
+            Ok(packages) => with_project(packages, entry, stdlib)
+            Err(error) => project_failure(error)
+    if locked or entry == ""
+        return Err(LoadError { path: entry, start: 0, end: 0, message: "project manifest required" })
+    load_graph(entry, stdlib, Project { packages:buffer(manifest.empty_package()) })
+
+fn load(entry: string, stdlib: string) -> Result<SourceGraph, LoadError>
+    load_options(entry, stdlib, "", false)

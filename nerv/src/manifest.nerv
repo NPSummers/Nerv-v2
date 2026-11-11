@@ -1,0 +1,449 @@
+import nerv.std
+import nerv.json
+import source
+import sha256
+
+struct ProjectError
+    path: string
+    start: i64
+    end: i64
+    message: string
+
+struct ManifestEntry
+    key: string
+    value: string
+    table: bool
+    start: i64
+
+struct ManifestReader
+    input: Source
+    file: string
+    position: []i64
+    entries: []Buffer<ManifestEntry>
+    tables: []Set
+    leaves: []Set
+    sealed: []Set
+    errors: []Buffer<ProjectError>
+
+struct DependencySpec
+    alias: string
+    path: string
+
+struct Package
+    root: string
+    name: string
+    version: string
+    entry: string
+    library: string
+    manifest: string
+    dependencies: Buffer<DependencySpec>
+
+fn empty_package() -> Package
+    Package { root: "", name: "", version: "", entry: "", library: "", manifest: "", dependencies:buffer(DependencySpec { alias: "", path: "" }) }
+
+fn failed(reader: ManifestReader) -> bool => reader.errors [0]:len() > 0
+fn current(reader: ManifestReader) -> i64 => reader.input:at(reader.position [0])
+
+fn error(reader: ManifestReader, message: string) -> void
+    if not failed(reader)
+        let offset = reader.input.offsets [reader.position [0]]
+        let mut errors = reader.errors
+        errors [0] = errors [0]:push(ProjectError { path: reader.file, start: offset, end: offset, message: message })
+
+fn move(reader: ManifestReader, count: i64) -> void
+    let mut position = reader.position
+    let next = position [0] + count
+    position [0] = if next > reader.input.length
+        reader.input.length
+    else
+        next
+
+fn take(reader: ManifestReader, value: i64) -> bool
+    if failed(reader) or reader.position [0] >= reader.input.length or current(reader) != value
+        return false
+    move(reader, 1)
+    true
+
+fn expect(reader: ManifestReader, value: i64) -> void
+    if not take(reader, value)
+        error(reader, "unexpected manifest token")
+
+fn spaces(reader: ManifestReader) -> void
+    while not failed(reader) and (current(reader) == 32 or current(reader) == 9)
+        move(reader, 1)
+
+fn newline(reader: ManifestReader) -> bool
+    if take(reader, 13)
+        if not take(reader, 10)
+            error(reader, "manifest CR must be followed by LF")
+        return true
+    take(reader, 10)
+
+fn blank_lines(reader: ManifestReader) -> void
+    while not failed(reader)
+        spaces(reader)
+        if take(reader, 35)
+            while reader.position [0] < reader.input.length and current(reader) != 10 and current(reader) != 13
+                move(reader, 1)
+        if not newline(reader)
+            break
+
+fn line_end(reader: ManifestReader) -> void
+    spaces(reader)
+    if take(reader, 35)
+        while reader.position [0] < reader.input.length and current(reader) != 10 and current(reader) != 13
+            move(reader, 1)
+    if reader.position [0] < reader.input.length and not newline(reader)
+        error(reader, "expected manifest end of line")
+
+fn hex_value(value: i64) -> i64
+    if value >= 48 and value <= 57
+        return value - 48
+    if value >= 65 and value <= 70
+        return value - 55
+    if value >= 97 and value <= 102
+        return value - 87
+    return -1
+
+fn unicode_escape(reader: ManifestReader, width: i64) -> string
+    let mut point = 0
+    for index in 0 .. width
+        let digit = hex_value(current(reader))
+        if reader.position [0] >= reader.input.length or digit < 0
+            error(reader, "invalid Unicode escape")
+            return ""
+        point = point * 16 + digit
+        move(reader, 1)
+    if point > 1114111 or (point >= 55296 and point <= 57343)
+        error(reader, "Unicode escape must name a scalar value")
+        return ""
+    if point < 65536
+        return nerv.string.concat("\\u", sha256.hex_number(point, 4))
+    let high = 55296 + (point - 65536) / 1024
+    let low = 56320 + (point - 65536) % 1024
+    join_text(["\\u", sha256.hex_number(high, 4), "\\u", sha256.hex_number(low, 4)], "")
+
+fn fragment(value: string) -> string
+    let json = nerv.json.string(value)
+    nerv.string.slice(json, 1, nerv.string.len(json) - 1)
+
+fn decoded(value: Json) -> string => json_text(value, "")
+
+fn invalid_string(reader: ManifestReader, value: JsonError) -> string
+    error(reader, value.message)
+    ""
+
+fn decode_string(reader: ManifestReader, text: string) -> string
+    match json_parse(text)
+        Ok(value) => decoded(value)
+        Err(value) => invalid_string(reader, value)
+
+fn string(reader: ManifestReader) -> string
+    let quote = current(reader)
+    if quote != 34 and quote != 39
+        error(reader, "manifest values must be strings or path tables")
+        return ""
+    move(reader, 1)
+    let triple = reader.input:at(reader.position [0]) == quote and reader.input:at(reader.position [0] + 1) == quote
+    if triple
+        move(reader, 2)
+        let first_newline = newline(reader)
+    let mut pieces = buffer("")
+    while not failed(reader) and reader.position [0] < reader.input.length
+        let value = current(reader)
+        if value == quote
+            if not triple or (reader.input:at(reader.position [0] + 1) == quote and reader.input:at(reader.position [0] + 2) == quote)
+                let width = if triple
+                    3
+                else
+                    1
+                move(reader, width)
+                if triple
+                    let mut extra = 0
+                    while current(reader) == quote and extra < 2
+                        pieces = pieces:push(fragment(reader.input:slice(reader.position [0], reader.position [0] + 1)))
+                        move(reader, 1)
+                        extra = extra + 1
+                let mut parts = [""] * pieces:len()
+                for index in 0 .. pieces:len()
+                    parts [index] = pieces:get(index)
+                return decode_string(reader, nerv.string.concat("\"", nerv.string.concat(join_text(parts, ""), "\"")))
+        if value == 10 or value == 13
+            if not triple
+                error(reader, "newline in single-line manifest string")
+                return ""
+            newline(reader)
+            pieces = pieces:push("\\n")
+            continue
+        if value < 32 and value != 9 or value == 127
+            error(reader, "control character in manifest string")
+            return ""
+        if value == 92 and quote == 34
+            move(reader, 1)
+            if triple and (current(reader) == 10 or current(reader) == 13 or current(reader) == 32 or current(reader) == 9)
+                spaces(reader)
+                if not newline(reader)
+                    error(reader, "invalid multiline string continuation")
+                    return ""
+                while not failed(reader)
+                    spaces(reader)
+                    if not newline(reader)
+                        break
+                continue
+            let escape = current(reader)
+            move(reader, 1)
+            if escape == 117 or escape == 85
+                let width = if escape == 117
+                    4
+                else
+                    8
+                pieces = pieces:push(unicode_escape(reader, width))
+                continue
+            let allowed = [34, 92, 98, 116, 110, 102, 114]
+            let mut valid = false
+            for index in 0 .. nerv.arrays.len(allowed)
+                valid = valid or escape == allowed [index]
+            if not valid
+                error(reader, "unsupported manifest string escape")
+                return ""
+            pieces = pieces:push(nerv.string.concat("\\", reader.input:slice(reader.position [0] - 1, reader.position [0])))
+            continue
+        let start = reader.position [0]
+        move(reader, 1)
+        pieces = pieces:push(fragment(reader.input:slice(start, reader.position [0])))
+    error(reader, "unterminated manifest string")
+    ""
+
+fn key(reader: ManifestReader) -> string
+    spaces(reader)
+    if current(reader) == 34 or current(reader) == 39
+        if reader.input:at(reader.position [0] + 1) == current(reader) and reader.input:at(reader.position [0] + 2) == current(reader)
+            error(reader, "manifest keys require single-line strings")
+            return ""
+        let value = string(reader)
+        if nerv.string.contains(value, ".") == 1
+            error(reader, "quoted manifest keys cannot contain dots")
+        return value
+    let start = reader.position [0]
+    while reader.position [0] < reader.input.length
+        let value = current(reader)
+        if not ((value >= 65 and value <= 90) or (value >= 97 and value <= 122) or (value >= 48 and value <= 57) or value == 95 or value == 45)
+            break
+        move(reader, 1)
+    if reader.position [0] == start
+        error(reader, "expected manifest key")
+    reader.input:slice(start, reader.position [0])
+
+fn key_path(reader: ManifestReader) -> string
+    let mut result = key(reader)
+    spaces(reader)
+    while take(reader, 46)
+        result = nerv.string.concat(result, nerv.string.concat(".", key(reader)))
+        spaces(reader)
+    result
+
+fn qualified(prefix: string, name: string) -> string
+    if prefix == ""
+        return name
+    nerv.string.concat(prefix, nerv.string.concat(".", name))
+
+fn record(reader: ManifestReader, name: string, value: string, table: bool, start: i64) -> void
+    if failed(reader)
+        return
+    let mut names = reader.leaves
+    let mut tables = reader.tables
+    let parts = split_text(name, ".")
+    let mut prefix = ""
+    for index in 0 .. nerv.arrays.len(parts)
+        prefix = qualified(prefix, parts [index])
+        if reader.sealed [0]:contains(prefix) or (index + 1 < nerv.arrays.len(parts) and names [0]:contains(prefix))
+            error(reader, "cannot extend a manifest value or inline table")
+            return
+    if not table
+        for index in 0 .. reader.entries [0]:len()
+            if nerv.string.starts_with(reader.entries [0]:get(index).key, nerv.string.concat(name, ".")) == 1
+                error(reader, "manifest value conflicts with an existing table")
+                return
+    if names [0]:contains(name) or tables [0]:contains(name)
+        error(reader, "duplicate manifest key or table")
+        return
+    if table
+        tables [0] = tables [0]:insert(name)
+    else
+        names [0] = names [0]:insert(name)
+    let mut entries = reader.entries
+    entries [0] = entries [0]:push(ManifestEntry { key: name, value: value, table: table, start: start })
+
+fn dotted_tables(reader: ManifestReader, section: string, name: string) -> void
+    let parts = split_text(name, ".")
+    let mut prefix = section
+    let mut tables = reader.tables
+    for index in 0 .. nerv.arrays.len(parts) - 1
+        prefix = qualified(prefix, parts [index])
+        tables [0] = tables [0]:insert(prefix)
+
+fn value(reader: ManifestReader, name: string, start: i64, depth: i64) -> void
+    if depth > 8
+        error(reader, "manifest table nesting limit exceeded")
+        return
+    spaces(reader)
+    if take(reader, 123)
+        record(reader, name, "", true, start)
+        spaces(reader)
+        if not take(reader, 125)
+            while not failed(reader)
+                let member = key_path(reader)
+                expect(reader, 61)
+                dotted_tables(reader, name, member)
+                value(reader, qualified(name, member), start, depth + 1)
+                spaces(reader)
+                if not take(reader, 44)
+                    break
+                spaces(reader)
+            expect(reader, 125)
+        let mut sealed = reader.sealed
+        sealed [0] = sealed [0]:insert(name)
+        return
+    let text = string(reader)
+    record(reader, name, text, false, start)
+
+fn document(reader: ManifestReader) -> void
+    if current(reader) == 65279
+        move(reader, 1)
+    let mut section = ""
+    blank_lines(reader)
+    while not failed(reader) and reader.position [0] < reader.input.length
+        let start = reader.input.offsets [reader.position [0]]
+        if take(reader, 91)
+            section = key_path(reader)
+            expect(reader, 93)
+            record(reader, section, "", true, start)
+        else
+            let name = key_path(reader)
+            expect(reader, 61)
+            dotted_tables(reader, section, name)
+            value(reader, qualified(section, name), start, 0)
+        line_end(reader)
+        blank_lines(reader)
+
+fn identifier(text: string) -> bool
+    let input = source.load_source(text)
+    if input.length == 0
+        return false
+    for index in 0 .. input.length
+        let value = input:at(index)
+        if not ((value >= 65 and value <= 90) or (value >= 97 and value <= 122) or value == 95 or (index > 0 and value >= 48 and value <= 57))
+            return false
+    true
+
+fn compare(left: string, right: string) -> i64
+    let a = source.load_source(left)
+    let b = source.load_source(right)
+    let mut index = 0
+    while index < a.length and index < b.length
+        if a:at(index) < b:at(index)
+            return -1
+        if a:at(index) > b:at(index)
+            return 1
+        index = index + 1
+    if a.length == b.length
+        return 0
+    if a.length < b.length
+        return -1
+    1
+
+fn version(text: string) -> bool
+    let parts = split_text(text, ".")
+    if nerv.arrays.len(parts) != 3
+        return false
+    for index in 0 .. 3
+        let input = source.load_source(parts [index])
+        let mut position = 0
+        if input:at(0) == 43
+            position = 1
+        let start = position
+        while position < input.length
+            if input:at(position) < 48 or input:at(position) > 57
+                return false
+            position = position + 1
+        if position == start
+            return false
+        let mut first = start
+        while first < input.length - 1 and input:at(first) == 48
+            first = first + 1
+        let number = input:slice(first, input.length)
+        if nerv.string.len(number) > 20 or (nerv.string.len(number) == 20 and compare(number, "18446744073709551615") > 0)
+            return false
+    true
+
+fn valid_source(text: string) -> bool
+    if path(text):is_absolute() or nerv.string.starts_with(text, "/") == 1 or nerv.string.starts_with(text, "\\") == 1
+        return false
+    if nerv.string.len(text) >= 2 and nerv.string.slice(text, 1, 2) == ":"
+        return false
+    let parts = split_text(nerv.string.replace(text, "\\", "/"), "/")
+    for index in 0 .. nerv.arrays.len(parts)
+        if parts [index] == ".."
+            return false
+    let name = parts [nerv.arrays.len(parts) - 1]
+    nerv.string.len(name) > 5 and nerv.string.ends_with(name, ".nerv") == 1
+
+fn find_entry(entries: Buffer<ManifestEntry>, key: string) -> i64
+    for index in 0 .. entries:len()
+        if entries:get(index).key == key
+            return index
+    return -1
+
+fn field(entries: Buffer<ManifestEntry>, key: string, fallback: string) -> string
+    let index = find_entry(entries, key)
+    if index < 0
+        return fallback
+    entries:get(index).value
+
+fn schema(reader: ManifestReader, root: string, raw: string) -> Result<Package, ProjectError>
+    let entries = reader.entries [0]
+    let name = field(entries, "package.name", "")
+    let release = field(entries, "package.version", "")
+    if not identifier(name) or name == "nerv"
+        error(reader, "package name must be an identifier other than nerv")
+    if not version(release)
+        error(reader, "package version must have three numeric u64 components")
+    let entry = field(entries, "package.entry", "src/main.nerv")
+    let library = field(entries, "package.lib", "src/lib.nerv")
+    if not valid_source(entry) or not valid_source(library)
+        error(reader, "package source paths must be relative .nerv paths without parent traversal")
+    let mut dependencies = buffer(DependencySpec { alias: "", path: "" })
+    let mut aliases = set()
+    for index in 0 .. entries:len()
+        let item = entries:get(index)
+        let parts = split_text(item.key, ".")
+        let mut valid = false
+        if item.table and (item.key == "package" or item.key == "dependencies")
+            valid = true
+        if nerv.arrays.len(parts) == 2 and parts [0] == "package" and not item.table
+            valid = parts [1] == "name" or parts [1] == "version" or parts [1] == "entry" or parts [1] == "lib"
+        if nerv.arrays.len(parts) >= 2 and parts [0] == "dependencies"
+            let alias = parts [1]
+            if not identifier(alias) or alias == "nerv" or alias == name
+                error(reader, "invalid dependency alias")
+            if item.table and nerv.arrays.len(parts) == 2
+                valid = true
+                if find_entry(entries, qualified(item.key, "path")) < 0
+                    error(reader, "dependency requires a path string")
+            if not item.table and nerv.arrays.len(parts) == 3 and parts [2] == "path"
+                valid = true
+                if not aliases:contains(alias)
+                    dependencies = dependencies:push(DependencySpec { alias: alias, path: item.value })
+                    aliases = aliases:insert(alias)
+        if not valid
+            error(reader, nerv.string.concat("unknown or invalid manifest key: ", item.key))
+    if failed(reader)
+        return Err(reader.errors [0]:get(0))
+    Ok(Package { root: root, name: name, version: release, entry:path(root):join(entry).text, library:path(root):join(library).text, manifest: raw, dependencies: dependencies })
+
+fn parse(text: string, file: string, root: string) -> Result<Package, ProjectError>
+    let reader = ManifestReader { input: source.load_source(text), file: file, position: [0], entries: [buffer(ManifestEntry { key: "", value: "", table: false, start: 0 })], tables: [set()], leaves: [set()], sealed: [set()], errors: [buffer(ProjectError { path: file, start: 0, end: 0, message: "" })] }
+    document(reader)
+    if failed(reader)
+        return Err(reader.errors [0]:get(0))
+    schema(reader, root, text)

@@ -1,0 +1,71 @@
+import nerv.std
+import nerv.json
+
+fn configuration() -> string
+    let args = arguments()
+    let bundled = path(nerv.ffi.executable()):parent():join("native.json").text
+    let fallback = if result_or(path_exists(path(bundled)), false)
+        bundled
+    else
+        "target/native.json"
+    option_or(environment("NERV_NATIVE_CONFIG"), fallback)
+
+fn text_field(value: Json, name: string) -> string
+    json_text(result_or(json_get(value, name), json_null()), "")
+
+fn link(config: Json, object: string, output: string) -> string
+    let executable = resolve(text_field(config, "linker"))
+    let root = resolve(text_field(config, "root"))
+    let runtime = resolve(text_field(config, "runtime"))
+    let templates = result_or(json_get(config, "arguments"), json_null())
+    let libraries = result_or(json_get(config, "native_libraries"), json_null())
+    if executable == "" or runtime == "" or json_kind(templates) != "array" or json_kind(libraries) != "array"
+        return "invalid native linker configuration"
+    let mut args = buffer("")
+    for index in 0 .. json_len(templates)
+        let value = json_text(result_or(json_index(templates, index), json_null()), "")
+        if value == "{native-libs}"
+            for offset in 0 .. json_len(libraries)
+                args = args:push(json_text(result_or(json_index(libraries, offset), json_null()), ""))
+        else
+            let with_root = nerv.string.replace(value, "{root}", root)
+            let with_object = nerv.string.replace(with_root, "{object}", object)
+            let with_runtime = nerv.string.replace(with_object, "{runtime}", runtime)
+            args = args:push(nerv.string.replace(with_runtime, "{output}", output))
+    let mut values = [""] * args:len()
+    for index in 0 .. args:len()
+        values [index] = args:get(index)
+    let status = nerv.ffi.run(executable, values)
+    if status != 0
+        return nerv.string.concat("linker failed with exit code ", integer_text(status))
+    ""
+
+fn invalid_json(error: JsonError) -> string => error.message
+fn read_failure(error: IoError) -> string => error.message
+
+fn parse_configuration(text: string, object: string, output: string) -> string
+    match json_parse(text)
+        Ok(config) => link(config, object, output)
+        Err(error) => invalid_json(error)
+
+fn executable(object: string, output: string) -> string
+    match read_text(configuration())
+        Ok(text) => parse_configuration(text, object, output)
+        Err(error) => read_failure(error)
+
+fn resolve(value: string) -> string
+    if value == "" or path(value):is_absolute()
+        return value
+    path(configuration()):parent():join(value).text
+
+fn llvm_library() -> string
+    let args = arguments()
+    let directory = path(nerv.ffi.executable()):parent()
+    let names = ["LLVM-C.dll", "libLLVM-23.dylib", "libLLVM-23.so"]
+    let mut fallback = "LLVM-C.dll"
+    for index in 0 .. nerv.arrays.len(names)
+        let file = directory:join(names [index])
+        if result_or(path_exists(file), false)
+            fallback = file.text
+            break
+    option_or(environment("NERV_LLVM"), fallback)

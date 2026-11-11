@@ -1,0 +1,67 @@
+import nerv.std
+import ir
+import generics_test
+
+test "generic layouts and methods have distinct concrete owners"
+    let text = "struct Box<T>\n    value: T\n    fn get(self) -> T => self.value\nfn main()\n    let a: Box<i64> = Box { value: 42 }\n    let b: Box<bool> = Box { value: true }\n    println(a:get())\n    println(b:get())\n"
+    let program = generics_test.generic_program(text)
+    let mut owners = buffer(0)
+    for index in 0 .. program.types:len()
+        let ty = program.types:get(index)
+        if ty.tag == NominalType()
+            owners = owners:push(ty.nominal)
+    assert(owners:len() == 2)
+    assert(owners:get(0) != owners:get(1))
+    assert(program.functions:len() == 3)
+    let mut methods = 0
+    for index in 0 .. program.symbols:len()
+        let symbol = program.symbols:get(index)
+        if symbol.category == "function" and symbol.name == "get"
+            methods = methods + 1
+            assert(symbol.owner == owners:get(0) or symbol.owner == owners:get(1))
+    assert(methods == 2)
+
+test "constructor fields retain source evaluation order and resolved slots"
+    let text = "struct Pair<T>\n    first: T\n    second: T\nfn left() -> i64 => 1\nfn right() -> i64 => 2\nfn main() -> i64\n    let p = Pair { second: right(), first: left() }\n    p.first\n"
+    let program = generics_test.generic_program(text)
+    let mut found = false
+    for index in 0 .. program.nodes:len()
+        let node = program.nodes:get(index)
+        if node.op == StructIR()
+            found = true
+            let second = program.nodes:get(node.children:get(0))
+            let first = program.nodes:get(node.children:get(1))
+            assert(second.slot == 1)
+            assert(first.slot == 0)
+            let right_call = program.nodes:get(second.children:get(0))
+            let left_call = program.nodes:get(first.children:get(0))
+            assert(program.symbols:get(right_call.symbol).name == "right")
+            assert(program.symbols:get(left_call.symbol).name == "left")
+    assert(found)
+
+test "generic option and result propagation resolves concrete failure constructors"
+    let text = "enum Result<T, E>\n    Ok(T)\n    Err(E)\nfn change(x: Result<i64, string>) -> Result<string, string>\n    let n = x?\n    Ok(\"value\")\n"
+    let program = generics_test.generic_program(text)
+    let mut found = false
+    for index in 0 .. program.nodes:len()
+        let node = program.nodes:get(index)
+        if node.op == TryIR()
+            found = true
+            assert(node.type_id == 2)
+            let failure = program.symbols:get(node.symbol)
+            assert(failure.category == "variant")
+            assert(failure.name == "Err")
+            assert(node.slot == 1)
+    assert(found)
+
+test "invalid instances and incompatible propagation fail"
+    assert(generics_test.generic_rejects("struct Box<T>\n    value: T\nfn main()\n    let b: Box<bool> = Box { value: 42 }\n"))
+    assert(generics_test.generic_rejects("struct Box<T>\n    value: T\nstruct Box\n    value: i64\n"))
+    assert(generics_test.generic_rejects("enum Result<T, E>\n    Ok(T)\n    Err(E)\nfn f(x: Result<i64, string>) -> Result<i64, bool>\n    let n = x?\n    Ok(n)\n"))
+    assert(generics_test.generic_rejects("enum Option<T>\n    Some(T)\n    None\nfn f()\n    let n = None()\n"))
+
+test "generic recursive layouts allow arrays and reject by-value cycles"
+    let text = "struct Node<T>\n    value: T\n    children: []Node<T>\nfn count(x: Node<i64>) -> i64 => nerv.arrays.len(x.children)\n"
+    let program = generics_test.generic_program(text)
+    assert(program.functions:len() == 1)
+    assert(generics_test.generic_rejects("struct Node<T>\n    value: Node<T>\nfn visit(x: Node<i64>)\n    println(0)\n"))

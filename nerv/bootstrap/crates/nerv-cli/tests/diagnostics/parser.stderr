@@ -1,0 +1,4 @@
+parser.nerv:1:21: error: expected expression
+  |
+1 | fn main() -> i64 => )
+  |                     ^

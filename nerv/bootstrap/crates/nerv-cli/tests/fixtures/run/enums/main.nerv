@@ -1,0 +1,8 @@
+enum Choice
+    Some(i64)
+    None
+
+fn main() -> i64
+    match Some(42)
+        Some(value) => value
+        None => 0

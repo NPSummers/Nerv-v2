@@ -1,0 +1,4 @@
+enum Payload
+    Text(void)
+
+fn main() -> i64 => 0

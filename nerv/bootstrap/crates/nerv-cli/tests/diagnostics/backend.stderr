@@ -1,0 +1,4 @@
+backend.nerv:2:5: error: enum payload cannot have type void
+  |
+2 |     Text(void)
+  |     ^^^^^^^^^^

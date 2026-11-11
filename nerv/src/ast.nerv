@@ -1,0 +1,119 @@
+import nerv.std
+
+enum NodeTag
+    ModuleNode
+    ImportNode
+    ModuleNameNode
+    FunctionNode
+    ParameterNode
+    GenericsNode
+    GenericNode
+    StructNode
+    EnumNode
+    VariantNode
+    TraitNode
+    ImplNode
+    FieldNode
+    TypeNameNode
+    ArrayTypeNode
+    FunctionTypeNode
+    AppliedTypeNode
+    BlockNode
+    LetNode
+    AssignNode
+    ReturnNode
+    BreakNode
+    ContinueNode
+    WhileNode
+    ForNode
+    ExprStatementNode
+    IntegerNode
+    FloatNode
+    StringNode
+    BooleanNode
+    NameNode
+    UnaryNode
+    BinaryNode
+    CallNode
+    MemberNode
+    MethodNode
+    IndexNode
+    ConstructNode
+    InitializerNode
+    ArrayNode
+    RepeatNode
+    TryNode
+    IfNode
+    MatchNode
+    ArmNode
+    LambdaNode
+
+fn tag_name(tag: NodeTag) -> string
+    match tag
+        ModuleNode => "Module"
+        ImportNode => "Import"
+        ModuleNameNode => "ModuleName"
+        FunctionNode => "Function"
+        ParameterNode => "Parameter"
+        GenericsNode => "Generics"
+        GenericNode => "Generic"
+        StructNode => "Struct"
+        EnumNode => "Enum"
+        VariantNode => "Variant"
+        TraitNode => "Trait"
+        ImplNode => "Impl"
+        FieldNode => "Field"
+        TypeNameNode => "TypeName"
+        ArrayTypeNode => "ArrayType"
+        FunctionTypeNode => "FunctionType"
+        AppliedTypeNode => "AppliedType"
+        BlockNode => "Block"
+        LetNode => "Let"
+        AssignNode => "Assign"
+        ReturnNode => "Return"
+        BreakNode => "Break"
+        ContinueNode => "Continue"
+        WhileNode => "While"
+        ForNode => "For"
+        ExprStatementNode => "ExprStatement"
+        IntegerNode => "Integer"
+        FloatNode => "Float"
+        StringNode => "String"
+        BooleanNode => "Boolean"
+        NameNode => "Name"
+        UnaryNode => "Unary"
+        BinaryNode => "Binary"
+        CallNode => "Call"
+        MemberNode => "Member"
+        MethodNode => "Method"
+        IndexNode => "Index"
+        ConstructNode => "Construct"
+        InitializerNode => "Initializer"
+        ArrayNode => "Array"
+        RepeatNode => "Repeat"
+        TryNode => "Try"
+        IfNode => "If"
+        MatchNode => "Match"
+        ArmNode => "Arm"
+        LambdaNode => "Lambda"
+
+struct Node
+    tag: NodeTag
+    text: string
+    start: i64
+    end: i64
+    children: Buffer<i64>
+
+struct Ast
+    nodes: Buffer<Node>
+    root: i64
+
+struct SyntaxError
+    start: i64
+    end: i64
+    line: i64
+    column: i64
+    message: string
+
+fn empty_node() -> Node
+    Node { tag:ModuleNode(), text: "", start: 0, end: 0, children:buffer(0) }

@@ -1,0 +1,110 @@
+import nerv.std
+import source
+
+fn power(bits: i64) -> i64
+    let mut value = 1
+    for index in 0 .. bits
+        value = value * 2
+    value
+
+fn mix(a: i64, b: i64, c: i64, mode: i64) -> i64
+    let mut x = a
+    let mut y = b
+    let mut z = c
+    let mut weight = 1
+    let mut result = 0
+    for index in 0 .. 32
+        let sum = x % 2 + y % 2 + z % 2
+        let mut bit = sum % 2
+        if mode == 1
+            bit = if x % 2 == 1
+                y % 2
+            else
+                z % 2
+        if mode == 2
+            bit = if sum >= 2
+                1
+            else
+                0
+        result = result + bit * weight
+        x = x / 2
+        y = y / 2
+        z = z / 2
+        weight = weight * 2
+    result
+
+fn rotate(value: i64, bits: i64) -> i64
+    value / power(bits) + value % power(bits) * power(32 - bits)
+
+fn hex_number(value: i64, width: i64) -> string
+    let alphabet = "0123456789abcdef"
+    let mut digits = [""] * width
+    let mut remaining = value
+    for index in 0 .. width
+        let digit = remaining % 16
+        digits [width - index - 1] = nerv.string.slice(alphabet, digit, digit + 1)
+        remaining = remaining / 16
+    join_text(digits, "")
+
+fn utf8(text: string) -> Buffer<i64>
+    let input = source.load_source(text)
+    let mut bytes = buffer(0)
+    for index in 0 .. input.length
+        let point = input:at(index)
+        if point < 128
+            bytes = bytes:push(point)
+            continue
+        if point < 2048
+            bytes = bytes:push(192 + point / 64):push(128 + point % 64)
+            continue
+        if point < 65536
+            bytes = bytes:push(224 + point / 4096):push(128 + point / 64 % 64):push(128 + point % 64)
+            continue
+        bytes = bytes:push(240 + point / 262144):push(128 + point / 4096 % 64):push(128 + point / 64 % 64):push(128 + point % 64)
+    bytes
+
+fn hash(text: string) -> string
+    let mut bytes = utf8(text)
+    let bit_length = bytes:len() * 8
+    bytes = bytes:push(128)
+    while bytes:len() % 64 != 56
+        bytes = bytes:push(0)
+    for index in 0 .. 8
+        bytes = bytes:push(bit_length / power((7 - index) * 8) % 256)
+    let mut state = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+    let constants = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]
+    for block in 0 .. bytes:len() / 64
+        let mut words = [0] * 64
+        for index in 0 .. 16
+            let offset = block * 64 + index * 4
+            words [index] = bytes:get(offset) * 16777216 + bytes:get(offset + 1) * 65536 + bytes:get(offset + 2) * 256 + bytes:get(offset + 3)
+        for index in 16 .. 64
+            let x = words [index - 15]
+            let y = words [index - 2]
+            let small0 = mix(rotate(x, 7), rotate(x, 18), x / 8, 0)
+            let small1 = mix(rotate(y, 17), rotate(y, 19), y / 1024, 0)
+            words [index] = (words [index - 16] + small0 + words [index - 7] + small1) % 4294967296
+        let mut work = [0] * 8
+        for index in 0 .. 8
+            work [index] = state [index]
+        for index in 0 .. 64
+            let big1 = mix(rotate(work [4], 6), rotate(work [4], 11), rotate(work [4], 25), 0)
+            let choose = mix(work [4], work [5], work [6], 1)
+            let first = (work [7] + big1 + choose + constants [index] + words [index]) % 4294967296
+            let big0 = mix(rotate(work [0], 2), rotate(work [0], 13), rotate(work [0], 22), 0)
+            let majority = mix(work [0], work [1], work [2], 2)
+            let second = (big0 + majority) % 4294967296
+            work [7] = work [6]
+            work [6] = work [5]
+            work [5] = work [4]
+            work [4] = (work [3] + first) % 4294967296
+            work [3] = work [2]
+            work [2] = work [1]
+            work [1] = work [0]
+            work [0] = (first + second) % 4294967296
+        for index in 0 .. 8
+            state [index] = (state [index] + work [index]) % 4294967296
+    let mut result = [""] * 8
+    for index in 0 .. 8
+        result [index] = hex_number(state [index], 8)
+    join_text(result, "")

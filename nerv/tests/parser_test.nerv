@@ -1,0 +1,98 @@
+import nerv.std
+import ast
+import parser
+
+fn bad_tree(error: SyntaxError) -> Ast
+    println(error.message)
+    assert(false)
+    Ast { nodes:buffer(empty_node()), root: - 1 }
+
+fn checked_tree(text: string) -> Ast
+    match parser.parse(text)
+        Ok(tree) => tree
+        Err(error) => bad_tree(error)
+
+fn rejects(text: string) -> bool
+    match parser.parse(text)
+        Ok(tree) => false
+        Err(error) => true
+
+fn error_offset(error: SyntaxError) -> i64 => error.start
+
+fn count_tag(tree: Ast, tag: NodeTag) -> i64
+    let mut count = 0
+    for index in 0 .. tree.nodes:len()
+        if tree.nodes:get(index).tag == tag
+            count = count + 1
+    count
+
+test "multiplication binds tighter than addition"
+    let tree = checked_tree("fn main() -> i64 => 1 + 2 * 3\n")
+    let root = tree.nodes:get(tree.root)
+    let function = tree.nodes:get(root.children:get(0))
+    let add = tree.nodes:get(function.children:get(function.children:len() - 1))
+    assert(add.tag == BinaryNode())
+    assert(add.text == "Plus")
+    let multiply = tree.nodes:get(add.children:get(1))
+    assert(multiply.tag == BinaryNode())
+    assert(multiply.text == "Star")
+    assert(multiply.start == 24)
+    assert(multiply.end == 29)
+
+test "generic declarations and nested function types"
+    let tree = checked_tree("fn apply<T>(f: fn(T) -> T, value: T) -> T => f(value)\n")
+    assert(count_tag(tree, GenericNode()) == 1)
+    assert(count_tag(tree, FunctionTypeNode()) == 1)
+    assert(count_tag(tree, ParameterNode()) == 2)
+    assert(count_tag(tree, CallNode()) == 1)
+
+test "structs methods and enum payloads"
+    let text = "struct Box<T>\n    value: T\n    fn get(self) -> T => self.value\nenum Choice<T>\n    Yes(T)\n    No\n"
+    let tree = checked_tree(text)
+    assert(count_tag(tree, StructNode()) == 1)
+    assert(count_tag(tree, EnumNode()) == 1)
+    assert(count_tag(tree, VariantNode()) == 2)
+    assert(count_tag(tree, FieldNode()) == 1)
+
+test "loop exits and indexed assignment"
+    let text = "fn main()\n    let mut a = [1, 2]\n    for i in 0 ..= 2\n        if i == 1\n            continue\n        a[0] = i\n        break\n    return\n"
+    let tree = checked_tree(text)
+    assert(count_tag(tree, ForNode()) == 1)
+    assert(count_tag(tree, IfNode()) == 1)
+    assert(count_tag(tree, ContinueNode()) == 1)
+    assert(count_tag(tree, AssignNode()) == 1)
+    assert(count_tag(tree, ReturnNode()) == 1)
+
+test "closures and propagation"
+    let tree = checked_tree("fn main()\n    let f = fn(x: i64) -> i64 => x + 1\n    result()?\n")
+    assert(count_tag(tree, LambdaNode()) == 1)
+    assert(count_tag(tree, TryNode()) == 1)
+
+test "syntax errors reject rather than returning a partial tree"
+    assert(rejects("fn main( => 1"))
+    assert(rejects("fn main()\n    1 = 2\n"))
+    assert(rejects("fn main() => [1,]\n"))
+    assert(rejects("fn main() => \"bad\\q\"\n"))
+    assert(rejects("fn main() => 9223372036854775808\n"))
+    assert(rejects("fn f<T, T>() => 0\n"))
+
+test "integer minimum and unicode source spans"
+    let tree = checked_tree("fn main()\n    let text = \"é\"\n    -9223372036854775808\n")
+    assert(count_tag(tree, IntegerNode()) == 1)
+    for index in 0 .. tree.nodes:len()
+        let node = tree.nodes:get(index)
+        assert(node.start >= 0 and node.end >= node.start)
+        for offset in 0 .. node.children:len()
+            assert(node.children:get(offset) < index)
+
+test "unexpected eof retains its source location"
+    let location = match parser.parse("fn main(")
+        Ok(tree) => -1
+        Err(error) => error_offset(error)
+    assert(location == 8)
+
+test "excessive nesting returns a syntax error"
+    let left = nerv.string.repeat("(", 150)
+    let right = nerv.string.repeat(")", 150)
+    let text = join_text(["fn main() => ", left, "0", right], "")
+    assert(rejects(text))

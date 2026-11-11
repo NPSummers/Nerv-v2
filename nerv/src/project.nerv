@@ -1,0 +1,327 @@
+import nerv.std
+import nerv.json
+import manifest
+import sha256
+
+struct Project
+    packages: Buffer<Package>
+
+struct ProjectState
+    packages: []Buffer<Package>
+    status: []Buffer<i64>
+    errors: []Buffer<ProjectError>
+
+fn failed(state: ProjectState) -> bool => state.errors [0]:len() > 0
+
+fn fail(state: ProjectState, file: string, message: string) -> void
+    if not failed(state)
+        let mut errors = state.errors
+        errors [0] = errors [0]:push(ProjectError { path: file, start: 0, end: 0, message: message })
+
+fn io_error(state: ProjectState, file: string, error: IoError) -> string
+    fail(state, file, error.message)
+    ""
+
+fn canonical(state: ProjectState, file: string) -> string
+    match path(file):canonicalize()
+        Ok(value) => value.text
+        Err(error) => io_error(state, file, error)
+
+fn read(state: ProjectState, file: string) -> string
+    match read_text(file)
+        Ok(value) => value
+        Err(error) => io_error(state, file, error)
+
+fn manifest_error(state: ProjectState, error: ProjectError) -> Package
+    if not failed(state)
+        let mut errors = state.errors
+        errors [0] = errors [0]:push(error)
+    manifest.empty_package()
+
+fn parse_package(state: ProjectState, root: string, text: string) -> Package
+    match manifest.parse(text, path(root):join("Nerv.toml").text, root)
+        Ok(package) => package
+        Err(error) => manifest_error(state, error)
+
+fn is_file(file: string) -> bool
+    match file_metadata(path(file))
+        Ok(info) => info.is_file
+        Err(error) => false
+
+fn is_directory(file: string) -> bool
+    match file_metadata(path(file))
+        Ok(info) => info.is_directory
+        Err(error) => false
+
+fn visit(state: ProjectState, requested: string) -> i64
+    if failed(state)
+        return -1
+    let root = canonical(state, requested)
+    if failed(state)
+        return -1
+    for index in 0 .. state.packages [0]:len()
+        if state.packages [0]:get(index).root == root
+            if state.status [0]:get(index) == 1
+                fail(state, path(root):join("Nerv.toml").text, "dependency cycle")
+                return -1
+            return index
+    if state.packages [0]:len() >= 256
+        fail(state, root, "package graph limit exceeded")
+        return -1
+    let file = path(root):join("Nerv.toml").text
+    let text = read(state, file)
+    if nerv.string.len(text) > 1048576
+        fail(state, file, "manifest size limit exceeded")
+        return -1
+    let package = parse_package(state, root, text)
+    if failed(state)
+        return -1
+    let index = state.packages [0]:len()
+    let mut packages = state.packages
+    let mut status = state.status
+    packages [0] = packages [0]:push(package)
+    status [0] = status [0]:push(1)
+    let mut dependencies = buffer(DependencySpec { alias: "", path: "" })
+    for offset in 0 .. package.dependencies:len()
+        let dependency = package.dependencies:get(offset)
+        let target = path(root):join(dependency.path).text
+        let child = visit(state, target)
+        if child >= 0
+            let resolved = packages [0]:get(child)
+            if not is_file(resolved.library)
+                fail(state, file, nerv.string.concat("dependency needs a library entry: ", resolved.library))
+            dependencies = dependencies:push(DependencySpec { alias: dependency.alias, path: resolved.root })
+    if failed(state)
+        return -1
+    let mut values = packages [0].values
+    values [index] = Package { root: package.root, name: package.name, version: package.version, entry: package.entry, library: package.library, manifest: package.manifest, dependencies: dependencies }
+    let mut states = status [0].values
+    states [index] = 2
+    index
+
+fn discover(start: string) -> string
+    let mut directory = result_or(path(start):canonicalize(), path(start))
+    if not is_directory(start)
+        directory = directory:parent()
+    while directory.text != ""
+        let file = directory:join("Nerv.toml").text
+        if is_file(file)
+            return file
+        let parent = directory:parent()
+        if parent.text == directory.text
+            break
+        directory = parent
+    ""
+
+fn normalized(text: string) -> string
+    let value = nerv.string.replace(text, "\\", "/")
+    if nerv.string.starts_with(value, "//?/UNC/") == 1
+        return nerv.string.concat("//", nerv.string.slice(value, 8, nerv.string.len(value)))
+    if nerv.string.starts_with(value, "//?/") == 1
+        return nerv.string.slice(value, 4, nerv.string.len(value))
+    value
+
+fn volume(text: string) -> string
+    let value = normalized(text)
+    if nerv.string.starts_with(value, "//") == 1
+        let parts = split_text(value, "/")
+        if nerv.arrays.len(parts) >= 4
+            return nerv.string.to_lower(join_text(["//", parts [2], "/", parts [3]], ""))
+    if nerv.string.len(value) >= 2 and nerv.string.slice(value, 1, 2) == ":"
+        return nerv.string.to_lower(nerv.string.slice(value, 0, 2))
+    "/"
+
+fn trimmed(text: string) -> string
+    let value = normalized(text)
+    let mut end = nerv.string.len(value)
+    while end > 0 and nerv.string.slice(value, end - 1, end) == "/"
+        end = end - 1
+    nerv.string.slice(value, 0, end)
+
+fn relative(state: ProjectState, root: string, target: string) -> string
+    if volume(root) != volume(target)
+        fail(state, root, "local dependencies must share a filesystem volume for portable locks")
+        return ""
+    let base = split_text(trimmed(root), "/")
+    let parts = split_text(trimmed(target), "/")
+    let mut common = 0
+    while common < nerv.arrays.len(base) and common < nerv.arrays.len(parts)
+        if base [common] != parts [common]
+            break
+        common = common + 1
+    let mut output = [""] * (nerv.arrays.len(base) - common + nerv.arrays.len(parts) - common)
+    let mut index = 0
+    for offset in common .. nerv.arrays.len(base)
+        output [index] = ".."
+        index = index + 1
+    for offset in common .. nerv.arrays.len(parts)
+        output [index] = parts [offset]
+        index = index + 1
+    join_text(output, "/")
+
+fn lock_text(state: ProjectState) -> string
+    let root = state.packages [0]:get(0).root
+    let mut names = [""] * state.packages [0]:len()
+    let mut order = [0] * state.packages [0]:len()
+    for index in 0 .. state.packages [0]:len()
+        let file = path(state.packages [0]:get(index).root):join("Nerv.toml").text
+        names [index] = relative(state, root, file)
+        order [index] = index
+        let mut offset = index
+        while offset > 0 and manifest.compare(names [order [offset - 1]], names [order [offset]]) > 0
+            let previous = order [offset - 1]
+            order [offset - 1] = order [offset]
+            order [offset] = previous
+            offset = offset - 1
+    let mut text = "version = 1\n"
+    for index in 0 .. nerv.arrays.len(order)
+        let package_id = order [index]
+        let package = state.packages [0]:get(package_id)
+        let fields = ["\n[[package]]\nchecksum = ", nerv.json.string(sha256.hash(package.manifest)), "\nmanifest = ", nerv.json.string(names [package_id]), "\nname = ", nerv.json.string(package.name), "\nversion = ", nerv.json.string(package.version), "\n\n[package.dependencies]\n"]
+        text = nerv.string.concat(text, join_text(fields, ""))
+        let mut aliases = [0] * package.dependencies:len()
+        for offset in 0 .. package.dependencies:len()
+            aliases [offset] = offset
+            let mut position = offset
+            while position > 0 and manifest.compare(package.dependencies:get(aliases [position - 1]).alias, package.dependencies:get(aliases [position]).alias) > 0
+                let previous = aliases [position - 1]
+                aliases [position - 1] = aliases [position]
+                aliases [position] = previous
+                position = position - 1
+        for offset in 0 .. nerv.arrays.len(aliases)
+            let dependency = package.dependencies:get(aliases [offset])
+            let destination = relative(state, root, path(dependency.path):join("Nerv.toml").text)
+            text = nerv.string.concat(text, join_text([dependency.alias, " = ", nerv.json.string(destination), "\n"], ""))
+    text
+
+fn record_write_error(state: ProjectState, file: string, error: IoError) -> bool
+    fail(state, file, error.message)
+    false
+
+fn write_temporary(state: ProjectState, file: string, text: string) -> bool
+    match write_text(file, text)
+        Ok(count) => true
+        Err(error) => record_write_error(state, file, error)
+
+fn replace_lock(state: ProjectState, temporary: string, target: string) -> bool
+    match rename_path(path(temporary), path(target))
+        Ok(done) => done
+        Err(error) => record_write_error(state, target, error)
+
+fn write_lock(state: ProjectState, file: string, text: string) -> void
+    let prefix = join_text([file, ".tmp-", integer_text(now_ms()), "-", integer_text(nerv.text.hash(file)), "-"], "")
+    let mut temporary = ""
+    for index in 0 .. 32
+        let candidate = nerv.string.concat(prefix, integer_text(index))
+        if not result_or(path_exists(path(candidate)), true)
+            temporary = candidate
+            break
+    if temporary == ""
+        fail(state, file, "cannot allocate temporary lockfile")
+        return
+    if write_temporary(state, temporary, text)
+        let replaced = replace_lock(state, temporary, file)
+    let cleanup = result_or(remove_file(path(temporary)), false)
+
+fn load(file: string, locked: bool) -> Result<Project, ProjectError>
+    let state = ProjectState { packages: [buffer(manifest.empty_package())], status: [buffer(0)], errors: [buffer(ProjectError { path: "", start: 0, end: 0, message: "" })] }
+    let manifest_path = canonical(state, file)
+    if not failed(state)
+        let root_id = visit(state, path(manifest_path):parent().text)
+    if not failed(state)
+        let text = lock_text(state)
+        let target = path(state.packages [0]:get(0).root):join("Nerv.lock").text
+        if not failed(state) and result_or(read_text(target), "") != text
+            if locked
+                fail(state, target, "Nerv.lock is missing or stale; resolve without --locked")
+            else
+                write_lock(state, target, text)
+    if failed(state)
+        return Err(state.errors [0]:get(0))
+    Ok(Project { packages: state.packages [0] })
+
+fn owner(project: Project, source: string) -> i64
+    let file = normalized(source)
+    let mut found = -1
+    let mut length = 0
+    for index in 0 .. project.packages:len()
+        let root = trimmed(project.packages:get(index).root)
+        let prefix = nerv.string.concat(root, "/")
+        if (file == root or nerv.string.starts_with(file, prefix) == 1) and nerv.string.len(root) > length
+            found = index
+            length = nerv.string.len(root)
+    found
+
+fn dependency_entry(project: Project, package_id: i64, alias: string) -> string
+    let package = project.packages:get(package_id)
+    if alias == package.name and is_file(package.library)
+        return package.library
+    for index in 0 .. package.dependencies:len()
+        let dependency = package.dependencies:get(index)
+        if dependency.alias == alias
+            for offset in 0 .. project.packages:len()
+                let child = project.packages:get(offset)
+                if child.root == dependency.path
+                    return child.library
+    ""
+
+fn import_target(project: Project, source: string, name: string) -> string
+    let package_id = owner(project, source)
+    if package_id < 0
+        return ""
+    let parts = split_text(name, ".")
+    let entry = dependency_entry(project, package_id, parts [0])
+    if entry == ""
+        return ""
+    if nerv.arrays.len(parts) == 1
+        return entry
+    let mut suffix = [""] * (nerv.arrays.len(parts) - 1)
+    for index in 1 .. nerv.arrays.len(parts)
+        suffix [index - 1] = parts [index]
+    path(entry):parent():join(nerv.string.concat(join_text(suffix, "/"), ".nerv")).text
+
+fn source_fallback(project: Project, file: string) -> string
+    let package_id = owner(project, file)
+    if package_id < 0
+        return path(file):parent().text
+    path(project.packages:get(package_id).root):join("src").text
+
+fn write_atomic(file: string, text: string) -> Result<bool, ProjectError>
+    let state = ProjectState { packages: [buffer(manifest.empty_package())], status: [buffer(0)], errors: [buffer(ProjectError { path: "", start: 0, end: 0, message: "" })] }
+    write_lock(state, file, text)
+    if failed(state)
+        return Err(state.errors [0]:get(0))
+    Ok(true)
+
+fn new_directory(state: ProjectState, file: string) -> void
+    match create_directory(file)
+        Ok(done) => discard_number(done)
+        Err(error) => fail(state, file, error.message)
+
+fn discard_number(value: i64) -> void
+    let discarded = value
+
+fn create(destination: string, library: bool) -> Result<Project, ProjectError>
+    let state = ProjectState { packages: [buffer(manifest.empty_package())], status: [buffer(0)], errors: [buffer(ProjectError { path: "", start: 0, end: 0, message: "" })] }
+    let name = path(destination):file_name()
+    if not manifest.identifier(name) or name == "nerv"
+        return Err(ProjectError { path: destination, start: 0, end: 0, message: "project name must be an identifier other than nerv" })
+    if result_or(path_exists(path(destination)), true)
+        return Err(ProjectError { path: destination, start: 0, end: 0, message: "project destination already exists" })
+    new_directory(state, path(destination):join("src").text)
+    let text = join_text(["[package]\nname = ", nerv.json.string(name), "\nversion = \"0.1.0\"\n\n[dependencies]\n"], "")
+    let config = path(destination):join("Nerv.toml").text
+    let manifest_written = write_temporary(state, config, text)
+    let ignore_written = write_temporary(state, path(destination):join(".gitignore").text, "/target/\n")
+    let entry = if library
+        "src/lib.nerv"
+    else
+        "src/main.nerv"
+    let source = if library
+        "fn answer() -> i64 => 42\n\ntest \"answer\"\n    assert(answer() == 42)\n"
+    else
+        "fn main() -> i64\n    println(\"Hello from Nerv\")\n    0\n\ntest \"arithmetic\"\n    assert(20 + 22 == 42)\n"
+    let source_written = write_temporary(state, path(destination):join(entry).text, source)
+    if failed(state)
+        return Err(state.errors [0]:get(0))
+    load(config, false)
