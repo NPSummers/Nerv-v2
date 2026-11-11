@@ -427,6 +427,7 @@ fn closure_value(b: Backend, item: CheckedNode) -> i64
     let closure = symbol(b, target).category == "lambda"
     let mut code = b.functions [target]
     let mut environment = llvm.ConstNull(b.api, pointer(b))
+    let mut mutable_captures = 0
     if not closure
         let parts = type_info(b, symbol(b, target).type_id).parts
         let ty = function_signature(b, symbol(b, target).type_id, true)
@@ -449,6 +450,9 @@ fn closure_value(b: Backend, item: CheckedNode) -> i64
         for index in 0 .. item.children:len()
             let id = item.children:get(index)
             fields [index] = b.types [node(b, id).type_id]
+            let tag = type_info(b, node(b, id).type_id).tag
+            if tag == ArrayType() or tag == NominalType() or ir.type_tag_name(tag) == "Function"
+                mutable_captures = 1
             values [index] = emit(b, id)
         let ty = aggregate(b, fields)
         environment = new_array(b, integer(b, 1), ty)
@@ -456,7 +460,7 @@ fn closure_value(b: Backend, item: CheckedNode) -> i64
         for index in 0 .. nerv.arrays.len(values)
             value = llvm.BuildInsertValue(b.api, b.builder, value, values [index], index, "capture")
         let instruction_440 = llvm.BuildStore(b.api, b.builder, value, element(b, environment, integer(b, 0), ty))
-    external(b, "nerv_closure_new", pointer(b), [pointer(b), pointer(b), b.types [2]], [code, environment, integer(b, 1)])
+    external(b, "nerv_closure_new", pointer(b), [pointer(b), pointer(b), b.types [2]], [code, environment, integer(b, mutable_captures)])
 
 fn propagation(b: Backend, item: CheckedNode) -> i64
     let input = node(b, item.children:get(0))

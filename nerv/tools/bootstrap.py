@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import tomllib
@@ -50,6 +51,11 @@ def main():
         archive_tool = cc.parent / ("llvm-ar.exe" if os.name == "nt" else "llvm-ar")
         if archive_tool.is_file():
             env["AR_" + target.replace("-", "_")] = str(archive_tool)
+    if platform.system() == "Darwin":
+        sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+        env["SDKROOT"] = sdk
+        flags_key = "CFLAGS_" + target.replace("-", "_")
+        env[flags_key] = (env.get(flags_key, "") + " -isysroot " + shlex.quote(sdk)).strip()
     source_snapshot = snapshot()
     command = ["cargo", "build", "--manifest-path", ROOT / "bootstrap/Cargo.toml", "--release", "--locked", "-p", "nerv", "--target", target, "--target-dir", ROOT / "target/bootstrap"]
     if args.offline:

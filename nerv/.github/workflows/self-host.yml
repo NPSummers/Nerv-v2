@@ -51,7 +51,8 @@ jobs:
         run: |
           if [ -f bootstrap/Cargo.toml ]; then echo 'path=.' >> "$GITHUB_OUTPUT"; else echo 'path=nerv' >> "$GITHUB_OUTPUT"; fi
           echo "NERV_REFERENCE=$GITHUB_WORKSPACE/.stage0-reference" >> "$GITHUB_ENV"
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: nativecache
         with:
           path: |
             ~/.cargo/registry
@@ -85,7 +86,10 @@ jobs:
           echo "LD_LIBRARY_PATH=$LLVM_SYS_231_PREFIX/lib" >> "$GITHUB_ENV"
           echo "DYLD_FALLBACK_LIBRARY_PATH=$LLVM_SYS_231_PREFIX/lib" >> "$GITHUB_ENV"
           echo "NERV_CC=$LLVM_SYS_231_PREFIX/bin/clang" >> "$GITHUB_ENV"
-          if [ "$RUNNER_OS" = macOS ]; then python .stage0-reference/tools/setup-toolchain.py macos; fi
+          if [ "$RUNNER_OS" = macOS ]; then
+            echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+            python .stage0-reference/tools/setup-toolchain.py macos
+          fi
       - name: Prepare native link plan
         working-directory: ${{ steps.source.outputs.path }}
         shell: bash
@@ -102,6 +106,7 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then compiler=target/stage3.exe; library="$LLVM_SYS_231_PREFIX/bin/LLVM-C.dll"; elif [ "$RUNNER_OS" = macOS ]; then compiler=target/stage3; library="$LLVM_SYS_231_PREFIX/lib/libLLVM-23.dylib"; else compiler=target/stage3; library="$LLVM_SYS_231_PREFIX/lib/libLLVM-23.so"; fi
+          cargo fetch --locked --manifest-path "$NERV_REFERENCE/Cargo.toml"
           python tools/package-portable.py --compiler "$compiler" --llvm-library "$library"
       - name: Build and test Windows installer
         if: runner.os == 'Windows'
@@ -139,6 +144,16 @@ jobs:
             ${{ steps.source.outputs.path }}/target/bootstrap-proof.json
             ${{ steps.source.outputs.path }}/target/installers/*
           if-no-files-found: error
+      - uses: actions/cache/save@v4
+        if: always() && steps.nativecache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ steps.source.outputs.path }}/target/bootstrap
+            .stage0-reference/llvm
+            .stage0-reference/target/toolchains
+          key: self-hosted-v1-${{ runner.os }}-${{ hashFiles('nerv/bootstrap/Cargo.lock', 'bootstrap/Cargo.lock') }}
 
   portable:
     needs: bootstrap

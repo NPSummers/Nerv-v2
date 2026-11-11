@@ -1,5 +1,6 @@
 import argparse
 import os
+import platform
 from pathlib import Path
 import subprocess
 
@@ -31,7 +32,10 @@ API void poke(int64_t *address, int64_t value) { *address = value; }
 API int64_t many(int64_t a,int64_t b,int64_t c,int64_t d,int64_t e,int64_t f,int64_t g,int64_t h) { return a+b+c+d+e+f+g+h; }
 """, encoding="utf-8")
     library = directory / ("native.dll" if os.name == "nt" else "native.so")
-    subprocess.run([str(cc), "-shared", "-O2", str(source), "-o", str(library)], check=True)
+    command = [str(cc), "-shared", "-O2", str(source), "-o", str(library)]
+    if platform.system() == "Darwin":
+        command.extend(["-isysroot", subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()])
+    subprocess.run(command, check=True)
     file = directory / "main.nerv"
     file.write_text("""import nerv.std
 fn main()

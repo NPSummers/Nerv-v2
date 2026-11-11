@@ -7,6 +7,10 @@ import subprocess
 ROOT = Path(__file__).resolve().parent.parent
 CASES = [
     ('fn main() -> i64 => 42\n', 42, ''),
+    ('fn main()\n    println(true)\n    println(false)\n', 0, 'true\nfalse\n'),
+    ('import nerv.std\nfn worker(n: i64) -> i64 => n + 2\nfn main()\n    let task = result_or(spawn_task(40, worker), Task { id: 0 })\n    println(result_or(join_task(task), -1))\n    println(nerv.memory.scope(40, worker))\n', 0, '42\n42\n'),
+    ('import nerv.std\nfn worker(n: i64) -> i64\n    while nerv.task.cancelled() == 0\n        assert(true)\n    n\nfn main()\n    let task = result_or(spawn_task(42, worker), Task { id: 0 })\n    assert(nerv.task.cancel(task.id) == 1)\n    println(result_or(join_task(task), -1))\n', 0, '42\n'),
+    ('fn callback(handle: i64, kind: string, text: string, bytes: []u8, state: string) -> []string => [state]\nfn main()\n    let raw = nerv.net.websocket_run("not a url", [""] * 0, "state", 1, "", callback)\n    assert(nerv.string.contains(raw[1], "capture") == 0)\n', 0, ''),
     ('fn main()\n    println("hello")\n', 0, 'hello\n'),
     ('fn main()\n    println("caf\u00e9 \U0001f600")\n', 0, 'caf\u00e9 \U0001f600\n'),
     ('fn main()\n    println(-9223372036854775808 / -1)\n    println(-9223372036854775808 % -1)\n', 0, '-9223372036854775808\n0\n'),

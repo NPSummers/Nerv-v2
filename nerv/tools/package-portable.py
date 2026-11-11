@@ -70,7 +70,7 @@ def main():
         package.mac_libraries(output / "nerv", args.llvm_library.resolve().parent.parent, output, original=compiler, extra=[(output / config["linker"], root / Path(config["linker"]).relative_to("toolchain"))])
     if platform.system() == "Linux":
         package.elf_libraries(output / "nerv", args.llvm_library.resolve().parent.parent, output, compiler, output / config["linker"])
-    env = {key: value for key, value in os.environ.items() if not key.startswith("NERV_") and key not in {"LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "LLVM_SYS_231_PREFIX", "LLVM_CONFIG_PATH", "LIB", "LIBPATH", "INCLUDE", "CARGO_HOME", "RUSTUP_HOME"}}
+    env = {key: value for key, value in os.environ.items() if not key.startswith("NERV_") and key not in {"LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "LLVM_SYS_231_PREFIX", "LLVM_CONFIG_PATH", "LIB", "LIBPATH", "INCLUDE", "SDKROOT", "DEVELOPER_DIR", "CARGO_HOME", "RUSTUP_HOME"}}
     env["PATH"] = os.environ.get("SystemRoot", "C:/Windows") + "/System32" if os.name == "nt" else "/usr/bin:/bin"
     fixture = ROOT / "target/portable-smoke"
     fixture.mkdir(exist_ok=True)
